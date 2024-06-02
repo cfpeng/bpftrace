@@ -9,6 +9,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/utsname.h>
 #include <tuple>
 #include <unordered_map>
@@ -41,6 +42,15 @@ private:
 };
 
 class EnospcException : public std::runtime_error {
+public:
+  // C++11 feature: bring base class constructor into scope to automatically
+  // forward constructor calls to base class
+  using std::runtime_error::runtime_error;
+};
+
+// Use this to end bpftrace execution due to a user error.
+// These should be caught at a high level only e.g. main.cpp or bpftrace.cpp
+class FatalUserException : public std::runtime_error {
 public:
   // C++11 feature: bring base class constructor into scope to automatically
   // forward constructor calls to base class
@@ -152,7 +162,9 @@ void get_uint64_env_var(const ::std::string &str,
 void get_bool_env_var(const ::std::string &str,
                       const std::function<void(bool)> &cb);
 // Tries to find a file in $PATH
-std::optional<std_filesystem::path> find_in_path(const std::string &name);
+std::optional<std_filesystem::path> find_in_path(std::string_view name);
+// Finds a file in the same directory as running binary
+std::optional<std_filesystem::path> find_near_self(std::string_view name);
 std::string get_pid_exe(pid_t pid);
 std::string get_pid_exe(const std::string &pid);
 std::string get_proc_maps(const std::string &pid);
@@ -293,7 +305,8 @@ T read_data(const void *src)
   return v;
 }
 
-uint32_t kernel_version(int attempt);
+enum KernelVersionMethod { vDSO, UTS, File, None };
+uint32_t kernel_version(KernelVersionMethod);
 
 template <typename T>
 T reduce_value(const std::vector<uint8_t> &value, int nvalues)

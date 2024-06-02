@@ -1,6 +1,5 @@
 #include <array>
 #include <bpf/libbpf.h>
-#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -38,6 +37,7 @@
 #include "output.h"
 #include "probe_matcher.h"
 #include "procmon.h"
+#include "run_bpftrace.h"
 #include "tracepoint_format_parser.h"
 #include "utils.h"
 #include "version.h"
@@ -165,7 +165,8 @@ static void enforce_infinite_rlimit()
 void check_is_root()
 {
   if (geteuid() != 0) {
-    LOG(FATAL) << "bpftrace currently only supports running as the root user.";
+    LOG(ERROR) << "bpftrace currently only supports running as the root user.";
+    exit(1);
   }
 }
 
@@ -278,12 +279,13 @@ static void parse_env(BPFtrace& bpftrace)
     // allocations would be: >240=  <Looks like the BPF stack limit of 512 bytes
     // is exceeded. Please move large on stack variables into BPF per-cpu array
     // map.> ~1024= <A call to built-in function 'memset' is not supported.>
-    LOG(FATAL) << "'BPFTRACE_MAX_STRLEN' " << max_strlen
+    LOG(ERROR) << "'BPFTRACE_MAX_STRLEN' " << max_strlen
                << " exceeds the current maximum of 200 bytes.\n"
                << "This limitation is because strings are currently stored on "
                   "the 512 byte BPF stack.\n"
                << "Long strings will be pursued in: "
                   "https://github.com/bpftrace/bpftrace/issues/305";
+    exit(1);
   }
 
   if (const char* env_p = std::getenv("BPFTRACE_STR_TRUNC_TRAILER"))
@@ -414,7 +416,7 @@ static void parse_env(BPFtrace& bpftrace)
       }
     }
     extra_flags.push_back("-include");
-    extra_flags.push_back(CLANG_WORKAROUNDS_H);
+    extra_flags.push_back("/bpftrace/include/" CLANG_WORKAROUNDS_H);
 
     for (auto dir : include_dirs) {
       extra_flags.push_back("-I");
@@ -528,7 +530,8 @@ Args parse_args(int argc, char* argv[])
         if (std::strcmp(optarg, "codegen") == 0)
           args.test_mode = TestMode::CODEGEN;
         else {
-          LOG(FATAL) << "USAGE: --test can only be 'codegen'.";
+          LOG(ERROR) << "USAGE: --test can only be 'codegen'.";
+          exit(1);
         }
         break;
       case Options::AOT: // --aot
@@ -537,8 +540,9 @@ Args parse_args(int argc, char* argv[])
         break;
       case Options::NO_FEATURE: // --no-feature
         if (args.no_feature.parse(optarg)) {
-          LOG(FATAL) << "USAGE: --no-feature can only have values "
+          LOG(ERROR) << "USAGE: --no-feature can only have values "
                         "'kprobe_multi,uprobe_multi'.";
+          exit(1);
         }
         break;
       case 'o':
@@ -566,7 +570,8 @@ Args parse_args(int argc, char* argv[])
         } else if (std::strcmp(optarg, "none") == 0) {
           args.obc = OutputBufferConfig::NONE;
         } else {
-          LOG(FATAL) << "USAGE: -B must be either 'line', 'full', or 'none'.";
+          LOG(ERROR) << "USAGE: -B must be either 'line', 'full', or 'none'.";
+          exit(1);
         }
         break;
       case 'f':
@@ -627,7 +632,8 @@ Args parse_args(int argc, char* argv[])
 
   if (bt_verbose && (bt_debug != DebugLevel::kNone)) {
     // TODO: allow both
-    LOG(FATAL) << "USAGE: Use either -v or -d.";
+    LOG(ERROR) << "USAGE: Use either -v or -d.";
+    exit(1);
   }
 
   if (!args.cmd_str.empty() && !args.pid_str.empty()) {
@@ -638,7 +644,8 @@ Args parse_args(int argc, char* argv[])
 
   // Difficult to serialize flex generated types
   if (args.helper_check_level && args.build_mode == BuildMode::AHEAD_OF_TIME) {
-    LOG(FATAL) << "Cannot use -k[k] with --aot";
+    LOG(ERROR) << "Cannot use -k[k] with --aot";
+    exit(1);
   }
 
   if (args.listing) {
@@ -664,7 +671,8 @@ Args parse_args(int argc, char* argv[])
   } else {
     // Expect to find a script either through -e or filename
     if (args.script.empty() && argv[optind] == nullptr) {
-      LOG(FATAL) << "USAGE: filename or -e 'program' required.";
+      LOG(ERROR) << "USAGE: filename or -e 'program' required.";
+      exit(1);
     }
 
     // If no script was specified with -e, then we expect to find a script file
@@ -684,29 +692,6 @@ Args parse_args(int argc, char* argv[])
   return args;
 }
 
-static const char* libbpf_print_level_string(enum libbpf_print_level level)
-{
-  switch (level) {
-    case LIBBPF_WARN:
-      return "WARN";
-    case LIBBPF_INFO:
-      return "INFO";
-    default:
-      return "DEBUG";
-  }
-}
-
-static int libbpf_print(enum libbpf_print_level level,
-                        const char* msg,
-                        va_list ap)
-{
-  if (bt_debug == DebugLevel::kNone)
-    return 0;
-
-  fprintf(stderr, "[%s] ", libbpf_print_level_string(level));
-  return vfprintf(stderr, msg, ap);
-}
-
 int main(int argc, char* argv[])
 {
   int err;
@@ -718,8 +703,9 @@ int main(int argc, char* argv[])
   if (!args.output_file.empty()) {
     outputstream.open(args.output_file);
     if (outputstream.fail()) {
-      LOG(FATAL) << "Failed to open output file: \"" << args.output_file
+      LOG(ERROR) << "Failed to open output file: \"" << args.output_file
                  << "\": " << strerror(errno);
+      exit(1);
     }
     os = &outputstream;
   }
@@ -730,8 +716,9 @@ int main(int argc, char* argv[])
   } else if (args.output_format == "json") {
     output = std::make_unique<JsonOutput>(*os);
   } else {
-    LOG(FATAL) << "Invalid output format \"" << args.output_format << "\"\n"
+    LOG(ERROR) << "Invalid output format \"" << args.output_format << "\"\n"
                << "Valid formats: 'text', 'json'";
+    exit(1);
   }
 
   switch (args.obc) {
@@ -767,12 +754,14 @@ int main(int argc, char* argv[])
     std::string errmsg;
     auto maybe_pid = parse_pid(args.pid_str, errmsg);
     if (!maybe_pid.has_value()) {
-      LOG(FATAL) << "Failed to parse pid: " + errmsg;
+      LOG(ERROR) << "Failed to parse pid: " + errmsg;
+      exit(1);
     }
     try {
       bpftrace.procmon_ = std::make_unique<ProcMon>(*maybe_pid);
     } catch (const std::exception& e) {
-      LOG(FATAL) << e.what();
+      LOG(ERROR) << e.what();
+      exit(1);
     }
   }
 
@@ -781,7 +770,8 @@ int main(int argc, char* argv[])
     try {
       bpftrace.child_ = std::make_unique<ChildProc>(args.cmd_str);
     } catch (const std::runtime_error& e) {
-      LOG(FATAL) << "Failed to fork child: " << e.what();
+      LOG(ERROR) << "Failed to fork child: " << e.what();
+      exit(1);
     }
   }
 
@@ -843,8 +833,9 @@ int main(int argc, char* argv[])
     } else {
       std::ifstream file(args.filename);
       if (file.fail()) {
-        LOG(FATAL) << "failed to open file '" << args.filename
+        LOG(ERROR) << "failed to open file '" << args.filename
                    << "': " << std::strerror(errno);
+        exit(1);
       }
 
       filename = args.filename;
@@ -905,7 +896,8 @@ int main(int argc, char* argv[])
     try {
       bpftrace.child_ = std::make_unique<ChildProc>(args.cmd_str);
     } catch (const std::runtime_error& e) {
-      LOG(FATAL) << "Failed to fork child: " << e.what();
+      LOG(ERROR) << "Failed to fork child: " << e.what();
+      exit(1);
     }
   }
 
@@ -932,7 +924,8 @@ int main(int argc, char* argv[])
     get_bool_env_var("BPFTRACE_VERIFY_LLVM_IR",
                      [&](bool x) { verify_llvm_ir = x; });
     if (verify_llvm_ir && !llvm.verify()) {
-      LOG(FATAL) << "Verification of generated LLVM IR failed";
+      LOG(ERROR) << "Verification of generated LLVM IR failed";
+      exit(1);
     }
 
     llvm.optimize();
@@ -950,6 +943,14 @@ int main(int argc, char* argv[])
       llvm.emit_elf(args.output_elf);
       return 0;
     }
+    if (args.build_mode == BuildMode::AHEAD_OF_TIME) {
+      llvm::SmallVector<char, 0> aot_output;
+      llvm::raw_svector_ostream aot_os(aot_output);
+      llvm.emit(aot_os);
+
+      return aot::generate(
+          bpftrace.resources, args.aot, aot_output.data(), aot_output.size());
+    }
     bytecode = llvm.emit();
   } catch (const std::system_error& ex) {
     LOG(ERROR) << "failed to write elf: " << ex.what();
@@ -962,41 +963,5 @@ int main(int argc, char* argv[])
   if (bt_debug != DebugLevel::kNone || args.test_mode == TestMode::CODEGEN)
     return 0;
 
-  if (args.build_mode == BuildMode::AHEAD_OF_TIME)
-    return aot::generate(bpftrace.resources, bytecode, args.aot);
-
-  // Signal handler that lets us know an exit signal was received.
-  struct sigaction act = {};
-  act.sa_handler = [](int) { BPFtrace::exitsig_recv = true; };
-  sigaction(SIGINT, &act, NULL);
-  sigaction(SIGTERM, &act, NULL);
-
-  // Signal handler that prints all maps when SIGUSR1 was received.
-  act.sa_handler = [](int) { BPFtrace::sigusr1_recv = true; };
-  sigaction(SIGUSR1, &act, NULL);
-
-  err = bpftrace.run(std::move(bytecode));
-  if (err)
-    return err;
-
-  // We are now post-processing. If we receive another SIGINT,
-  // handle it normally (exit)
-  act.sa_handler = SIG_DFL;
-  sigaction(SIGINT, &act, NULL);
-
-  std::cout << "\n\n";
-
-  err = bpftrace.print_maps();
-
-  if (bpftrace.child_) {
-    auto val = 0;
-    if ((val = bpftrace.child_->term_signal()) > -1)
-      LOG(V1) << "Child terminated by signal: " << val;
-    if ((val = bpftrace.child_->exit_code()) > -1)
-      LOG(V1) << "Child exited with code: " << val;
-  }
-
-  bpftrace.close_pcaps();
-
-  return err;
+  return run_bpftrace(bpftrace, bytecode);
 }

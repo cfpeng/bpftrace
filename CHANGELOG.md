@@ -28,8 +28,6 @@ and this project adheres to
   - [#3047](https://github.com/bpftrace/bpftrace/pull/3047)
 - Reproducible Builds: Do not store timestamps in gzip header
   - [#3096](https://github.com/bpftrace/bpftrace/pull/3096)
-- Replace instances of std::runtime_error with LOG(FATAL)
-  - [#3091](https://github.com/bpftrace/bpftrace/pull/3091)
 - Parse DWARF using liblldb instead of libdw
   - [#3042](https://github.com/bpftrace/bpftrace/pull/3042)
 - Replace native 'bpf_get_stackid'
@@ -38,6 +36,8 @@ and this project adheres to
   - [#2645](https://github.com/bpftrace/bpftrace/pull/2645)
 - Attach probe to inlined functions
   - [#3095](https://github.com/bpftrace/bpftrace/pull/3095)
+- Move error printing from debug to verbose mode
+  - [#3202](https://github.com/bpftrace/bpftrace/pull/3202)
 #### Deprecated
 - Deprecate `sarg` builtin
   - [#3095](https://github.com/bpftrace/bpftrace/pull/3095)
@@ -59,6 +59,12 @@ and this project adheres to
   - [#3095](https://github.com/bpftrace/bpftrace/pull/3095)
 - Fix storing strings of differing lengths in a variable
   - [#3178](https://github.com/bpftrace/bpftrace/pull/3178)
+- Field analyser: resolve fields for array accesses
+  - [#3024](https://github.com/bpftrace/bpftrace/pull/3024)
+- Fix error in dereferencing kernel double pointers
+  - [#3024](https://github.com/bpftrace/bpftrace/pull/3024)
+- Fix variable corruption when used as map key
+  - [#3195](https://github.com/bpftrace/bpftrace/pull/3195)
 #### Docs
 #### Tools
 
