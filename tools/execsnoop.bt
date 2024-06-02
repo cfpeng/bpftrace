@@ -28,5 +28,5 @@ tracepoint:syscalls:sys_enter_exec*
 {
 	$task = (struct task_struct *)curtask;
 	printf("%15s %-7d %-7d ", strftime("%H:%M:%S.%f", nsecs), pid, $task->real_parent->pid);
-	join(args.argv);
+	join(args->argv); // run debain
 }
