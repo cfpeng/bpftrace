@@ -32,7 +32,7 @@ int Driver::parse_str(std::string_view script)
 int Driver::parse()
 {
   // Reset previous state if we parse more than once
-  root.reset();
+  ctx = {};
 
   // Reset source location info on every pass
   loc.initialize();
@@ -48,13 +48,13 @@ int Driver::parse()
   yylex_destroy(scanner);
 
   if (!failed_) {
-    ast::AttachPointParser ap_parser(root.get(), bpftrace_, out_, listing_);
+    ast::AttachPointParser ap_parser(ctx, bpftrace_, out_, listing_);
     if (ap_parser.parse())
       failed_ = true;
   }
 
   if (failed_) {
-    root.reset();
+    ctx = {};
   }
 
   // Keep track of errors thrown ourselves, since the result of
@@ -77,18 +77,18 @@ void Driver::error(const std::string &m)
 
 // Retrieves the list of kernel modules for all attachpoints. Will be used to
 // identify modules whose BTF we need to parse.
-// Currently, this is useful for k(ret)func, k(ret)probe, and tracepoint probes.
+// Currently, this is useful for fentry/fexit, k(ret)probes, and tracepoints.
 std::set<std::string> Driver::list_modules() const
 {
   std::set<std::string> modules;
-  for (auto &probe : *root->probes) {
-    for (auto &ap : *probe->attach_points) {
+  for (auto &probe : ctx.root->probes) {
+    for (auto &ap : probe->attach_points) {
       auto probe_type = probetype(ap->provider);
-      if (probe_type == ProbeType::kfunc || probe_type == ProbeType::kretfunc ||
+      if (probe_type == ProbeType::fentry || probe_type == ProbeType::fexit ||
           ((probe_type == ProbeType::kprobe ||
             probe_type == ProbeType::kretprobe) &&
            !ap->target.empty())) {
-        if (ap->need_expansion) {
+        if (ap->expansion != ast::ExpansionType::NONE) {
           for (auto &match :
                bpftrace_.probe_matcher_->get_matches_for_ap(*ap)) {
             std::string func = match;

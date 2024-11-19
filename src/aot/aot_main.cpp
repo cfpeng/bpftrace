@@ -22,6 +22,8 @@ void usage(std::string_view filename)
   std::cerr << "    -o file        redirect bpftrace output to file" << std::endl;
   std::cerr << "    -q,            keep messages quiet" << std::endl;
   std::cerr << "    -v,            verbose messages" << std::endl;
+  std::cerr << "    -d STAGE       debug info for various stages of bpftrace execution" << std::endl;
+  std::cerr << "                   ('all', 'libbpf', 'verifier')" << std::endl;
   std::cerr << "    -h, --help     show this help message" << std::endl;
   std::cerr << "    -V, --version  bpftrace version" << std::endl;
   std::cerr << std::endl;
@@ -64,7 +66,7 @@ int main(int argc, char* argv[])
   int c;
 
   // TODO: which other options from `bpftrace` should be included?
-  const char* const short_opts = "f:hVo:qv";
+  const char* const short_opts = "d:f:hVo:qv";
   option long_opts[] = {
     option{ "help", no_argument, nullptr, 'h' },
     option{ "version", no_argument, nullptr, 'V' },
@@ -98,6 +100,18 @@ int main(int argc, char* argv[])
       case 'v':
         bt_verbose = true;
         break;
+      case 'd':
+        if (std::strcmp(optarg, "libbpf") == 0)
+          bt_debug.insert(DebugStage::Libbpf);
+        else if (std::strcmp(optarg, "verifier") == 0)
+          bt_debug.insert(DebugStage::Verifier);
+        else if (std::strcmp(optarg, "all") == 0) {
+          bt_debug.insert({ DebugStage::Libbpf, DebugStage::Verifier });
+        } else {
+          LOG(ERROR) << "USAGE: invalid option for -d: " << optarg;
+          return 1;
+        }
+        break;
       default:
         usage(argv[0]);
         return 1;
@@ -109,6 +123,8 @@ int main(int argc, char* argv[])
     return 1;
   }
 
+  check_is_root();
+
   libbpf_set_print(libbpf_print);
 
   auto output = prepare_output(output_file, output_format);
@@ -116,6 +132,7 @@ int main(int argc, char* argv[])
     return 1;
 
   BPFtrace bpftrace(std::move(output));
+
   int err = aot::load(bpftrace, argv[0]);
   if (err) {
     LOG(ERROR) << "Failed to load AOT script";

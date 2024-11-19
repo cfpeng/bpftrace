@@ -5,8 +5,7 @@
 #include "ast/visitors.h"
 #include "log.h"
 
-namespace bpftrace {
-namespace ast {
+namespace bpftrace::ast {
 
 #define MAKE_ACCEPT(Ty)                                                        \
   void Ty::accept(VisitorBase &v)                                              \
@@ -36,6 +35,7 @@ MAKE_ACCEPT(ExprStatement)
 MAKE_ACCEPT(AssignMapStatement)
 MAKE_ACCEPT(AssignVarStatement)
 MAKE_ACCEPT(AssignConfigVarStatement)
+MAKE_ACCEPT(VarDeclStatement)
 MAKE_ACCEPT(Predicate)
 MAKE_ACCEPT(AttachPoint)
 MAKE_ACCEPT(If)
@@ -43,6 +43,7 @@ MAKE_ACCEPT(Unroll)
 MAKE_ACCEPT(While)
 MAKE_ACCEPT(For)
 MAKE_ACCEPT(Config)
+MAKE_ACCEPT(Block)
 MAKE_ACCEPT(Jump)
 MAKE_ACCEPT(Probe)
 MAKE_ACCEPT(SubprogArg)
@@ -51,227 +52,8 @@ MAKE_ACCEPT(Program)
 
 #undef MAKE_ACCEPT
 
-Call::~Call()
-{
-  if (vargs)
-    for (Expression *expr : *vargs)
-      delete expr;
-
-  delete vargs;
-  vargs = nullptr;
-}
-Sizeof::~Sizeof()
-{
-  if (expr)
-    delete expr;
-  expr = nullptr;
-}
-Offsetof::~Offsetof()
-{
-  if (expr)
-    delete expr;
-  expr = nullptr;
-}
-Map::~Map()
-{
-  if (vargs)
-    for (Expression *expr : *vargs)
-      delete expr;
-
-  delete vargs;
-  vargs = nullptr;
-}
-Binop::~Binop()
-{
-  delete left;
-  delete right;
-  left = nullptr;
-  right = nullptr;
-}
-
-Unop::~Unop()
-{
-  delete expr;
-  expr = nullptr;
-}
-
-FieldAccess::~FieldAccess()
-{
-  delete expr;
-  expr = nullptr;
-}
-
-ArrayAccess::~ArrayAccess()
-{
-  delete expr;
-  delete indexpr;
-  expr = nullptr;
-  indexpr = nullptr;
-}
-
-Cast::~Cast()
-{
-  delete expr;
-  expr = nullptr;
-}
-
-Tuple::~Tuple()
-{
-  for (Expression *expr : *elems)
-    delete expr;
-  delete elems;
-}
-
-ExprStatement::~ExprStatement()
-{
-  delete expr;
-  expr = nullptr;
-}
-
-AssignMapStatement::~AssignMapStatement()
-{
-  // In a compound assignment, the expression owns the map so
-  // we shouldn't free
-  if (!compound)
-    delete map;
-  delete expr;
-  map = nullptr;
-  expr = nullptr;
-}
-
-AssignVarStatement::~AssignVarStatement()
-{
-  // In a compound assignment, the expression owns the map so
-  // we shouldn't free
-  if (!compound)
-    delete var;
-  delete expr;
-  var = nullptr;
-  expr = nullptr;
-}
-
-AssignConfigVarStatement::~AssignConfigVarStatement()
-{
-  delete expr;
-  expr = nullptr;
-}
-
-If::~If()
-{
-  delete cond;
-  cond = nullptr;
-
-  if (stmts)
-    for (Statement *s : *stmts)
-      delete s;
-  delete stmts;
-  stmts = nullptr;
-
-  if (else_stmts)
-    for (Statement *s : *else_stmts)
-      delete s;
-  delete else_stmts;
-  else_stmts = nullptr;
-}
-
-Unroll::~Unroll()
-{
-  if (stmts)
-    for (Statement *s : *stmts)
-      delete s;
-  delete stmts;
-  stmts = nullptr;
-}
-Jump::~Jump()
-{
-  if (return_value)
-    delete return_value;
-  return_value = nullptr;
-}
-Predicate::~Predicate()
-{
-  delete expr;
-  expr = nullptr;
-}
-Ternary::~Ternary()
-{
-  delete cond;
-  delete left;
-  delete right;
-  cond = nullptr;
-  left = nullptr;
-  right = nullptr;
-}
-
-While::~While()
-{
-  delete cond;
-  for (auto *stmt : *stmts)
-    delete stmt;
-  delete stmts;
-}
-
-For::~For()
-{
-  delete decl;
-  delete expr;
-  for (auto *stmt : *stmts)
-    delete stmt;
-  delete stmts;
-}
-
-Config::~Config()
-{
-  for (auto *stmt : *stmts)
-    delete stmt;
-  delete stmts;
-}
-
-Scope::~Scope()
-{
-  if (stmts)
-    for (auto *stmt : *stmts)
-      delete stmt;
-  delete stmts;
-  stmts = nullptr;
-}
-
-Probe::~Probe()
-{
-  if (attach_points)
-    for (AttachPoint *ap : *attach_points)
-      delete ap;
-  delete attach_points;
-  attach_points = nullptr;
-
-  delete pred;
-  pred = nullptr;
-}
-
-Subprog::~Subprog()
-{
-  if (args)
-    for (SubprogArg *a : *args)
-      delete a;
-  delete args;
-}
-
-Program::~Program()
-{
-  if (functions)
-    for (Subprog *s : *functions)
-      delete s;
-  delete functions;
-  if (probes)
-    for (Probe *p : *probes)
-      delete p;
-  delete probes;
-  probes = nullptr;
-  delete config;
-  config = nullptr;
-}
-
-Integer::Integer(int64_t n, location loc) : Expression(loc), n(n)
+Integer::Integer(int64_t n, location loc, bool is_negative)
+    : Expression(loc), n(n), is_negative(is_negative)
 {
   is_literal = true;
 }
@@ -306,17 +88,16 @@ PositionalParameter::PositionalParameter(PositionalParameterType ptype,
 }
 
 Call::Call(const std::string &func, location loc)
-    : Expression(loc), func(is_deprecated(func)), vargs(nullptr)
+    : Expression(loc), func(is_deprecated(func))
 {
 }
 
-Call::Call(const std::string &func, ExpressionList *vargs, location loc)
-    : Expression(loc), func(is_deprecated(func)), vargs(vargs)
+Call::Call(const std::string &func, ExpressionList &&vargs, location loc)
+    : Expression(loc), func(is_deprecated(func)), vargs(std::move(vargs))
 {
 }
 
-Sizeof::Sizeof(SizedType type, location loc)
-    : Expression(loc), expr(nullptr), argtype(type)
+Sizeof::Sizeof(SizedType type, location loc) : Expression(loc), argtype(type)
 {
 }
 
@@ -325,7 +106,7 @@ Sizeof::Sizeof(Expression *expr, location loc) : Expression(loc), expr(expr)
 }
 
 Offsetof::Offsetof(SizedType record, std::string &field, location loc)
-    : Expression(loc), record(record), expr(nullptr), field(field)
+    : Expression(loc), record(record), field(field)
 {
 }
 
@@ -334,19 +115,16 @@ Offsetof::Offsetof(Expression *expr, std::string &field, location loc)
 {
 }
 
-Map::Map(const std::string &ident, location loc)
-    : Expression(loc), ident(ident), vargs(nullptr)
+Map::Map(const std::string &ident, location loc) : Expression(loc), ident(ident)
 {
   is_map = true;
 }
 
-Map::Map(const std::string &ident, ExpressionList *vargs, location loc)
-    : Expression(loc), ident(ident), vargs(vargs)
+Map::Map(const std::string &ident, Expression &expr, location loc)
+    : Expression(loc), ident(ident), key_expr(&expr)
 {
   is_map = true;
-  for (auto expr : *vargs) {
-    expr->key_for_map = this;
-  }
+  key_expr->key_for_map = this;
 }
 
 Variable::Variable(const std::string &ident, location loc)
@@ -401,8 +179,8 @@ Cast::Cast(SizedType cast_type, Expression *expr, location loc)
   type = cast_type;
 }
 
-Tuple::Tuple(ExpressionList *elems, location loc)
-    : Expression(loc), elems(elems)
+Tuple::Tuple(ExpressionList &&elems, location loc)
+    : Expression(loc), elems(std::move(elems))
 {
 }
 
@@ -411,20 +189,27 @@ ExprStatement::ExprStatement(Expression *expr, location loc)
 {
 }
 
-AssignMapStatement::AssignMapStatement(Map *map,
-                                       Expression *expr,
-                                       bool compound,
-                                       location loc)
-    : Statement(loc), map(map), expr(expr), compound(compound)
+AssignMapStatement::AssignMapStatement(Map *map, Expression *expr, location loc)
+    : Statement(loc), map(map), expr(expr)
 {
   expr->map = map;
 };
 
 AssignVarStatement::AssignVarStatement(Variable *var,
                                        Expression *expr,
-                                       bool compound,
                                        location loc)
-    : Statement(loc), var(var), expr(expr), compound(compound)
+    : Statement(loc), var(var), expr(expr)
+{
+  expr->var = var;
+}
+
+AssignVarStatement::AssignVarStatement(VarDeclStatement *var_decl_stmt,
+                                       Expression *expr,
+                                       location loc)
+    : Statement(loc),
+      var_decl_stmt(var_decl_stmt),
+      var(var_decl_stmt->var),
+      expr(expr)
 {
   expr->var = var;
 }
@@ -437,6 +222,18 @@ AssignConfigVarStatement::AssignConfigVarStatement(
 {
 }
 
+VarDeclStatement::VarDeclStatement(Variable *var, SizedType type, location loc)
+    : Statement(loc), var(var), set_type(true)
+{
+  var->type = std::move(type);
+}
+
+VarDeclStatement::VarDeclStatement(Variable *var, location loc)
+    : Statement(loc), var(var)
+{
+  var->type = CreateNone();
+}
+
 Predicate::Predicate(Expression *expr, location loc) : Node(loc), expr(expr)
 {
 }
@@ -446,28 +243,33 @@ AttachPoint::AttachPoint(const std::string &raw_input, location loc)
 {
 }
 
-If::If(Expression *cond, StatementList *stmts) : cond(cond), stmts(stmts)
+Block::Block(StatementList &&stmts) : stmts(std::move(stmts))
 {
 }
 
-If::If(Expression *cond, StatementList *stmts, StatementList *else_stmts)
-    : cond(cond), stmts(stmts), else_stmts(else_stmts)
+If::If(Expression *cond, StatementList &&stmts)
+    : cond(cond), if_block(Block(std::move(stmts))), else_block(Block({}))
 {
 }
 
-Unroll::Unroll(Expression *expr, StatementList *stmts, location loc)
-    : Statement(loc), expr(expr), stmts(stmts)
+If::If(Expression *cond, StatementList &&stmts, StatementList &&else_stmts)
+    : cond(cond),
+      if_block(Block(std::move(stmts))),
+      else_block(Block(std::move(else_stmts)))
 {
 }
 
-Scope::Scope(StatementList *stmts) : stmts(stmts)
+Unroll::Unroll(Expression *expr, StatementList &&stmts, location loc)
+    : Statement(loc), expr(expr), block(std::move(stmts))
 {
 }
 
-Probe::Probe(AttachPointList *attach_points,
+Probe::Probe(AttachPointList &&attach_points,
              Predicate *pred,
-             StatementList *stmts)
-    : Scope(stmts), attach_points(attach_points), pred(pred)
+             StatementList &&stmts)
+    : attach_points(std::move(attach_points)),
+      pred(pred),
+      block(std::move(stmts))
 {
 }
 
@@ -483,23 +285,23 @@ std::string SubprogArg::name() const
 
 Subprog::Subprog(std::string name,
                  SizedType return_type,
-                 SubprogArgList *args,
-                 StatementList *stmts)
-    : Scope(stmts),
-      args(args),
+                 SubprogArgList &&args,
+                 StatementList &&stmts)
+    : args(std::move(args)),
       return_type(std::move(return_type)),
+      stmts(std::move(stmts)),
       name_(std::move(name))
 {
 }
 
 Program::Program(const std::string &c_definitions,
                  Config *config,
-                 SubprogList *functions,
-                 ProbeList *probes)
+                 SubprogList &&functions,
+                 ProbeList &&probes)
     : c_definitions(c_definitions),
       config(config),
-      functions(functions),
-      probes(probes)
+      functions(std::move(functions)),
+      probes(std::move(probes))
 {
 }
 
@@ -577,9 +379,13 @@ std::string opstr(const Unop &unop)
     case Operator::MUL:
       return "dereference";
     case Operator::INCREMENT:
-      return "++";
+      if (unop.is_post_op)
+        return "++ (post)";
+      return "++ (pre)";
     case Operator::DECREMENT:
-      return "--";
+      if (unop.is_post_op)
+        return "-- (post)";
+      return "-- (pre)";
     default:
       return {};
   }
@@ -599,12 +405,12 @@ AttachPoint AttachPoint::create_expansion_copy(const std::string &match) const
       break;
     case ProbeType::uprobe:
     case ProbeType::uretprobe:
-    case ProbeType::kfunc:
-    case ProbeType::kretfunc:
+    case ProbeType::fentry:
+    case ProbeType::fexit:
     case ProbeType::tracepoint:
-      // Tracepoint, uprobe, and k(ret)func probes specify both a target
+      // Tracepoint, uprobe, and fentry/fexit probes specify both a target
       // (category for tracepoints, binary for uprobes, and kernel module
-      // for k(ret)func) and a function name.
+      // for fentry/fexit and a function name.
       ap.func = match;
       ap.target = erase_prefix(ap.func);
       break;
@@ -677,8 +483,8 @@ void AttachPoint::set_index(int index)
 std::string Probe::name() const
 {
   std::vector<std::string> ap_names;
-  std::transform(attach_points->begin(),
-                 attach_points->end(),
+  std::transform(attach_points.begin(),
+                 attach_points.end(),
                  std::back_inserter(ap_names),
                  [](const AttachPoint *ap) { return ap->name(); });
   return str_join(ap_names, ",");
@@ -699,88 +505,6 @@ void Probe::set_index(int index)
   index_ = index;
 }
 
-Expression::Expression(const Expression &other) : Node(other)
-{
-  type = other.type;
-  is_literal = other.is_literal;
-  is_variable = other.is_variable;
-  is_map = other.is_map;
-}
-
-Call::Call(const Call &other) : Expression(other)
-{
-  func = other.func;
-}
-
-Sizeof::Sizeof(const Sizeof &other) : Expression(other)
-{
-}
-
-Offsetof::Offsetof(const Offsetof &other) : Expression(other)
-{
-}
-
-Binop::Binop(const Binop &other) : Expression(other)
-{
-  op = other.op;
-}
-
-Unop::Unop(const Unop &other) : Expression(other)
-{
-  op = other.op;
-  is_post_op = other.is_post_op;
-}
-
-Map::Map(const Map &other) : Expression(other)
-{
-  ident = other.ident;
-  skip_key_validation = other.skip_key_validation;
-}
-
-FieldAccess::FieldAccess(const FieldAccess &other)
-    : Expression(other), expr(nullptr)
-{
-  field = other.field;
-  index = other.index;
-}
-
-Unroll::Unroll(const Unroll &other) : Statement(other)
-{
-  var = other.var;
-}
-
-Program::Program(const Program &other) : Node(other)
-{
-  c_definitions = other.c_definitions;
-  config = other.config;
-}
-
-Config::Config(const Config &other) : Statement(other)
-{
-}
-
-Cast::Cast(const Cast &other) : Expression(other)
-{
-}
-
-SubprogArg::SubprogArg(const SubprogArg &other) : Node(other)
-{
-  name_ = other.name_;
-  type = other.type;
-}
-
-Subprog::Subprog(const Subprog &other) : Scope(other)
-{
-  name_ = other.name_;
-}
-
-Probe::Probe(const Probe &other) : Scope(static_cast<const Scope &>(other))
-{
-  need_expansion = other.need_expansion;
-  tp_args_structs_level = other.tp_args_structs_level;
-  index_ = other.index_;
-}
-
 std::string Subprog::name() const
 {
   return name_;
@@ -788,46 +512,12 @@ std::string Subprog::name() const
 
 bool Probe::has_ap_of_probetype(ProbeType probe_type)
 {
-  if (!attach_points)
-    return false;
-  for (auto ap : *attach_points) {
+  for (auto *ap : attach_points) {
     if (probetype(ap->provider) == probe_type)
       return true;
   }
   return false;
 }
-
-While::While(const While &other) : Statement(other)
-{
-}
-
-For::For(const For &other) : Statement(other)
-{
-}
-
-Tuple::Tuple(const Tuple &other) : Expression(other)
-{
-}
-
-If::If(const If &other) : Statement(other)
-{
-}
-
-AssignVarStatement::AssignVarStatement(const AssignVarStatement &other)
-    : Statement(other)
-{
-  compound = other.compound;
-};
-
-AssignMapStatement::AssignMapStatement(const AssignMapStatement &other)
-    : Statement(other)
-{
-  compound = other.compound;
-};
-
-AssignConfigVarStatement::AssignConfigVarStatement(
-    const AssignConfigVarStatement &other)
-    : Statement(other){};
 
 SizedType ident_to_record(const std::string &ident, int pointer_level)
 {
@@ -837,5 +527,4 @@ SizedType ident_to_record(const std::string &ident, int pointer_level)
   return result;
 }
 
-} // namespace ast
-} // namespace bpftrace
+} // namespace bpftrace::ast

@@ -65,6 +65,14 @@ struct Arrays *func_arrays(struct Arrays *arr)
   return 0;
 }
 
+struct ArrayWithCompoundData {
+  struct Foo3 *data[2];
+};
+
+void func_array_with_compound_data(struct ArrayWithCompoundData *arr)
+{
+}
+
 struct task_struct {
   int pid;
   int pgid;
@@ -113,16 +121,27 @@ int bpf_iter_task_vma()
   return 0;
 }
 
+// kfunc definitions
+struct bpf_map {};
+long bpf_map_sum_elem_count(const struct bpf_map *map)
+{
+  return 0;
+}
+
+// Make sure all new mocked kernel functions are called in this main (below)
+// so they don't get optimzed away
 int main(void)
 {
   struct bpf_iter__task iter_task;
   struct bpf_iter__task_file iter_task_file;
   struct bpf_iter__task_vma iter_task_vma;
+  struct bpf_map bpf_map;
 
   func_1(0, 0, 0, 0);
 
   bpf_iter_task();
   bpf_iter_task_file();
   bpf_iter_task_vma();
+  bpf_map_sum_elem_count(&bpf_map);
   return 0;
 }

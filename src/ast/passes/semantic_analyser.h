@@ -8,20 +8,27 @@
 #include "ast/visitors.h"
 #include "bpffeature.h"
 #include "bpftrace.h"
+#include "collect_nodes.h"
 #include "config.h"
 #include "types.h"
 
 namespace bpftrace {
 namespace ast {
 
+struct variable {
+  SizedType type;
+  bool can_resize;
+  bool was_assigned;
+};
+
 class SemanticAnalyser : public Visitor {
 public:
-  explicit SemanticAnalyser(Node *root,
+  explicit SemanticAnalyser(ASTContext &ctx,
                             BPFtrace &bpftrace,
                             std::ostream &out = std::cerr,
                             bool has_child = true,
                             bool listing = false)
-      : root_(root),
+      : ctx_(ctx),
         bpftrace_(bpftrace),
         out_(out),
         listing_(listing),
@@ -29,17 +36,34 @@ public:
   {
   }
 
-  explicit SemanticAnalyser(Node *root, BPFtrace &bpftrace, bool has_child)
-      : SemanticAnalyser(root, bpftrace, std::cerr, has_child)
+  explicit SemanticAnalyser(ASTContext &ctx, BPFtrace &bpftrace, bool has_child)
+      : SemanticAnalyser(ctx, bpftrace, std::cerr, has_child)
   {
   }
 
-  explicit SemanticAnalyser(Node *root,
+  explicit SemanticAnalyser(ASTContext &ctx,
                             BPFtrace &bpftrace,
                             bool has_child,
                             bool listing)
-      : SemanticAnalyser(root, bpftrace, std::cerr, has_child, listing)
+      : SemanticAnalyser(ctx, bpftrace, std::cerr, has_child, listing)
   {
+  }
+
+  [[deprecated("Use Visit(Node *const &n) instead.")]]
+  virtual inline void Visit(Node &n) override
+  {
+    n.accept(*this);
+  }
+
+  virtual inline void Visit(Node *const &n)
+  {
+    n->accept(*this);
+  }
+
+  virtual inline void Visit(Expression *&expr)
+  {
+    expr->accept(*this);
+    dereference_if_needed(expr);
   }
 
   void visit(Integer &integer) override;
@@ -67,19 +91,21 @@ public:
   void visit(AssignMapStatement &assignment) override;
   void visit(AssignVarStatement &assignment) override;
   void visit(AssignConfigVarStatement &assignment) override;
-  void visit(If &if_block) override;
+  void visit(VarDeclStatement &decl) override;
+  void visit(If &if_node) override;
   void visit(Unroll &unroll) override;
   void visit(Predicate &pred) override;
   void visit(AttachPoint &ap) override;
   void visit(Probe &probe) override;
   void visit(Config &config) override;
+  void visit(Block &block) override;
   void visit(Subprog &subprog) override;
   void visit(Program &program) override;
 
   int analyse();
 
 private:
-  Node *root_ = nullptr;
+  ASTContext &ctx_;
   BPFtrace &bpftrace_;
   std::ostream &out_;
   std::ostringstream err_;
@@ -88,13 +114,16 @@ private:
   bool listing_;
 
   bool is_final_pass() const;
+  bool is_first_pass() const;
 
   bool check_assignment(const Call &call,
                         bool want_map,
                         bool want_var,
                         bool want_map_key);
-  bool check_nargs(const Call &call, size_t expected_nargs);
-  bool check_varargs(const Call &call, size_t min_nargs, size_t max_nargs);
+  [[nodiscard]] bool check_nargs(const Call &call, size_t expected_nargs);
+  [[nodiscard]] bool check_varargs(const Call &call,
+                                   size_t min_nargs,
+                                   size_t max_nargs);
   bool check_arg(const Call &call,
                  Type type,
                  int arg_num,
@@ -105,15 +134,20 @@ private:
 
   void check_stack_call(Call &call, bool kernel);
 
-  Probe *get_probe_from_scope(Scope *scope,
-                              const location &loc,
-                              std::string name = "");
+  Probe *get_probe(const location &loc, std::string name = "");
 
   SizedType *get_map_type(const Map &map);
-  MapKey *get_map_key_type(const Map &map);
+  SizedType *get_map_key_type(const Map &map);
   void assign_map_type(const Map &map, const SizedType &type);
-  void update_key_type(const Map &map, const MapKey &new_key);
+  SizedType create_key_type(const SizedType &expr_type, const location &loc);
+  void update_current_key(SizedType &current_key_type,
+                          const SizedType &new_key_type);
+  void validate_new_key(const SizedType &current_key_type,
+                        const SizedType &new_key_type,
+                        const std::string &map_ident,
+                        const location &loc);
   bool update_string_size(SizedType &type, const SizedType &new_type);
+  void validate_map_key(const SizedType &key, const location &loc);
   void resolve_struct_type(SizedType &type, const location &loc);
 
   void builtin_args_tracepoint(AttachPoint *attach_point, Builtin &builtin);
@@ -123,15 +157,19 @@ private:
   void binop_ptr(Binop &op);
   void binop_int(Binop &op);
   void binop_array(Binop &op);
+  void dereference_if_needed(Expression *&expr);
 
   bool has_error() const;
   bool in_loop(void)
   {
     return loop_depth_ > 0;
   };
-  void accept_statements(StatementList *stmts);
+  void accept_statements(StatementList &stmts);
 
-  Scope *scope_;
+  // At the moment we iterate over the stack from top to bottom as variable
+  // shadowing is not supported.
+  std::vector<Node *> scope_stack_;
+  Node *top_level_node_ = nullptr;
 
   // Holds the function currently being visited by this SemanticAnalyser.
   std::string func_;
@@ -139,9 +177,14 @@ private:
   // SemanticAnalyser.
   int func_arg_idx_ = -1;
 
-  std::map<Scope *, std::map<std::string, SizedType>> variable_val_;
+  variable *find_variable(const std::string &var_ident);
+  Node *find_variable_scope(const std::string &var_ident);
+
+  std::map<Node *, std::map<std::string, variable>> variables_;
+  std::map<Node *, std::map<std::string, location>> variable_decls_;
+  std::map<Node *, CollectNodes<Variable>> for_vars_referenced_;
   std::map<std::string, SizedType> map_val_;
-  std::map<std::string, MapKey> map_key_;
+  std::map<std::string, SizedType> map_key_;
 
   uint32_t loop_depth_ = 0;
   bool has_begin_probe_ = false;

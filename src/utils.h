@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -14,6 +15,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "filesystem.h"
@@ -157,6 +159,13 @@ static std::vector<std::string> COMPILE_TIME_FUNCS = { "cgroupid" };
 
 static std::vector<std::string> UPROBE_LANGS = { "cpp" };
 
+static const std::set<std::string> RECURSIVE_KERNEL_FUNCS = {
+  "vmlinux:_raw_spin_lock",
+  "vmlinux:_raw_spin_lock_irqsave",
+  "vmlinux:_raw_spin_unlock_irqrestore",
+  "vmlinux:queued_spin_lock_slowpath",
+};
+
 void get_uint64_env_var(const ::std::string &str,
                         const std::function<void(uint64_t)> &cb);
 void get_bool_env_var(const ::std::string &str,
@@ -174,8 +183,9 @@ std::vector<std::string> split_string(const std::string &str,
                                       char delimiter,
                                       bool remove_empty = false);
 std::string erase_prefix(std::string &str);
-bool wildcard_match(const std::string &str,
-                    std::vector<std::string> &tokens,
+void erase_parameter_list(std::string &demangled_name);
+bool wildcard_match(std::string_view str,
+                    const std::vector<std::string> &tokens,
                     bool start_wildcard,
                     bool end_wildcard);
 std::vector<std::string> get_wildcard_tokens(const std::string &input,
@@ -183,10 +193,13 @@ std::vector<std::string> get_wildcard_tokens(const std::string &input,
                                              bool &end_wildcard);
 std::vector<int> get_online_cpus();
 std::vector<int> get_possible_cpus();
+int get_max_cpu_id();
 bool is_dir(const std::string &path);
 bool file_exists_and_ownedby_root(const char *f);
-std::tuple<std::string, std::string> get_kernel_dirs(
-    const struct utsname &utsname);
+std::optional<std::string> find_vmlinux(struct symbol *sym = nullptr);
+bool get_kernel_dirs(const struct utsname &utsname,
+                     std::string &ksrc,
+                     std::string &kobj);
 std::vector<std::string> get_kernel_cflags(const char *uname_machine,
                                            const std::string &ksrc,
                                            const std::string &kobj,
@@ -200,18 +213,21 @@ std::vector<std::pair<std::string, std::string>> get_cgroup_paths(
 bool is_module_loaded(const std::string &module);
 FuncsModulesMap parse_traceable_funcs();
 const std::string &is_deprecated(const std::string &str);
+bool is_recursive_func(const std::string &func_name);
 bool is_unsafe_func(const std::string &func_name);
 bool is_compile_time_func(const std::string &func_name);
 bool is_supported_lang(const std::string &lang);
 bool is_type_name(std::string_view str);
 std::string exec_system(const char *cmd);
+bool is_exe(const std::string &path);
 std::vector<std::string> resolve_binary_path(const std::string &cmd);
 std::vector<std::string> resolve_binary_path(const std::string &cmd, int pid);
 std::string path_for_pid_mountns(int pid, const std::string &path);
 void cat_file(const char *filename, size_t, std::ostream &);
 std::string str_join(const std::vector<std::string> &list,
                      const std::string &delim);
-bool is_numeric(const std::string &str);
+std::optional<std::variant<int64_t, uint64_t>> get_int_from_str(
+    const std::string &s);
 bool symbol_has_cpp_mangled_signature(const std::string &sym_name);
 std::optional<pid_t> parse_pid(const std::string &str, std::string &err);
 std::string hex_format_buffer(const char *buf,
@@ -240,6 +256,8 @@ std::map<uintptr_t, elf_symbol, std::greater<>> get_symbol_table_for_elf(
     const std::string &elf_file);
 std::vector<int> get_pids_for_program(const std::string &program);
 std::vector<int> get_all_running_pids();
+
+uint32_t round_up_to_next_power_of_two(uint32_t n);
 
 std::string sanitise_bpf_program_name(const std::string &name);
 // Generate object file function name for a given probe
@@ -317,8 +335,57 @@ T reduce_value(const std::vector<uint8_t> &value, int nvalues)
   }
   return sum;
 }
-int64_t min_value(const std::vector<uint8_t> &value, int nvalues);
-uint64_t max_value(const std::vector<uint8_t> &value, int nvalues);
+
+template <typename T>
+T min_max_value(const std::vector<uint8_t> &value, int nvalues, bool is_max)
+{
+  T mm_val = 0;
+  bool mm_set = false;
+  for (int i = 0; i < nvalues; i++) {
+    T val = read_data<T>(value.data() + i * (sizeof(T) * 2));
+    uint32_t is_set = read_data<uint32_t>(value.data() + sizeof(T) +
+                                          i * (sizeof(T) * 2));
+    if (!is_set) {
+      continue;
+    }
+    if (!mm_set) {
+      mm_val = val;
+      mm_set = true;
+    } else if (is_max && val > mm_val) {
+      mm_val = val;
+    } else if (!is_max && val < mm_val) {
+      mm_val = val;
+    }
+  }
+  return mm_val;
+}
+
+template <typename T>
+struct stats {
+  T total;
+  T count;
+  T avg;
+};
+
+template <typename T>
+stats<T> stats_value(const std::vector<uint8_t> &value, int nvalues)
+{
+  stats<T> ret = { 0, 0, 0 };
+  for (int i = 0; i < nvalues; i++) {
+    T val = read_data<T>(value.data() + i * (sizeof(T) * 2));
+    T cpu_count = read_data<T>(value.data() + sizeof(T) + i * (sizeof(T) * 2));
+    ret.count += cpu_count;
+    ret.total += val;
+  }
+  ret.avg = (T)(ret.total / ret.count);
+  return ret;
+}
+
+template <typename T>
+T avg_value(const std::vector<uint8_t> &value, int nvalues)
+{
+  return stats_value<T>(value, nvalues).avg;
+}
 
 // Combination of 2 hashes
 // The algorithm is taken from boost::hash_combine
@@ -327,6 +394,49 @@ inline void hash_combine(std::size_t &seed, const T &value)
 {
   std::hash<T> hasher;
   seed ^= hasher(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+
+struct symbol {
+  std::string name;
+  uint64_t start;
+  uint64_t size;
+  uint64_t address;
+};
+
+inline int sym_name_cb(const char *symname,
+                       uint64_t start,
+                       uint64_t size,
+                       void *p)
+{
+  struct symbol *sym = static_cast<struct symbol *>(p);
+
+  if (sym->name == symname) {
+    sym->start = start;
+    sym->size = size;
+    return -1;
+  }
+
+  return 0;
+}
+
+inline int sym_address_cb(const char *symname,
+                          uint64_t start,
+                          uint64_t size,
+                          void *p)
+{
+  struct symbol *sym = static_cast<struct symbol *>(p);
+
+  // When size is 0, then [start, start + size) = [start, start) = ø.
+  // So we need a special case when size=0, but address matches the symbol's
+  if (sym->address == start ||
+      (sym->address > start && sym->address < (start + size))) {
+    sym->start = start;
+    sym->size = size;
+    sym->name = symname;
+    return -1;
+  }
+
+  return 0;
 }
 
 } // namespace bpftrace

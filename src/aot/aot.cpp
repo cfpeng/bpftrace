@@ -18,7 +18,6 @@
 #include <cereal/types/unordered_map.hpp>
 #include <cereal/types/vector.hpp>
 
-#include "ast/elf_parser.h"
 #include "filesystem.h"
 #include "log.h"
 #include "utils.h"
@@ -47,8 +46,7 @@ struct Header {
 static_assert(sizeof(Header) == 48);
 static_assert(sizeof(std::size_t) <= sizeof(uint64_t));
 
-namespace bpftrace {
-namespace aot {
+namespace bpftrace::aot {
 namespace {
 
 uint32_t rs_hash(std::string_view str)
@@ -128,14 +126,14 @@ std::optional<std::vector<uint8_t>> generate_btaot_section(
 
 // Clones the shim to final destination while also injecting
 // the custom .btaot section.
-bool build_binary(const std_filesystem::path &shim,
-                  const std::string &out,
-                  const std::vector<uint8_t> &section)
+int build_binary(const std_filesystem::path &shim,
+                 const std::string &out,
+                 const std::vector<uint8_t> &section)
 {
   std::error_code ec;
-  bool ret = false;
   char cmd[1024];
   int written;
+  int ret = 0;
 
   // Write out section data in a temporary file
   std::ofstream secdata(AOT_SECDATA_TEMPFILE, std::ios_base::binary);
@@ -150,6 +148,7 @@ bool build_binary(const std_filesystem::path &shim,
   // Resolve objcopy binary to full path
   auto objcopy_full = find_in_path(objcopy);
   if (!objcopy_full) {
+    ret = 1;
     LOG(ERROR) << "Failed to find " << objcopy << " in $PATH";
     goto out;
   }
@@ -162,19 +161,21 @@ bool build_binary(const std_filesystem::path &shim,
                      shim.c_str(),
                      out.c_str());
   if (written < 0 || written == sizeof(cmd)) {
+    ret = 1;
     LOG(ERROR) << "Failed to construct objcopy command";
     goto out;
   }
 
-  if (std::system(cmd)) {
+  if ((ret = std::system(cmd))) {
     LOG(ERROR) << "Failed to execute: " << cmd;
     goto out;
   }
 
-  ret = true;
 out:
-  if (!std_filesystem::remove(AOT_SECDATA_TEMPFILE, ec) || ec)
+  if (!std_filesystem::remove(AOT_SECDATA_TEMPFILE, ec) || ec) {
+    ret = 1;
     LOG(ERROR) << "Failed to remove " << AOT_SECDATA_TEMPFILE << ": " << ec;
+  }
   return ret;
 }
 
@@ -233,12 +234,12 @@ int load(BPFtrace &bpftrace, const std::string &in)
   }
 
   // Find .btaot section
-  Elf *elf = NULL;
-  Elf_Scn *scn = NULL;
+  Elf *elf = nullptr;
+  Elf_Scn *scn = nullptr;
   GElf_Shdr shdr;
-  char *secname = NULL;
-  Elf_Data *data = NULL;
-  uint8_t *btaot_section = NULL;
+  char *secname = nullptr;
+  Elf_Data *data = nullptr;
+  uint8_t *btaot_section = nullptr;
   const Header *hdr;
 
   if (elf_version(EV_CURRENT) == EV_NONE) {
@@ -247,7 +248,7 @@ int load(BPFtrace &bpftrace, const std::string &in)
     goto out;
   }
 
-  elf = elf_begin(infd, ELF_C_READ, NULL);
+  elf = elf_begin(infd, ELF_C_READ, nullptr);
   if (!elf) {
     LOG(ERROR) << "Cannot read ELF file: " << elf_errmsg(-1);
     err = 1;
@@ -282,7 +283,7 @@ int load(BPFtrace &bpftrace, const std::string &in)
     }
 
     if (std::string_view(secname) == AOT_ELF_SECTION) {
-      data = elf_getdata(scn, 0);
+      data = elf_getdata(scn, nullptr);
       if (!data) {
         LOG(ERROR) << "Failed to get BTAOT ELF section(" << i
                    << ") data: " << elf_errmsg(-1);
@@ -337,9 +338,8 @@ int load(BPFtrace &bpftrace, const std::string &in)
   if (err)
     goto out;
 
-  bpftrace.bytecode_ = elf::parseBpfBytecodeFromElfObject(btaot_section +
-                                                              hdr->elf_off,
-                                                          hdr->elf_len);
+  bpftrace.bytecode_ = BpfBytecode{ std::span<uint8_t>{
+      btaot_section + hdr->elf_off, hdr->elf_len } };
   if (err)
     goto out;
 
@@ -351,5 +351,4 @@ out:
   return err;
 }
 
-} // namespace aot
-} // namespace bpftrace
+} // namespace bpftrace::aot

@@ -1,6 +1,7 @@
 = bpftrace(8)
 :doctype: manpage
 :toc: true
+:toclevels: 1
 
 ////
 Style guide:
@@ -67,18 +68,22 @@ When the child terminates bpftrace will also terminate, as if 'exit()' had been 
 If bpftrace terminates before the child process does the child process will be terminated with a SIGTERM.
 If used, 'USDT' probes will only be attached to the child process.
 To avoid a race condition when using 'USDTs', the child is stopped after 'execve' using 'ptrace(2)' and continued when all 'USDT' probes are attached.
-The child PID is available to programs as the 'cpid' builtin.
 The child process runs with the same privileges as bpftrace itself (usually root).
 
-=== *-d*
+Unless otherwise specified, bpftrace does not perform any implicit filtering. Therefore, if you are only interested in
+events in _COMMAND_, you may want to filter based on the child PID. The child PID is available to programs as the 'cpid' builtin.
+For example, you could add the predicate `/pid == cpid/` to probes with userspace context.
+
+=== *-d STAGE*
 
 Enable debug mode.
 For more details see the <<Debug Output>> section.
 
-=== *-dd*
+=== *--dry-run*
 
-Enable verbose debug mode.
-For more details see the <<Debug Output>> section.
+Terminate execution right after attaching all the probes. Useful for testing
+that the script can be parsed, loaded, and attached, without actually running
+it.
 
 === *-e* _PROGRAM_
 
@@ -92,7 +97,7 @@ Valid values are::
 *json* +
 *text*
 
-Note: the json output is ndjson, meaning each line of the streamed output is a single blob of valid json.
+The JSON output is compatible with NDJSON and JSON Lines, meaning each line of the streamed output is a single blob of valid JSON.
 
 === *-h, --help*
 
@@ -231,20 +236,21 @@ For more details see the <<Verbose Output>> section.
 Programs saved as files are often called scripts and can be executed by specifying their file name.
 We use a `.bt` file extension, short for bpftrace, but the extension is not required.
 
-For example, listing the sleepers.bt file using `cat -n`:
+For example, listing the sleepers.bt file using `cat`:
 
 ----
-# cat -n sleepers.bt
-1 tracepoint:syscalls:sys_enter_nanosleep
-2 {
-3   printf("%s is sleeping.\n", comm);
-4 }
+# cat sleepers.bt
+
+tracepoint:syscalls:sys_enter_nanosleep {
+  printf("%s is sleeping.\n", comm);
+}
 ----
 
 And then calling it:
 
 ----
 # bpftrace sleepers.bt
+
 Attaching 1 probe...
 iscsid is sleeping.
 iscsid is sleeping.
@@ -254,13 +260,11 @@ It can also be made executable to run stand-alone.
 Start by adding an interpreter line at the top (`#!`) with either the path to your installed bpftrace (/usr/local/bin is the default) or the path to `env` (usually just `/usr/bin/env`) followed by `bpftrace` (so it will find bpftrace in your `$PATH`):
 
 ----
-# cat -n sleepers.bt
-1 #!/usr/local/bin/bpftrace
-2
-3 tracepoint:syscalls:sys_enter_nanosleep
-4 {
-5   printf("%s is sleeping.\n", comm);
-6 }
+#!/usr/local/bin/bpftrace
+
+tracepoint:syscalls:sys_enter_nanosleep {
+  printf("%s is sleeping.\n", comm);
+}
 ----
 
 Then make it executable:
@@ -268,6 +272,7 @@ Then make it executable:
 ----
 # chmod 755 sleepers.bt
 # ./sleepers.bt
+
 Attaching 1 probe...
 iscsid is sleeping.
 iscsid is sleeping.
@@ -365,7 +370,7 @@ Both single line and multi line comments are supported.
 
 ----
 // A single line comment
-i:s:1 { // can also be used to comment inline
+interval:s:1 { // can also be used to comment inline
 /*
  a multi line comment
 
@@ -432,9 +437,10 @@ inside a script config block.
 
 === Data Types
 
-The following fundamental integer types are provided by the language.
-Integers are internally represented as 64 bit signed.
-If you need another representation, you may cast to the following built in types:
+The following fundamental types are provided by the language.
+Note: Integers are by default represented as 64 bit signed but that can be
+changed by either casting them or, for scratch variables, explicitly specifying
+the type upon declaration.
 
 [cols="~,~"]
 |===
@@ -500,7 +506,7 @@ Identifiers must match the following regular expression: `[_a-zA-Z][_a-zA-Z0-9]*
 
 === Literals
 
-Integer, char, and string literals are supported.
+Integer and string literals are supported.
 
 Integer literals can be defined in the following formats:
 
@@ -519,11 +525,17 @@ To improve the readability of big literals an underscore `_` can be used as fiel
 Integer suffixes as found in the C language are parsed by bpftrace to ensure compatibility with C headers/definitions but they're not used as size specifiers.
 `123UL`, `123U` and `123LL` all result in the same integer type with a value of `123`.
 
-Character literals can be defined by enclosing the character in single quotes e.g. `$c = 'c';`.
+Character literals are not supported at this time, and the corresponding ASCII code must be used instead:
+
+----
+BEGIN {
+  printf("Echo A: %c\n", 65);
+}
+----
 
 String literals can be defined by enclosing the character string in double quotes e.g. `$str = "Hello world";`.
 
-Characters and strings support the following escape sequences:
+Strings support the following escape sequences:
 
 [cols="~,~"]
 |===
@@ -600,7 +612,7 @@ Within a while-loop the following control flow statements can be used:
 |===
 
 ----
-i:s:1 {
+interval:s:1 {
   $i = 0;
   while ($i <= 100) {
     printf("%d ", $i);
@@ -629,13 +641,13 @@ As this happens at compile time `n` must be a constant greater than 0 (`n > 0`).
 The following two probes compile into the same code:
 
 ----
-i:s:1 {
+interval:s:1 {
   unroll(3) {
     print("Unrolled")
   }
 }
 
-i:s:1 {
+interval:s:1 {
   print("Unrolled")
   print("Unrolled")
   print("Unrolled")
@@ -667,7 +679,15 @@ The following operators are available for integer arithmetic:
 
 |===
 
-// TODO: Words about integer conversion when types mismatch
+Operations between a signed and an unsigned integer are allowed providing
+bpftrace can statically prove a safe conversion is possible. If safe conversion
+is not guaranteed, the operation is undefined behavior and a corresponding
+warning will be emitted.
+
+If the two operands are different size, the smaller integer is implicitly
+promoted to the size of the larger one. Sign is preserved in the promotion.
+For example, `(uint32)5 + (uint8)3` is converted to `(uint32)5 + (uint32)3`
+which results in `(uint32)8`.
 
 ==== Logical Operators
 
@@ -790,9 +810,9 @@ All these operators are syntactic sugar for combining assignment with the specif
 
 ==== Increment and Decrement Operators
 
-The increment (`\++`) and decrement (`--`) operators can be used on integer and pointer variables to increment their value by one.
+The increment (`{plus}{plus}`) and decrement (`--`) operators can be used on integer and pointer variables to increment their value by one.
 They can only be used on variables and can either be applied as prefix or suffix.
-The difference is that the expression `x++` returns the original value of `x`, before it got incremented while `++x` returns the value of `x` post increment.
+The difference is that the expression `x{plus}{plus}` returns the original value of `x`, before it got incremented while `{plus}{plus}x` returns the value of `x` post increment.
 
 ----
 $x = 10;
@@ -804,7 +824,7 @@ $b = --$a; // a = 9; b = 9
 Note that maps will be implicitly declared and initialized to 0 if not already declared or defined.
 Scratch variables must be initialized before using these operators.
 
-Note `++`/`--` on a shared global variable can lose updates. See <<map-functions-count, `count()`>> for more details.
+Note `{plus}{plus}`/`--` on a shared global variable can lose updates. See <<map-functions-count, `count()`>> for more details.
 
 === Pointers
 
@@ -845,7 +865,7 @@ Individual fields can be accessed with the `.` operator.
 Tuples are zero indexed like arrays are.
 
 ----
-i:s:1 {
+interval:s:1 {
   $a = (1,2);
   $b = (3,4, $a);
   print($a);
@@ -911,7 +931,7 @@ This feature is especially useful when working with IP addresses since various l
 Array casting allows seamless comparison of such representations:
 
 ----
-kfunc:tcp_connect {
+fentry:tcp_connect {
     if (args->sk->__sk_common.skc_daddr == (uint32)pton("127.0.0.1"))
         ...
 }
@@ -921,8 +941,37 @@ kfunc:tcp_connect {
 
 bpftrace knows two types of variables, 'scratch' and 'map'.
 
-'scratch' variables are kept on the BPF stack and only exists during the execution of the action block and cannot be accessed outside of the program.
-Scratch variable names always start with a `$`, e.g. `$myvar`.
+'scratch' variables are kept on the BPF stack and their names always start
+with a `$`, e.g. `$myvar`.
+'scratch' variables cannot be accessed outside of their lexical block e.g.
+```
+$a = 1;
+if ($a == 1) {
+  $b = "hello"
+  $a = 2;
+}
+// $b is not accessible here
+```
+
+'scratch' variables can also declared before or during initialization with `let` e.g.
+```
+let $a = 1;
+let $b;
+if ($a == 1) {
+  $b = "hello"
+  $a = 2;
+}
+// $b IS accessible here and would be an empty string if the condition wasn't true
+```
+
+If no assignment is specified variables will initialize to 0.
+
+You can also specify the type in the declaration e.g.
+```
+let $x: uint8;
+let $y: uint8 = 7;
+let $a: string = "hiya";
+```
 
 'map' variables use BPF 'maps'.
 These exist for the lifetime of `bpftrace` itself and can be accessed from all action blocks and user-space.
@@ -932,37 +981,58 @@ All valid identifiers can be used as `name`.
 
 The data type of a variable is automatically determined during first assignment and cannot be changed afterwards.
 
-==== Associative Arrays
+==== Maps without Explicit Keys
 
-Associative arrays are a collection of elements indexed by a key, similar to the hash tables found in languages like C++ (`std::map`) and Python (`dict`).
-They're a variant of 'map' variables.
+Values can be assigned directly to maps without a key (sometimes refered to as scalar maps).
+Note: you can't iterate over these maps as they don't have an accessible key.
+
+----
+@name = expression
+----
+
+==== Map Keys
+
+Setting single value map keys.
 
 ----
 @name[key] = expression
+----
+
+Map keys that are composed of multiple values are represented as tuples e.g.
+
+----
+@name[(key1,key2)] = expression
+----
+
+However, this, more concise, syntax is supported and the same as the explicit
+tuple above:
+
+----
 @name[key1,key2] = expression
 ----
 
 Just like with any variable the type is determined on first use and cannot be modified afterwards.
 This applies to both the key(s) and the value type.
 
-The following snippet creates a map with key signature `[int64, string[16]]` and a value type of `int64`:
+The following snippets create a map with key signature `(int64, string[16])` and a value type of `int64`:
 
 ----
 @[pid, comm]++
+@[(pid, comm)]++
 ----
 
 ==== Per-Thread Variables
 
-These can be implemented as an associative array keyed on the thread ID. For example, `@start[tid]`:
+These can be implemented as a map keyed on the thread ID. For example, `@start[tid]`:
 
 ----
 kprobe:do_nanosleep {
   @start[tid] = nsecs;
 }
 
-kretprobe:do_nanosleep /@start[tid] != 0/ {
+kretprobe:do_nanosleep /has_key(@start, tid)/ {
   printf("slept for %d ms\n", (nsecs - @start[tid]) / 1000000);
-  delete(@start[tid]);
+  delete(@start, tid);
 }
 
 /*
@@ -972,6 +1042,24 @@ kretprobe:do_nanosleep /@start[tid] != 0/ {
  * slept for 2002 ms
  * ...
  */
+----
+
+This style of map may also be useful for capturing output parameters, or other context, between two different probes. For example:
+
+----
+tracepoint:syscalls:sys_enter_wait4
+{
+  @out[tid] = args.ru;
+}
+
+tracepoint:syscalls:sys_exit_wait4
+{
+  $ru = @out[tid];
+  delete(@out, tid);
+  if ($ru != 0) {
+    printf("got usage ...", ...);
+  }
+}
 ----
 
 == Builtins
@@ -1012,7 +1100,7 @@ For string arguments use the `str()` call to retrieve the value.
 | struct args
 | n/a
 | n/a
-| The struct of all arguments of the traced function. Available in `tracepoint`, `kfunc`, and `uprobe` (with DWARF) probes. Use `args.x` to access argument `x` or `args` to get a record with all arguments.
+| The struct of all arguments of the traced function. Available in `tracepoint`, `fentry`, `fexit`, and `uprobe` (with DWARF) probes. Use `args.x` to access argument `x` or `args` to get a record with all arguments.
 
 | cgroup
 | uint64
@@ -1075,7 +1163,7 @@ For string arguments use the `str()` call to retrieve the value.
 | ID of the NUMA node executing the BPF program
 
 | pid
-| uint64
+| uint32
 | 4.2
 | get_current_pid_tgid
 | Process ID of the current thread (aka thread group ID), as seen from the init namespace
@@ -1102,10 +1190,10 @@ For string arguments use the `str()` call to retrieve the value.
 | int64
 | n/a
 | n/a
-| Value returned by the function being traced (kretprobe, uretprobe, kretfunc)
+| Value returned by the function being traced (kretprobe, uretprobe, fexit)
 
 | tid
-| uint64
+| uint32
 | 4.2
 | get_current_pid_tgid
 | Thread ID of the current thread, as seen from the init namespace
@@ -1228,8 +1316,8 @@ Tracing block I/O sizes > 0 bytes
 | Convert cgroup id to cgroup path
 | Sync
 
-| <<functions-exit, `exit()`>>
-| Quit bpftrace
+| <<functions-exit, `exit([int code])`>>
+| Quit bpftrace with an optional exit code
 | Async
 
 | <<functions-join, `join(char *arr[] [, char *delim])`>>
@@ -1272,7 +1360,7 @@ Tracing block I/O sizes > 0 bytes
 | Override return value
 | Sync
 
-| <<functions-path, `path(struct path *path)`>>
+| <<functions-path, `path(struct path *path [, int32 size])`>>
 | Return full path
 | Sync
 
@@ -1372,7 +1460,7 @@ The return type is an unsigned integer of the same width as `n`.
 === buf
 
 .variants
-* `buf_t buf(void * data, [int64 length])`
+* `buffer buf(void * data, [int64 length])`
 
 `buf` reads `length` amount of bytes from address `data`.
 The maximum value of `length` is limited to the `BPFTRACE_MAX_STRLEN` variable.
@@ -1380,12 +1468,12 @@ For arrays the `length` is optional, it is automatically inferred from the signa
 
 `buf` is address space aware and will call the correct helper based on the address space associated with `data`.
 
-The `buf_t` object returned by `buf` can safely be printed as a hex encoded string with the `%r` format specifier.
+The `buffer` object returned by `buf` can safely be printed as a hex encoded string with the `%r` format specifier.
 
 Bytes with values >=32 and \<=126 are printed using their ASCII character, other bytes are printed in hex form (e.g. `\x00`). The `%rx` format specifier can be used to print everything in hex form, including ASCII characters. The similar `%rh` format specifier prints everything in hex form without `\x` and with spaces between bytes (e.g. `0a fe`).
 
 ----
-i:s:1 {
+interval:s:1 {
   printf("%r\n", buf(kaddr("avenrun"), 8));
 }
 ----
@@ -1408,7 +1496,7 @@ Dump the contents of the named file to stdout.
 If the file cannot be opened or read an error is printed to stderr.
 
 ----
-t:syscalls:sys_enter_execve {
+tracepoint:syscalls:sys_enter_execve {
   cat("/proc/%d/maps", pid);
 }
 ----
@@ -1441,7 +1529,7 @@ BEGIN {
 === cgroup_path
 
 .variants
-* `cgroup_path cgroup_path(int cgroupid, string filter)`
+* `cgroup_path_t cgroup_path(int cgroupid, string filter)`
 
 Convert cgroup id to cgroup path.
 This is done asynchronously in userspace when the cgroup_path value is printed,
@@ -1470,12 +1558,27 @@ BEGIN {
 === exit
 
 .variants
-* `void exit()`
+* `void exit([int code])`
 
 *async*
 
 Terminate bpftrace, as if a `SIGTERM` was received.
 The `END` probe will still trigger (if specified) and maps will be printed.
+An optional exit code can be provided.
+
+----
+BEGIN {
+  exit();
+}
+----
+
+Or
+
+----
+BEGIN {
+  exit(1);
+}
+----
 
 [#functions-join]
 === join
@@ -1506,7 +1609,15 @@ tracepoint:syscalls:sys_enter_execve {
 
 Get the address of the kernel symbol `name`.
 
-The following script:
+----
+interval:s:1 {
+  $avenrun = kaddr("avenrun");
+  $load1 = *$avenrun;
+}
+----
+
+You can find all kernel symbols at `/proc/kallsyms`.
+
 
 [#functions-kptr]
 === kptr
@@ -1641,7 +1752,7 @@ Defaults to `boot` if no clock is explicitly requested.
 - `nsecs(sw_tai)` - approximation of TAI timestamp in nanoseconds, is obtained through the "triple vdso sandwich" method. For older kernels without direct TAI timestamp access in BPF.
 
 ----
-i:s:1 {
+interval:s:1 {
   $sw_tai1 = nsecs(sw_tai);
   $tai = nsecs(tai);
   $sw_tai2 = nsecs(sw_tai);
@@ -1660,9 +1771,9 @@ i:s:1 {
 === ntop
 
 .variants
-* `inet_t ntop([int64 af, ] int addr)`
-* `inet_t ntop([int64 af, ] char addr[4])`
-* `inet_t ntop([int64 af, ] char addr[16])`
+* `inet ntop([int64 af, ] int addr)`
+* `inet ntop([int64 af, ] char addr[4])`
+* `inet ntop([int64 af, ] char addr[16])`
 
 `ntop` returns the string representation of an IPv4 or IPv6 address.
 `ntop` will infer the address type (IPv4 or IPv6) based on the `addr` type and size.
@@ -1701,7 +1812,7 @@ Note that subfields are not yet supported.
 When using `override` the probed function will not be executed and instead `rc` will be returned.
 
 ----
-k:__x64_sys_getuid
+kprobe:__x64_sys_getuid
 /comm == "id"/ {
   override(2<<21);
 }
@@ -1724,13 +1835,14 @@ Error attaching probe: 'kprobe:vfs_read'
 === path
 
 .variants
-* `char * path(struct path * path)`
+* `char * path(struct path * path [, int32 size])`
 
 *Kernel* 5.10
 
 *Helper* `bpf_d_path`
 
-Return full path referenced by struct path pointer in argument.
+Return full path referenced by struct path pointer in argument. If `size` is set,
+the path will be clamped by `size` otherwise `BPFTRACE_MAX_STRLEN` is used.
 
 This function can only be used by functions that are allowed to, these functions are contained in the `btf_allowlist_d_path` set in the kernel.
 
@@ -1751,7 +1863,7 @@ This function can only be used by functions that are allowed to, these functions
 `print` prints a the value, which can be a map or a scalar value, with the default formatting for the type.
 
 ----
-i:s:1 {
+interval:s:1 {
   print(123);
   print("abc");
   exit();
@@ -1765,8 +1877,8 @@ i:s:1 {
 ----
 
 ----
-i:ms:10 { @=hist(rand); }
-i:s:1 {
+interval:ms:10 { @=hist(rand); }
+interval:s:1 {
   print(@);
   exit();
 }
@@ -1817,7 +1929,7 @@ Scaling values before storing them can result in rounding errors.
 Consider the following program:
 
 ----
-k:f {
+kprobe:f {
   @[func] += arg0/10;
 }
 ----
@@ -1869,7 +1981,27 @@ The non-standard ones can be found in the table below:
 
 |===
 
-Supported escape sequences
+`printf()` can also symbolize enums as strings. User defined enums as well as enums
+defined in the kernel are supported. For example:
+
+----
+enum custom {
+  CUSTOM_ENUM = 3,
+};
+
+BEGIN {
+  $r = SKB_DROP_REASON_SOCKET_FILTER;
+  printf("%d, %s, %s\n", $r, $r, CUSTOM_ENUM);
+  exit();
+}
+----
+
+yields:
+
+----
+6, SKB_DROP_REASON_SOCKET_FILTER, CUSTOM_ENUM
+----
+
 
 Colors are supported too, using standard terminal escape sequences:
 
@@ -1971,11 +2103,11 @@ Usage
 
 ----
 # cat dump.bt
-kfunc:napi_gro_receive {
+fentry:napi_gro_receive {
   $ret = skboutput("receive.pcap", args.skb, args.skb->len, 0);
 }
 
-kfunc:dev_queue_xmit {
+fentry:dev_queue_xmit {
   // setting offset to 14, to exclude ethernet header
   $ret = skboutput("output.pcap", args.skb, args.skb->len, 14);
   printf("skboutput returns %d\n", $ret);
@@ -2022,7 +2154,7 @@ bpftrace doesn't read past the length of the shortest string.
 === strerror
 
 .variants
-* `strerror strerror(int error)`
+* `strerror_t strerror(int error)`
 
 Convert errno code to string.
 This is done asynchronously in userspace when the strerror value is printed, hence the returned value can only be used for printing.
@@ -2038,17 +2170,17 @@ BEGIN {
 === strftime
 
 .variants
-* `strtime_t strftime(const string fmt, int64 timestamp_ns)`
+* `timestamp strftime(const string fmt, int64 timestamp_ns)`
 
 *async*
 
 Format the nanoseconds since boot timestamp `timestamp_ns` according to the format specified by `fmt`.
-The time conversion and formatting happens in user space, therefore  the `timestr_t` value returned can only be used for printing using the `%s` format specifier.
+The time conversion and formatting happens in user space, therefore  the `timestamp` value returned can only be used for printing using the `%s` format specifier.
 
 bpftrace uses the `strftime(3)` function for formatting time and supports the same format specifiers.
 
 ----
-i:s:1 {
+interval:s:1 {
   printf("%s\n", strftime("%H:%M:%S", nsecs));
 }
 ----
@@ -2091,19 +2223,19 @@ The use of the `==` and `!=` operators is recommended over calling `strncmp` dir
 The `command` is run with the same privileges as bpftrace and it blocks execution of the processing threads which can lead to missed events and delays processing of async events.
 
 ----
-i:s:1 {
+interval:s:1 {
   time("%H:%M:%S: ");
   printf("%d\n", @++);
 }
-i:s:10 {
+interval:s:10 {
   system("/bin/sleep 10");
 }
-i:s:30 {
+interval:s:30 {
   exit();
 }
 ----
 
-Note how the async `time` and `printf` first print every second until the `i:s:10` probe hits, then they print every 10 seconds due to bpftrace blocking on `sleep`.
+Note how the async `time` and `printf` first print every second until the `interval:s:10` probe hits, then they print every 10 seconds due to bpftrace blocking on `sleep`.
 
 ----
 Attaching 3 probes...
@@ -2132,7 +2264,7 @@ Attaching 3 probes...
 `system` supports the same format string and arguments that `printf` does.
 
 ----
-t:syscalls:sys_enter_execve {
+tracepoint:syscalls:sys_enter_execve {
   system("/bin/grep %s /proc/%d/status", "vmswap", pid);
 }
 ----
@@ -2309,6 +2441,8 @@ The data type associated with these functions are only for internal use and are 
 
 Functions that are marked *async* are asynchronous which can lead to unexpected behavior, see the <<Invocation Mode>> section for more information.
 
+See <<Advanced Topics>> for more information on <<Map Printing>>.
+
 [%header,cols="~,~,~"]
 |===
 | Function Name
@@ -2327,8 +2461,12 @@ Functions that are marked *async* are asynchronous which can lead to unexpected 
 | Count how often this function is called.
 | Sync
 
-| <<map-functions-delete, `delete(mapkey k, ...)`>>
-| Delete a single key from a map. For a single value map this deletes the only element. For an associative-array the key to delete has to be specified. Multiple arguments can be passed to delete many keys at once.
+| <<map-functions-delete, `delete(map m, mapkey k)`>>
+| Delete a single key from a map.
+| Sync
+
+| <<map-functions-has_key, `has_key(map m, mapkey k)`>>
+| Return true (1) if the key exists in this map. Otherwise return false (0).
 | Sync
 
 | <<map-functions-hist, `hist(int64 n[, int k])`>>
@@ -2374,7 +2512,7 @@ Functions that are marked *async* are asynchronous which can lead to unexpected 
 Calculate the running average of `n` between consecutive calls.
 
 ----
-i:s:1 {
+interval:s:1 {
   @x++;
   @y = avg(@x);
   print(@x);
@@ -2383,7 +2521,10 @@ i:s:1 {
 ----
 
 Internally this keeps two values in the map: value count and running total.
-The average is computed in user-space when printing by dividing the total by the count.
+The average is computed in user-space when printing by dividing the total by the
+count. However, you can get the average in kernel space in expressions like
+`if (@y == 5)` but this is expensive as bpftrace needs to iterate over all the
+cpus to collect and sum BOTH count and total.
 
 [#map-functions-clear]
 === clear
@@ -2396,11 +2537,11 @@ The average is computed in user-space when printing by dividing the total by the
 Clear all keys/values from map `m`.
 
 ----
-i:ms:100 {
+interval:ms:100 {
   @[rand % 10] = count();
 }
 
-i:s:10 {
+interval:s:10 {
   print(@);
   clear(@);
 }
@@ -2414,18 +2555,39 @@ i:s:10 {
 
 Count how often this function is called.
 
-Using `@=count()` is conceptually similar to `@++`.
-The difference is that the `count()` function uses a map type optimized for this (PER_CPU), increasing performance and correctness.
-Multiple writers to a shared global var might lose counts as bpftrace doesn't update them atomically.
-Due to this the map cannot be accessed as a regular integer.
+Using `@=count()` is conceptually similar to `@{plus}{plus}`.
+The difference is that the `count()` function uses a map type optimized for
+performance and correctness using cheap, thread-safe writes (PER_CPU). However, sync reads
+can be expensive as bpftrace needs to iterate over all the cpus to collect and
+sum these values.
 
+Note: This differs from "raw" writes (e.g. `@{plus}{plus}`) where multiple writers to a
+shared location might lose updates, as bpftrace does not generate any atomic instructions
+for `{plus}{plus}`.
+
+Example one:
 ----
-i:ms:100 {
+BEGIN {
+  @ = count();
+  @ = count();
+  printf("%d\n", (int64)@);   // prints 2
+  exit();
+}
+----
+
+Example two:
+----
+interval:ms:100 {
   @ = count();
 }
 
-i:s:10 {
+interval:s:10 {
+  // async read
   print(@);
+  // sync read
+  if (@ > 10) {
+    print(("hello"));
+  }
   clear(@);
 }
 ----
@@ -2434,23 +2596,58 @@ i:s:10 {
 === delete
 
 .variants
-* `delete(mapkey k, ...)`
+* `delete(map m, mapkey k)`
+* deprecated `delete(mapkey k)`
 
 Delete a single key from a map.
-For a single value map this deletes the only element.
-For an associative-array the key to delete has to be specified.
-Multiple arguments can be passed to delete many keys at once.
+For scalar maps (e.g. no explicit keys), the key is omitted and is equivalent to calling `clear`.
+For map keys that are composed of multiple values (e.g. `@mymap[3, "hello"] = 1` - remember these values are represented as a tuple) the syntax would be: `delete(@mymap, (3, "hello"));`
+
+The, now deprecated, API (supported in version <= 0.21.x) of passing map arguments with the key is still supported:
+e.g. `delete(@mymap[3, "hello"]);`.
 
 ```
-k:dummy {
+kprobe:dummy {
   @scalar = 1;
+  delete(@scalar); // ok
+  @single["hello"] = 1;
+  delete(@single, "hello"); // ok
   @associative[1,2] = 1;
-  delete(@scalar);
-  delete(@associative[1,2]);
-  // alternatively, you can delete both at once
-  delete(@scalar, @associative[1,2]);
-
+  delete(@associative, (1,2)); // ok
   delete(@associative); // error
+  delete(@associative, 1); // error
+
+  // deprecated but ok
+  delete(@single["hello"]);
+  delete(@associative[1, 2]);
+}
+```
+
+[#map-functions-has_key]
+=== has_key
+
+.variants
+* `int has_key(map m, mapkey k)`
+
+Return true (1) if the key exists in this map.
+Otherwise return false (0).
+Error if called with a map that has no keys (aka scalar map).
+Return value can also be used for scratch variables and map keys/values.
+
+```
+kprobe:dummy {
+  @associative[1,2] = 1;
+  if (!has_key(@associative, (1,3))) { // ok
+    print(("bye"));
+  }
+
+  @scalar = 1;
+  if (has_key(@scalar)) { // error
+    print(("hello"));
+  }
+
+  $a = has_key(@associative, (1,2)); // ok
+  @b[has_key(@associative, (1,2))] = has_key(@associative, (1,2)); // ok
 }
 ```
 
@@ -2505,11 +2702,11 @@ Create a linear histogram of `n`.
 Values in the range `(-inf, min)` and `(max, inf)` get their get their own bucket too, bringing the total amount of buckets created to `M+2`.
 
 ----
-i:ms:1 {
+interval:ms:1 {
   @ = lhist(rand %10, 0, 10, 1);
 }
 
-i:s:5 {
+interval:s:5 {
   exit();
 }
 ----
@@ -2537,6 +2734,28 @@ Prints:
 * `max(int64 n)`
 
 Update the map with `n` if `n` is bigger than the current value held.
+Similar to `count` this uses a PER_CPU map (thread-safe, fast writes, slow reads).
+
+Note: this is different than the typical userspace `max()` in that bpftrace's `max()`
+only takes a single argument. The logical "other" argument to compare to is the value
+in the map the "result" is being assigned to.
+
+For example, compare the two logically equivalent samples (C++ vs bpftrace):
+
+In C++:
+----
+int x = std::max(3, 33);  // x contains 33
+----
+
+In bpftrace:
+----
+@x = max(3);
+@x = max(33);   // @x contains 33
+----
+
+Also note that bpftrace takes care to handle the unset case. In other words,
+there is no default value. The first value you pass to `max()` will always
+be returned.
 
 [#map-functions-min]
 === min
@@ -2545,6 +2764,9 @@ Update the map with `n` if `n` is bigger than the current value held.
 * `min(int64 n)`
 
 Update the map with `n` if `n` is smaller than the current value held.
+Similar to `count` this uses a PER_CPU map (thread-safe, fast writes, slow reads).
+
+See `max()` above for how this differs from the typical userspace `min()`.
 
 [#map-functions-stats]
 === stats
@@ -2574,6 +2796,44 @@ kprobe:vfs_read {
 * `sum(int64 n)`
 
 Calculate the sum of all `n` passed.
+
+Using `@=sum(5)` is conceptually similar to `@+=5`.
+The difference is that the `sum()` function uses a map type optimized for
+performance and correctness using cheap, thread-safe writes (PER_CPU). However, sync reads
+can be expensive as bpftrace needs to iterate over all the cpus to collect and
+sum these values.
+
+Note: This differs from "raw" writes (e.g. `@+=5`) where multiple writers to a
+shared location might lose updates, as bpftrace does not generate any implicit
+atomic operations.
+
+Example one:
+----
+BEGIN {
+  @ = sum(5);
+  @ = sum(6);
+  printf("%d\n", (int64)@);   // prints 11
+  clear(@);
+  exit();
+}
+----
+
+Example two:
+----
+interval:ms:100 {
+  @ = sum(5);
+}
+
+interval:s:10 {
+  // async read
+  print(@);
+  // sync read
+  if (@ > 10) {
+    print(("hello"));
+  }
+  clear(@);
+}
+----
 
 [#map-functions-zero]
 === zero
@@ -2620,61 +2880,80 @@ kprobe:tcp_reset,kprobe:*socket* {
 
 Most providers also support a short name which can be used instead of the full name, e.g. `kprobe:f` and `k:f` are identical.
 
-[cols="~,~,~"]
+[cols="~,~,~,~"]
 |===
 |*Probe Name*
+|*Short Name*
 |*Description*
 |*Kernel/User Level*
 
 | <<probes-begin-end, `BEGIN/END`>>
+| -
+| Built-in events
+| Kernel/User
+
+| <<probes-self, `self`>>
+| -
 | Built-in events
 | Kernel/User
 
 | <<probes-hardware, `hardware`>>
+| `h`
 | Processor-level events
 | Kernel
 
 | <<probes-interval, `interval`>>
+| `i`
 | Timed output
 | Kernel/User
 
 | <<probes-iterator, `iter`>>
+| `it`
 | Iterators tracing
 | Kernel
 
-| <<probes-kfunc, `kfunc/kretfunc`>>
+| <<probes-fentry, `fentry/fexit`>>
+| `f`/`fr`
 | Kernel functions tracing with BTF support
 | Kernel
 
 | <<probes-kprobe, `kprobe/kretprobe`>>
+| `k`/`kr`
 | Kernel function start/return
 | Kernel
 
 | <<probes-profile, `profile`>>
+| `p`
 | Timed sampling
 | Kernel/User
 
 | <<probes-rawtracepoint, `rawtracepoint`>>
+| `rt`
 | Kernel static tracepoints with raw arguments
 | Kernel
 
 | <<probes-software, `software`>>
+| `s`
 | Kernel software events
 | Kernel
 
 | <<probes-tracepoint, `tracepoint`>>
+| `t`
 | Kernel static tracepoints
 | Kernel
 
 | <<probes-uprobe, `uprobe/uretprobe`>>
+| `u`/`ur`
 | User-level function start/return
 | User
 
 | <<probes-usdt, `usdt`>>
+| `U`
 | User-level static tracepoints
 | User
 
 | <<probes-watchpoint, `watchpoint/asyncwatchpoint`>>
+| `w`/`aw`
 | Memory watchpoints
 | Kernel
 |===
@@ -2693,6 +2972,22 @@ To prevent printing all used maps need be cleared in the `END` probe:
 END {
     clear(@map1);
     clear(@map2);
+}
+----
+
+[#probes-self]
+=== self
+
+.variants
+* `self:signal:SIGUSR1`
+
+These are special built-in events provided by the bpftrace runtime.
+The trigger function is called by the bpftrace runtime when the bpftrace process receives specific events, such as a `SIGUSR1` signal.
+When multiple signal handlers are attached to the same signal, only the first one is used.
+
+----
+self:signal:SIGUSR1 {
+  print("abc");
 }
 ----
 
@@ -2844,42 +3139,42 @@ iter:task_file:/sys/fs/bpf/files {
  */
 ----
 
-[#probes-kfunc]
-=== kfunc and kretfunc
+[#probes-fentry]
+=== fentry and fexit
 
 .variants
-* `kfunc[:module]:fn`
 * `fentry[:module]:fn`
-* `kretfunc[:module]:fn`
 * `fexit[:module]:fn`
 
 .short names
-* `f` (`kfunc` or `fentry`)
-* `fr` (`kretfunc` or `fexit`)
+* `f` (`fentry`)
+* `fr` (`fexit`)
 
 .requires (`--info`)
 * Kernel features:BTF
-* Probe types:kfunc
+* Probe types:fentry
 
-``kfunc``s attach to kernel functions similar to <<probes-kprobe>>.
+``fentry``/``fexit`` probes attach to kernel functions similar to <<probes-kprobe>>.
 They make use of eBPF trampolines which allow kernel code to call into BPF programs with near zero overhead.
-`kfunc` and `kretfunc` are aliased as `fentry` and `fexit` to match how these are referenced in the kernel.
+Originally, these were called `kfunc` and `kretfunc` but were later renamed to `fentry` and `fexit` to match
+how these are referenced in the kernel and to prevent confusion with https://docs.kernel.org/bpf/kfuncs.html[BPF Kernel Functions].
+The original names are still supported for backwards compatibility.
 
-``kfunc``s make use of BTF type information to derive the type of function arguments at compile time.
+``fentry``/``fexit`` probes make use of BTF type information to derive the type of function arguments at compile time.
 This removes the need for manual type casting and makes the code more resilient against small signature changes in the kernel.
 The function arguments are available in the `args` struct which can be inspected by doing verbose listing (see <<Listing Probes>>).
-These arguments are also available in the return probe (`kretfunc`), unlike `kretprobe`.
+These arguments are also available in the return probe (`fexit`), unlike `kretprobe`.
 
 ----
-# bpftrace -lv 'kfunc:tcp_reset'
+# bpftrace -lv 'fentry:tcp_reset'
 
-kfunc:tcp_reset
+fentry:tcp_reset
     struct sock * sk
     struct sk_buff * skb
 ----
 
 ----
-kfunc:x86_pmu_stop {
+fentry:x86_pmu_stop {
   printf("pmu %s stop\n", str(args.event->pmu->name));
 }
 ----
@@ -2887,7 +3182,7 @@ kfunc:x86_pmu_stop {
 The fget function takes one argument as file descriptor and you can access it via args.fd and the return value is accessible via retval:
 
 ----
-kretfunc:fget {
+fexit:fget {
   printf("fd %d name %s\n", args.fd, str(retval->f_path.dentry->d_name.name));
 }
 
@@ -3378,13 +3673,10 @@ system.
 
 Default: 64
 
-Number of bytes allocated on the BPF stack for the string returned by str().
-Make this larger if you wish to read bigger strings with str().
-Beware that the BPF stack is small (512 bytes), and that you pay the toll again inside printf() (whilst
-it composes a perf event output buffer).
-So in practice you can only grow this to about 200 bytes.
+The maximum length (in bytes) for values created by `str()`, `buf()` and `path()`.
 
-Support for even larger strings is being discussed: https://github.com/bpftrace/bpftrace/issues/305.
+This limit is necessary because BPF requires the size of all dynamically-read strings (and similar) to be declared up front. This is the size for all strings (and similar) in bpftrace unless specified at the call site.
+There is no artificial limit on what you can tune this to. But you may be wasting resources (memory and cpu) if you make this too high.
 
 === max_type_res_iterations
 
@@ -3392,6 +3684,27 @@ Default: 0
 
 Maximum number of levels of nested field accesses for tracepoint args.
 0 is unlimited.
+
+=== missing_probes
+
+Default: `warn`
+
+Controls handling of probes with multiple kprobe or uprobe attach points which
+cannot be attached to some functions because they do not exist in the kernel or
+in the traced binary.
+
+The possible options are:
+- `error` - always fail on missing probes
+- `warn` - print a warning but continue execution
+- `ignore` - silently ignore missing probes
+
+=== on_stack_limit
+
+Default: 32
+
+The maximum size (in bytes) of individual objects that will be stored on the BPF stack. If they are larger than this limit they will be stored in pre-allocated memory.
+
+This exists because the BPF stack is limited to 512 bytes and large objects make it more likely that we'll run out of space. bpftrace can store objects that are larger than the `on_stack_limit` in pre-allocated memory to prevent this stack error. However, storing in pre-allocated memory may be less memory efficient. Lower this default number if you are still seeing a stack memory error or increase it if you're worried about memory consumption.
 
 === perf_rb_pages
 
@@ -3422,6 +3735,26 @@ Default: `..`
 
 Trailer to add to strings that were truncated.
 Set to empty string to disable truncation trailers.
+
+=== print_maps_on_exit
+
+Default: 1
+
+Controls whether maps are printed on exit. Set to `0` in order to change the default behavior and not automatically print maps at program exit.
+
+=== symbol_source
+
+Default: `dwarf` if `bpftrace` is compiled with LLDB, `symbol_table` otherwise
+
+Choose how bpftrace will resolve all `uprobe` symbol locations.
+
+Available options:
+
+- `dwarf` - locate uprobes using DebugInfo, which yields more accurate stack traces (`ustack`). Fall back to the Symbol Table if it can't locate the probe using DebugInfo.
+- `symbol_table` - don't use DebugInfo and rely on the ELF Symbol Table instead.
+
+If the DebugInfo was rewritten by a post-linkage optimisation tool (like BOLT or AutoFDO), it might yield an incorrect address for a probe location.
+This config can force using the Symbol Table, for when the DebugInfo returns invalid addresses.
 
 == Environment Variables
 
@@ -3465,52 +3798,43 @@ See src/attached_probe.cpp:find_vmlinux() for details.
 
 === Debug Output
 
-The `-d` option produces debug output and does not run the program. This is mostly useful for debugging issues with bpftrace itself.
-You can also use `-dd` to produce a more verbose debug output, which will also print unoptimized IR.
+The `-d STAGE` option produces debug output. It prints the output of the
+bpftrace execution stage given by the _STAGE_ argument. The option can be used
+multiple times (with different stage names) and the special value `all` prints
+the output of all the supported stages. The option also takes multiple stages
+in one invocation as comma separated values.
 
 Note: This is primarily used for bpftrace developers.
 
-The output begins with `Program` and then an abstract syntax tree (AST) representation of the program.
+The supported options are:
 
-----
-# bpftrace -d -e 'tracepoint:syscalls:sys_enter_nanosleep { printf("%s is sleeping.\n", comm); }'
-Program
- tracepoint:syscalls:sys_enter_nanosleep
-  call: printf
-   string: %s is sleeping.\n
-   builtin: comm
-[...]
-----
+[cols="~,~"]
+|===
 
-Continued:
+| `ast`
+| Prints the Abstract Syntax Tree (AST) after every pass.
 
-----
-[...]
-%printf_t = type { i64, [16 x i8] }
-[...]
-define i64 @"tracepoint:syscalls:sys_enter_nanosleep"(i8*) local_unnamed_addr section "s_tracepoint:syscalls:sys_enter_nanosleep" {
-entry:
-  %comm = alloca [16 x i8], align 1
-  %printf_args = alloca %printf_t, align 8
-  %1 = bitcast %printf_t* %printf_args to i8*
-  call void @llvm.lifetime.start.p0i8(i64 -1, i8* nonnull %1)
-  %2 = getelementptr inbounds [16 x i8], [16 x i8]* %comm, i64 0, i64 0
-  %3 = bitcast %printf_t* %printf_args to i8*
-  call void @llvm.memset.p0i8.i64(i8* nonnull %3, i8 0, i64 24, i32 8, i1 false)
-  call void @llvm.lifetime.start.p0i8(i64 -1, i8* nonnull %2)
-  call void @llvm.memset.p0i8.i64(i8* nonnull %2, i8 0, i64 16, i32 1, i1 false)
-  %get_comm = call i64 inttoptr (i64 16 to i64 (i8*, i64)*)([16 x i8]* nonnull %comm, i64 16)
-  %4 = getelementptr inbounds %printf_t, %printf_t* %printf_args, i64 0, i32 1, i64 0
-  call void @llvm.memcpy.p0i8.p0i8.i64(i8* nonnull %4, i8* nonnull %2, i64 16, i32 1, i1 false)
-  %pseudo = call i64 @llvm.bpf.pseudo(i64 1, i64 1)
-  %get_cpu_id = call i64 inttoptr (i64 8 to i64 ()*)()
-  %perf_event_output = call i64 inttoptr (i64 25 to i64 (i8*, i8*, i64, i8*, i64)*)(i8* %0, i64 %pseudo, i64 %get_cpu_id, %printf_t* nonnull %printf_args, i64 24)
-  call void @llvm.lifetime.end.p0i8(i64 -1, i8* nonnull %1)
-  ret i64 0
-[...]
-----
+| `codegen`
+| Prints the unoptimized LLVM IR as produced by `CodegenLLVM`.
 
-This section shows the llvm intermediate representation (IR) assembly, which is then compiled into BPF.
+| `codegen-opt`
+| Prints the optimized LLVM IR, i.e. the code which will be compiled into BPF
+bytecode.
+
+| `dis`
+| Disassembles and prints out the generated bytecode that `libbpf` will see.
+Only available in debug builds.
+
+| `libbpf`
+| Captures and prints libbpf log for all libbpf operations that bpftrace uses.
+
+| `verifier`
+| Captures and prints the BPF verifier log.
+
+| `all`
+| Prints the output of all of the above stages.
+
+|===
 
 === Listing Probes
 
@@ -3531,8 +3855,8 @@ combined with `-e` or filename args to see all the probes that a program would a
 The verbose flag (`-v`) can be specified to inspect arguments (`args`) for providers that support it:
 
 ----
-# bpftrace -l 'fr:tcp_reset,t:syscalls:sys_enter_openat' -v
-kretfunc:tcp_reset
+# bpftrace -l 'fexit:tcp_reset,tracepoint:syscalls:sys_enter_openat' -v
+fexit:tcp_reset
     struct sock * sk
     struct sk_buff * skb
 tracepoint:syscalls:sys_enter_openat
@@ -3606,44 +3930,17 @@ The `-v` option prints more information about the program as it is run:
 
 ----
 # bpftrace -v -e 'tracepoint:syscalls:sys_enter_nanosleep { printf("%s is sleeping.\n", comm); }'
+AST node count: 7
 Attaching 1 probe...
 
-The verifier log:
-0: (bf) r6 = r1
-1: (b7) r1 = 0
-2: (7b) *(u64 *)(r10 -24) = r1
-3: (7b) *(u64 *)(r10 -32) = r1
-4: (7b) *(u64 *)(r10 -40) = r1
-5: (7b) *(u64 *)(r10 -8) = r1
-6: (7b) *(u64 *)(r10 -16) = r1
-7: (bf) r1 = r10
-8: (07) r1 += -16
-9: (b7) r2 = 16
-10: (85) call bpf_get_current_comm#16
-11: (79) r1 = *(u64 *)(r10 -16)
-12: (7b) *(u64 *)(r10 -32) = r1
-13: (79) r1 = *(u64 *)(r10 -8)
-14: (7b) *(u64 *)(r10 -24) = r1
-15: (18) r7 = 0xffff9044e65f1000
-17: (85) call bpf_get_smp_processor_id#8
-18: (bf) r4 = r10
-19: (07) r4 += -40
-20: (bf) r1 = r6
-21: (bf) r2 = r7
-22: (bf) r3 = r0
-23: (b7) r5 = 24
-24: (85) call bpf_perf_event_output#25
-25: (b7) r0 = 0
-26: (95) exit
-processed 26 insns (limit 131072), stack depth 40
+load tracepoint:syscalls:sys_enter_nanosleep, with BTF, with func_infos: Success
 
+Program ID: 111
 Attaching tracepoint:syscalls:sys_enter_nanosleep
 iscsid is sleeping.
 iscsid is sleeping.
 [...]
 ----
-
-This includes `The verifier log:` and then the log message from the in-kernel verifier.
 
 == Advanced Topics
 
@@ -3808,6 +4105,41 @@ Maps are printed by reference not by value and as the value gets updated right a
 
 Therefore, when you need precise event statistics, it is recommended to use synchronous functions (e.g. count() and hist()) to ensure more reliable and accurate results.
 
+=== Map Printing
+
+By default when a bpftrace program exits it will print all maps to stdout.
+If you don't want this, you can either override the `print_maps_on_exit` configuration option or you can specify an `END` probe and `clear` the maps you don't want printed (this second method doesn't work for scalar maps).
+
+For example, this script:
+```
+config = {
+  print_maps_on_exit=0
+}
+
+BEGIN {
+  @a = 1;
+  @b[1] = 1;
+}
+```
+
+would print nothing on exit, while this script:
+```
+BEGIN {
+  @a = 1;
+  @b[1] = 1;
+}
+
+END {
+  clear(@a);
+  clear(@b);
+}
+```
+
+will print this on exit:
+```
+@a: 0
+```
+
 === Systemd support
 
 To run bpftrace in the background using systemd::
@@ -3833,3 +4165,24 @@ ExecStart=bpftrace -e 'kprobe:do_nanosleep { printf("%d sleeping\n", pid); }'
 
 Similarly to the systemd-run example, the service to be traced will not start
 until bpftrace started by the systemd unit has attached its probes.
+
+=== PER_CPU types
+
+For bpftrace PER_CPU types (search this document for "PER_CPU"), you may coerce
+(and thus force a more expensive synchronous read) the type to an integer using
+a cast or by doing a comparison. This is useful for when you need an integer
+during comparisons, `printf()`, or other.
+
+For example:
+
+----
+BEGIN {
+  @c = count();
+  @s = sum(3);
+  @s = sum(9);
+
+  if (@s == 12) {                             // Coerces @s
+    printf("%d %d\n", (int64)@c, (int64)@s);  // Coerces @c and @s and prints "1 12"
+  }
+}
+----

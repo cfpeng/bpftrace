@@ -4,9 +4,7 @@
 #include "gtest/gtest.h"
 #include <iostream>
 
-namespace bpftrace {
-namespace test {
-namespace log {
+namespace bpftrace::test::log {
 
 TEST(LogStream, basic)
 {
@@ -31,6 +29,7 @@ TEST(LogStream, basic)
   LOG(V1) << content_1 << content_2;
   EXPECT_EQ(ss.str(), content_1 + content_2 + "\n");
   std::cerr.rdbuf(cerr_buf);
+  DISABLE_LOG(V1);
 }
 
 TEST(LogStream, with_location)
@@ -68,6 +67,4 @@ TEST(Log, disable_log_type)
   ss.str({});
 }
 
-} // namespace log
-} // namespace test
-} // namespace bpftrace
+} // namespace bpftrace::test::log

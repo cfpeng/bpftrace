@@ -18,10 +18,10 @@ class BPFtrace;
 
 class Dwarf {
 public:
-  virtual ~Dwarf();
-
   static std::unique_ptr<Dwarf> GetFromBinary(BPFtrace *bpftrace,
                                               std::string file_path);
+
+  bool has_debug_info();
 
   std::vector<uint64_t> get_function_locations(const std::string &function,
                                                bool include_inlined);
@@ -32,16 +32,26 @@ public:
   void resolve_fields(const SizedType &type);
 
 private:
-  static std::atomic<size_t> instance_count;
-
   Dwarf(BPFtrace *bpftrace, std::string file_path);
 
   lldb::SBValueList function_params(const std::string &function);
 
   std::string get_type_name(lldb::SBType type);
   SizedType get_stype(lldb::SBType type, bool resolve_structs = true);
+  void resolve_fields(std::shared_ptr<Struct> str, lldb::SBType type);
   std::optional<Bitfield> resolve_bitfield(lldb::SBTypeMember field);
 
+  // Initialize/Terminate liblldb globally with RAII
+  class InstanceCounter final {
+  private:
+    static std::atomic<size_t> count;
+
+  public:
+    InstanceCounter();
+    ~InstanceCounter();
+  };
+
+  InstanceCounter counter_;
   BPFtrace *bpftrace_;
   std::string file_path_;
 
@@ -65,11 +75,12 @@ public:
                                               std::string file_path_
                                               __attribute__((unused)))
   {
-    static bool warned = false;
-    if (!warned)
-      LOG(WARNING) << "Cannot parse DWARF: liblldb not available";
-    warned = true;
     return nullptr;
+  }
+
+  bool has_debug_info()
+  {
+    return false;
   }
 
   std::vector<uint64_t> get_function_locations(const std::string &function

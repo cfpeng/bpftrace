@@ -1,9 +1,6 @@
-add_library(aot aot.cpp)
-add_dependencies(aot parser version_h)
-target_link_libraries(aot required_resources)
-target_include_directories(aot PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_include_directories(aot PUBLIC ${CMAKE_BINARY_DIR}/src)
-target_include_directories(aot PUBLIC ${CMAKE_BINARY_DIR})
+add_library(aot STATIC aot.cpp)
+add_dependencies(aot version_h)
+target_link_libraries(aot required_resources parser)
 target_compile_definitions(aot PRIVATE ${BPFTRACE_FLAGS})
 
 if(STATIC_LINKING)

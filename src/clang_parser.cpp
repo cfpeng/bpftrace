@@ -2,6 +2,8 @@
 #include <iostream>
 #include <limits>
 #include <regex>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 #include "llvm/Config/llvm-config.h"
@@ -87,102 +89,6 @@ static std::string get_clang_string(CXString string)
 }
 
 /*
- * is_anonymous
- *
- * Determine whether the provided cursor points to an anonymous struct.
- *
- * This union is anonymous:
- *   struct { int i; };
- * This is not, although it is marked as such in LLVM 8:
- *   struct { int i; } obj;
- * This is not, and does not actually declare an instance of a struct:
- *   struct X { int i; };
- *
- * The libclang API was changed in LLVM 8 and restored under a different
- * function in LLVM 9. For LLVM 8 there is no way to properly tell if
- * a record declaration is anonymous, so we do some hacks here.
- *
- * LLVM version differences:
- *   https://reviews.llvm.org/D54996
- *   https://reviews.llvm.org/D61232
- */
-static bool is_anonymous(CXCursor c)
-{
-#if LLVM_VERSION_MAJOR <= 7
-  return clang_Cursor_isAnonymous(c);
-#elif LLVM_VERSION_MAJOR >= 9
-  return clang_Cursor_isAnonymousRecordDecl(c);
-#else // LLVM 8
-  if (!clang_Cursor_isAnonymous(c))
-    return false;
-
-  // In LLVM 8, some structs which the above function says are anonymous
-  // are actually not. We iterate through the siblings of our struct
-  // definition to see if there is a field giving it a name.
-  //
-  // struct Parent                 struct Parent
-  // {                             {
-  //   struct                        struct
-  //   {                             {
-  //     ...                           ...
-  //   } name;                       };
-  //   int sibling;                  int sibling;
-  // };                            };
-  //
-  // Children of parent:           Children of parent:
-  //   Struct: (cursor c)            Struct: (cursor c)
-  //   Field:  (Record)name          Field:  (int)sibling
-  //   Field:  (int)sibling
-  //
-  // Record field found after      No record field found after
-  // cursor - not anonymous        cursor - anonymous
-
-  auto parent = clang_getCursorSemanticParent(c);
-  if (clang_Cursor_isNull(parent))
-    return false;
-
-  struct AnonFinderState {
-    CXCursor struct_to_check;
-    bool is_anon;
-    bool prev_was_definition;
-  } state;
-
-  state.struct_to_check = c;
-  state.is_anon = true;
-  state.prev_was_definition = false;
-
-  clang_visitChildren(
-      parent,
-      [](CXCursor c2, CXCursor, CXClientData client_data) {
-        auto state = static_cast<struct AnonFinderState *>(client_data);
-        if (state->prev_was_definition) {
-          // This is the next child after the definition of the struct we're
-          // interested in. If it is a field containing a record, we assume
-          // that it must be the field for our struct, so our struct is not
-          // anonymous.
-          state->prev_was_definition = false;
-          auto kind = clang_getCursorKind(c2);
-          auto type = clang_getCanonicalType(clang_getCursorType(c2));
-          if (kind == CXCursor_FieldDecl && type.kind == CXType_Record) {
-            state->is_anon = false;
-            return CXChildVisit_Break;
-          }
-        }
-
-        // We've found the definition of the struct we're interested in
-        if (memcmp(c2.data,
-                   state->struct_to_check.data,
-                   3 * sizeof(uintptr_t)) == 0)
-          state->prev_was_definition = true;
-        return CXChildVisit_Continue;
-      },
-      &state);
-
-  return state.is_anon;
-#endif
-}
-
-/*
  * get_named_parent
  *
  * Find the parent struct of the field pointed to by the cursor.
@@ -192,7 +98,8 @@ static CXCursor get_named_parent(CXCursor c)
 {
   CXCursor parent = clang_getCursorSemanticParent(c);
 
-  while (!clang_Cursor_isNull(parent) && is_anonymous(parent)) {
+  while (!clang_Cursor_isNull(parent) &&
+         clang_Cursor_isAnonymousRecordDecl(parent)) {
     parent = clang_getCursorSemanticParent(parent);
   }
 
@@ -280,8 +187,13 @@ static SizedType get_sized_type(CXType clang_type, StructManager &structs)
     case CXType_LongLong:
     case CXType_Int:
       return CreateInt(size);
-    case CXType_Enum:
-      return CreateUInt(size);
+    case CXType_Enum: {
+      // The pretty printed type name contains `enum` prefix. That's not
+      // helpful for us, so remove it. We have our own metadata.
+      static std::regex re("enum ");
+      auto enum_name = std::regex_replace(typestr, re, "");
+      return CreateEnum(size, enum_name);
+    }
     case CXType_Pointer: {
       auto pointee_type = clang_getPointeeType(clang_type);
       return CreatePointer(get_sized_type(pointee_type, structs));
@@ -464,10 +376,31 @@ bool ClangParser::visit_children(CXCursor &cursor, BPFtrace &bpftrace)
           return CXChildVisit_Recurse;
         }
 
+        // Each anon enum must have a unique ID otherwise two variants
+        // with different names but same value will clobber each other
+        // in enum_defs_.
+        static uint32_t anon_enum_count = 0;
+        if (clang_getCursorKind(c) == CXCursor_EnumDecl)
+          anon_enum_count++;
+
         if (clang_getCursorKind(parent) == CXCursor_EnumDecl) {
+          // Store variant name to variant value
           auto &enums = static_cast<BPFtrace *>(client_data)->enums_;
-          enums[get_clang_string(clang_getCursorSpelling(c))] =
-              clang_getEnumConstantDeclValue(c);
+          auto enum_name = get_clang_string(clang_getCursorSpelling(parent));
+          // Anonymous enums have empty string names in libclang <= 15
+          if (enum_name.empty()) {
+            std::ostringstream name;
+            name << "enum <anon_" << anon_enum_count << ">";
+            enum_name = std::move(name.str());
+          }
+          auto variant_name = get_clang_string(clang_getCursorSpelling(c));
+          auto variant_value = clang_getEnumConstantDeclValue(c);
+          enums[variant_name] = std::make_pair(variant_value, enum_name);
+
+          // Store enum name to variant value to variant name
+          auto &enum_defs = static_cast<BPFtrace *>(client_data)->enum_defs_;
+          enum_defs[enum_name][variant_value] = variant_name;
+
           return CXChildVisit_Recurse;
         }
 
@@ -590,15 +523,15 @@ std::unordered_set<std::string> ClangParser::get_incomplete_types()
 
 void ClangParser::resolve_incomplete_types_from_btf(
     BPFtrace &bpftrace,
-    const ast::ProbeList *probes)
+    const ast::ProbeList &probes)
 {
   // Resolution of incomplete types must run at least once, maximum should be
   // the number of levels of nested field accesses for tracepoint args.
   // The maximum number of iterations can be also controlled by the
   // BPFTRACE_MAX_TYPE_RES_ITERATIONS env variable (0 is unlimited).
   uint64_t field_lvl = 1;
-  for (auto &probe : *probes)
-    if (probe->tp_args_structs_level > (int)field_lvl)
+  for (auto &probe : probes)
+    if (probe->tp_args_structs_level > static_cast<int>(field_lvl))
       field_lvl = probe->tp_args_structs_level;
 
   unsigned max_iterations = std::max(
@@ -841,9 +774,8 @@ std::string ClangParser::get_arch_include_path()
   return "/usr/include/" + std::string(utsname.machine) + "-linux-gnu";
 }
 
-std::vector<std::string> ClangParser::system_include_paths()
+static void query_clang_include_dirs(std::vector<std::string> &result)
 {
-  std::vector<std::string> result;
   try {
     auto clang = "clang-" + std::to_string(LLVM_VERSION_MAJOR);
     auto cmd = clang + " -Wp,-v -x c -fsyntax-only /dev/null 2>&1";
@@ -856,6 +788,19 @@ std::vector<std::string> ClangParser::system_include_paths()
     while (std::getline(lines, line) && line != "End of search list.")
       result.push_back(trim(line));
   } catch (std::runtime_error &) { // If exec_system fails, just ignore it
+  }
+}
+
+std::vector<std::string> ClangParser::system_include_paths()
+{
+  std::vector<std::string> result;
+  std::istringstream lines(SYSTEM_INCLUDE_PATHS);
+  std::string line;
+  while (std::getline(lines, line, ':')) {
+    if (line == "auto")
+      query_clang_include_dirs(result);
+    else
+      result.push_back(trim(line));
   }
 
   if (result.empty())

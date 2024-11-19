@@ -12,6 +12,8 @@
 
 namespace bpftrace {
 
+static constexpr auto RETVAL_FIELD_NAME = "$retval";
+
 struct Bitfield {
   Bitfield(size_t byte_offset, size_t bit_width);
   Bitfield(size_t read_bytes, size_t access_rshift, uint64_t mask)
@@ -91,13 +93,17 @@ struct Struct {
   const Field &GetField(const std::string &name) const;
   void AddField(const std::string &field_name,
                 const SizedType &type,
-                ssize_t offset,
-                const std::optional<Bitfield> &bitfield,
-                bool is_data_loc);
+                ssize_t offset = 0,
+                const std::optional<Bitfield> &bitfield = std::nullopt,
+                bool is_data_loc = false);
   bool HasFields() const;
   void ClearFields();
 
-  static std::unique_ptr<Struct> CreateTuple(std::vector<SizedType> fields);
+  static std::unique_ptr<Struct> CreateRecord(
+      const std::vector<SizedType> &fields,
+      const std::vector<std::string_view> &field_names);
+  static std::unique_ptr<Struct> CreateTuple(
+      const std::vector<SizedType> &fields);
   void Dump(std::ostream &os);
 
   bool operator==(const Struct &rhs) const
@@ -166,8 +172,10 @@ public:
                                     bool allow_override = true);
   bool Has(const std::string &name) const;
 
-  // tuples set manipulation
-  std::weak_ptr<Struct> AddTuple(std::vector<SizedType> fields);
+  std::weak_ptr<Struct> AddAnonymousStruct(
+      const std::vector<SizedType> &fields,
+      const std::vector<std::string_view> &field_names);
+  std::weak_ptr<Struct> AddTuple(const std::vector<SizedType> &fields);
   size_t GetTuplesCnt() const;
 
   // probe args lookup
@@ -176,7 +184,7 @@ public:
 
 private:
   std::map<std::string, std::shared_ptr<Struct>> struct_map_;
-  std::unordered_set<std::shared_ptr<Struct>> tuples_;
+  std::unordered_set<std::shared_ptr<Struct>> anonymous_types_;
 };
 
 } // namespace bpftrace

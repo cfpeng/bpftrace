@@ -8,7 +8,9 @@
 #include "bpffeature.h"
 #include "bpfprogram.h"
 #include "btf.h"
+#include "config.h"
 #include "types.h"
+#include "usdt.h"
 
 #include <bcc/libbpf.h>
 
@@ -20,16 +22,11 @@ std::string progtypeName(libbpf::bpf_prog_type t);
 
 class AttachedProbe {
 public:
+  AttachedProbe(Probe &probe, const BpfProgram &prog, BPFtrace &bpftrace);
   AttachedProbe(Probe &probe,
-                BpfProgram &&prog,
-                bool safe_mode,
-                BPFfeature &feature,
-                BTF &btf);
-  AttachedProbe(Probe &probe,
-                BpfProgram &&prog,
+                const BpfProgram &prog,
                 int pid,
-                BPFfeature &feature,
-                BTF &btf,
+                BPFtrace &bpftrace,
                 bool safe_mode = true);
   ~AttachedProbe();
   AttachedProbe(const AttachedProbe &) = delete;
@@ -42,12 +39,11 @@ public:
 private:
   std::string eventprefix() const;
   std::string eventname() const;
-  void resolve_offset_kprobe(bool safe_mode);
-  bool resolve_offset_uprobe(bool safe_mode);
-  void load_prog(BPFfeature &feature);
+  void resolve_offset_kprobe();
+  bool resolve_offset_uprobe(bool safe_mode, bool has_multiple_aps);
   void attach_multi_kprobe(void);
   void attach_multi_uprobe(int pid);
-  void attach_kprobe(bool safe_mode);
+  void attach_kprobe();
   void attach_uprobe(int pid, bool safe_mode);
 
   // Note: the following usdt attachment functions will only activate a
@@ -70,27 +66,27 @@ private:
   void attach_software();
   void attach_hardware();
   void attach_watchpoint(int pid, const std::string &mode);
-  void attach_kfunc(void);
-  int detach_kfunc(void);
+  void attach_fentry(void);
+  int detach_fentry(void);
   void attach_iter(void);
   int detach_iter(void);
   void attach_raw_tracepoint(void);
   int detach_raw_tracepoint(void);
 
   static std::map<std::string, int> cached_prog_fds_;
-  bool use_cached_progfd(void);
+  bool use_cached_progfd(BPFfeature &feature);
   void cache_progfd(void);
 
   Probe &probe_;
-  BpfProgram prog_;
   std::vector<int> perf_event_fds_;
   bool close_progfd_ = true;
   int progfd_ = -1;
   uint64_t offset_ = 0;
   int tracing_fd_ = -1;
   std::function<void()> usdt_destructor_;
+  USDTHelper usdt_helper;
 
-  BTF &btf_;
+  BPFtrace &bpftrace_;
 };
 
 class HelperVerifierError : public std::runtime_error {

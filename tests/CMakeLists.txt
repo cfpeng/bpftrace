@@ -15,11 +15,14 @@ add_custom_command(
   DEPENDS
     ${CODEGEN_SOURCES})
 
-if(${LLVM_VERSION_MAJOR} VERSION_EQUAL 12)
+# Codegen tests are based on the IR produced by LLVM 18. The compiler used to
+# build bpftrace is also important, as decisions on order of evaluation can
+# influence the order of the generated IR.
+if(${LLVM_VERSION_MAJOR} VERSION_EQUAL 18 AND ${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
   set(CODEGEN_SRC ${CODEGEN_INCLUDES_CPP})
 else()
   set(CODEGEN_SRC "")
-  message(STATUS "Disabled codegen test for LLVM != 12 (found ${LLVM_VERSION_MAJOR})")
+  message(STATUS "Disabled codegen tests. Requires GNU/GCC and LLVM 18 (found ${CMAKE_CXX_COMPILER_ID}, LLVM ${LLVM_VERSION_MAJOR})")
 endif()
 
 add_executable(bpftrace_test
@@ -46,6 +49,7 @@ add_executable(bpftrace_test
   return_path_analyser.cpp
   semantic_analyser.cpp
   tracepoint_format_parser.cpp
+  types.cpp
   utils.cpp
 
   ${CODEGEN_SRC}
@@ -54,9 +58,11 @@ add_executable(bpftrace_test
 add_subdirectory(data)
 if(${LLDB_FOUND})
   add_dependencies(bpftrace_test debuginfo_dwarf_data)
+  add_dependencies(bpftrace_test data_source_cxx)
 endif()
 add_dependencies(bpftrace_test debuginfo_btf_data)
 target_include_directories(bpftrace_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(bpftrace_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_definitions(bpftrace_test PRIVATE TEST_CODEGEN_LOCATION="${CMAKE_SOURCE_DIR}/tests/codegen/llvm/")
 target_link_libraries(bpftrace_test libbpftrace)
@@ -80,31 +86,14 @@ if(BUILD_ASAN)
   target_link_options(bpftrace_test PUBLIC "-fsanitize=address")
 endif()
 
-# Still need to support vendored gtest/gmock b/c old ubuntu versions (< focal)
-# only provide gtest/gmock sources -- no precompiled binaries
-if(VENDOR_GTEST)
-  include(FetchContent)
-  set(FETCHCONTENT_QUIET FALSE)
-  FetchContent_Declare(
-    gtest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG release-1.11.0
-  )
-  FetchContent_MakeAvailable(gtest)
+# bpftrace tests require (at minimum) version 1.11.
+# There's no great way to enforce a minimum version from cmake -- the cmake
+# modules don't respect minimum requested version.
+find_package(GTest REQUIRED)
+find_package(GMock REQUIRED)
+include_directories(SYSTEM ${GTEST_INCLUDE_DIRS} ${GMOCK_INCLUDE_DIRS})
+target_link_libraries(bpftrace_test ${GTEST_BOTH_LIBRARIES} ${GMOCK_LIBRARIES})
 
-  target_include_directories(bpftrace_test PUBLIC ${gtest_SOURCE_DIR}/googletest/include)
-  target_include_directories(bpftrace_test PUBLIC ${gtest_SOURCE_DIR}/googlemock/include)
-  target_link_libraries(bpftrace_test gtest)
-  target_link_libraries(bpftrace_test gmock)
-else()
-  # bpftrace tests require (at minimum) the vendored version (see above).
-  # There's no great way to enforce a minimum version from cmake -- the cmake
-  # modules don't respect minimum requested version.
-  find_package(GTest REQUIRED)
-  find_package(GMock REQUIRED)
-  include_directories(SYSTEM ${GTEST_INCLUDE_DIRS} ${GMOCK_INCLUDE_DIRS})
-  target_link_libraries(bpftrace_test ${GTEST_BOTH_LIBRARIES} ${GMOCK_LIBRARIES})
-endif(VENDOR_GTEST)
 add_test(NAME bpftrace_test COMMAND bpftrace_test)
 if(NOT STATIC_LINKING)
   find_package(Threads REQUIRED)
@@ -170,13 +159,13 @@ if (BUILD_ASAN)
 endif()
 
 if(ENABLE_TEST_VALIDATE_CODEGEN)
-  if(${LLVM_VERSION_MAJOR} VERSION_EQUAL 12)
+  if(${LLVM_VERSION_MAJOR} VERSION_EQUAL 18)
     message(STATUS "Adding codegen-validator test")
     configure_file(codegen-validator.sh codegen-validator.sh COPYONLY)
     add_custom_target(codegen-validator COMMAND ./codegen-validator.sh)
     add_test(NAME codegen-validator COMMAND ./codegen-validator.sh ${CMAKE_SOURCE_DIR})
   else()
-    message(STATUS "Not building with LLVM 12, skipping codegen-validator test")
+    message(STATUS "Not building with LLVM 18, skipping codegen-validator test")
   endif()
 else()
   message(STATUS "codegen-validator test disabled")

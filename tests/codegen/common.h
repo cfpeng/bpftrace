@@ -18,11 +18,15 @@
 #include "driver.h"
 #include "tracepoint_format_parser.h"
 
+#include "btf_common.h"
+
 namespace bpftrace {
 namespace test {
 namespace codegen {
 
 #define NAME (::testing::UnitTest::GetInstance()->current_test_info()->name())
+
+class codegen_btf : public test_btf {};
 
 static std::string get_expected(const std::string &name)
 {
@@ -49,29 +53,29 @@ static void test(BPFtrace &bpftrace,
   Driver driver(bpftrace);
   ASSERT_EQ(driver.parse_str(input), 0);
 
-  ast::FieldAnalyser fields(driver.root.get(), bpftrace);
+  ast::FieldAnalyser fields(driver.ctx.root, bpftrace);
   ASSERT_EQ(fields.analyse(), 0);
 
   ClangParser clang;
-  clang.parse(driver.root.get(), bpftrace);
+  clang.parse(driver.ctx.root, bpftrace);
 
   ASSERT_EQ(driver.parse_str(input), 0);
 
-  ast::SemanticAnalyser semantics(driver.root.get(), bpftrace);
+  ast::SemanticAnalyser semantics(driver.ctx, bpftrace);
   ASSERT_EQ(semantics.analyse(), 0);
 
-  ast::ResourceAnalyser resource_analyser(driver.root.get());
+  ast::ResourceAnalyser resource_analyser(driver.ctx.root, bpftrace);
   auto resources_optional = resource_analyser.analyse();
   ASSERT_TRUE(resources_optional.has_value());
   bpftrace.resources = resources_optional.value();
 
   std::stringstream out;
-  ast::CodegenLLVM codegen(driver.root.get(), bpftrace);
+  ast::CodegenLLVM codegen(driver.ctx.root, bpftrace);
   codegen.generate_ir();
   codegen.DumpIR(out);
   // Test that generated code compiles cleanly
   codegen.optimize();
-  codegen.emit();
+  codegen.emit(false);
 
   uint64_t update_tests = 0;
   get_uint64_env_var("BPFTRACE_UPDATE_TESTS",

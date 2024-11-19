@@ -1,11 +1,24 @@
-set(testprog_cflags "-g -O0")
-if(LLVM_VERSION_MAJOR VERSION_LESS 13)
-  # CI's GCC compile the testprogs using DWARF version 5
-  # LLDB doesn't support DWARF5 before version 13, so we force DWARF4
-  set(testprog_cflags "${testprog_cflags} -gdwarf-4")
-endif()
+set_property(GLOBAL APPEND_STRING PROPERTY testprog_cflags "-g -O0")
 
-file(GLOB testprog_sources CONFIGURE_DEPENDS *.c)
+# Check and add CFLAG to testprog_cflags
+function(test_and_add_testprog_cflag flag)
+  try_compile(FLAG_AVAILABLE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/simple_struct.c
+    LINK_OPTIONS ${flag}
+  )
+  if(${FLAG_AVAILABLE})
+    set_property(GLOBAL APPEND_STRING PROPERTY testprog_cflags " ${flag}")
+  else()
+    message(STATUS "${CMAKE_C_COMPILER} does not support ${flag}")
+  endif()
+endfunction()
+
+test_and_add_testprog_cflag("-fno-omit-frame-pointer")
+test_and_add_testprog_cflag("-mno-omit-leaf-frame-pointer")
+get_property(testprog_cflags GLOBAL PROPERTY testprog_cflags)
+
+file(GLOB testprog_sources CONFIGURE_DEPENDS *.c *.cpp)
 set(testprogtargets "")
 foreach(testprog_source ${testprog_sources})
   get_filename_component(testprog_name ${testprog_source} NAME_WE)
@@ -23,6 +36,6 @@ foreach(testprog_source ${testprog_sources})
 endforeach()
 add_custom_target(testprogs DEPENDS ${testprogtargets})
 
-target_include_directories(usdt_lib PUBLIC ${CMAKE_SOURCE_DIR}/tests/testlibs/)
+target_include_directories(usdt_lib PRIVATE ${CMAKE_SOURCE_DIR}/tests/testlibs/)
 target_compile_options(usdt_lib PRIVATE -fPIC)
 target_link_libraries(usdt_lib usdt_tp)

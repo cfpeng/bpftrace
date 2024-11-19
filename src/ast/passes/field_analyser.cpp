@@ -8,8 +8,7 @@
 #include "log.h"
 #include "probe_matcher.h"
 
-namespace bpftrace {
-namespace ast {
+namespace bpftrace::ast {
 
 void FieldAnalyser::visit(Identifier &identifier)
 {
@@ -50,7 +49,7 @@ void FieldAnalyser::visit(Builtin &builtin)
       return;
     resolve_args(*probe_);
 
-    auto arg = bpftrace_.structs.GetProbeArg(*probe_, "$retval");
+    auto arg = bpftrace_.structs.GetProbeArg(*probe_, RETVAL_FIELD_NAME);
     if (arg)
       sized_type_ = arg->type;
     return;
@@ -62,12 +61,8 @@ void FieldAnalyser::visit(Builtin &builtin)
 
 void FieldAnalyser::visit(Map &map)
 {
-  MapKey key;
-  if (map.vargs) {
-    for (Expression *expr : *map.vargs) {
-      Visit(*expr);
-    }
-  }
+  if (map.key_expr)
+    Visit(*map.key_expr);
 
   auto it = var_types_.find(map.ident);
   if (it != var_types_.end())
@@ -93,22 +88,20 @@ void FieldAnalyser::visit(FieldAccess &acc)
       sized_type_ = arg->type;
 
     has_builtin_args_ = false;
-  } else if (!sized_type_.IsNoneTy()) {
-    // If the struct type or the field type has not been resolved, add the type
-    // to the BTF set to let ClangParser resolve it
-    if (bpftrace_.has_btf_data() && sized_type_.IsRecordTy()) {
-      SizedType field_type = CreateNone();
-      if (sized_type_.HasField(acc.field))
-        field_type = sized_type_.GetField(acc.field).type;
+  } else if (sized_type_.IsRecordTy()) {
+    SizedType field_type = CreateNone();
+    if (sized_type_.HasField(acc.field))
+      field_type = sized_type_.GetField(acc.field).type;
 
-      if (!field_type.IsNoneTy())
-        sized_type_ = field_type;
-      else {
-        bpftrace_.btf_set_.insert(sized_type_.GetName());
-        auto field_type_name = bpftrace_.btf_->type_of(sized_type_.GetName(),
-                                                       acc.field);
-        bpftrace_.btf_set_.insert(field_type_name);
-      }
+    if (!field_type.IsNoneTy()) {
+      sized_type_ = field_type;
+    } else if (bpftrace_.has_btf_data()) {
+      // If the struct type or the field type has not been resolved, add the
+      // type to the BTF set to let ClangParser resolve it
+      bpftrace_.btf_set_.insert(sized_type_.GetName());
+      auto field_type_name = bpftrace_.btf_->type_of(sized_type_.GetName(),
+                                                     acc.field);
+      bpftrace_.btf_set_.insert(field_type_name);
     }
   }
 }
@@ -119,6 +112,9 @@ void FieldAnalyser::visit(ArrayAccess &arr)
   Visit(*arr.expr);
   if (sized_type_.IsPtrTy()) {
     sized_type_ = *sized_type_.GetPointeeTy();
+    resolve_fields(sized_type_);
+  } else if (sized_type_.IsArrayTy()) {
+    sized_type_ = *sized_type_.GetElementTy();
     resolve_fields(sized_type_);
   }
 }
@@ -167,15 +163,16 @@ void FieldAnalyser::visit(Unop &unop)
 
 void FieldAnalyser::resolve_args(Probe &probe)
 {
-  // load probe arguments into a special record type "struct <probename>_args"
-  Struct probe_args;
-  for (auto *ap : *probe.attach_points) {
+  for (auto *ap : probe.attach_points) {
+    // load probe arguments into a special record type "struct <probename>_args"
+    Struct probe_args;
+
     auto probe_type = probetype(ap->provider);
-    if (probe_type != ProbeType::kfunc && probe_type != ProbeType::kretfunc &&
+    if (probe_type != ProbeType::fentry && probe_type != ProbeType::fexit &&
         probe_type != ProbeType::uprobe)
       continue;
 
-    if (ap->need_expansion) {
+    if (ap->expansion != ExpansionType::NONE) {
       std::set<std::string> matches;
 
       // Find all the matches for the wildcard..
@@ -190,21 +187,20 @@ void FieldAnalyser::resolve_args(Probe &probe)
 
       Struct ap_args;
       for (auto &match : matches) {
-        // Both uprobes and kfuncs have a target (binary for uprobes, kernel
-        // module for kfuncs).
+        // Both uprobes and fentry have a target (binary for uprobes, kernel
+        // module for fentry).
         std::string func = match;
         std::string target = erase_prefix(func);
 
-        // Trying to attach to multiple kfuncs. If some of them fails on
+        // Trying to attach to multiple fentry. If some of them fails on
         // argument resolution, do not fail hard, just print a warning and
         // continue with other functions.
-        if (probe_type == ProbeType::kfunc ||
-            probe_type == ProbeType::kretfunc) {
+        if (probe_type == ProbeType::fentry || probe_type == ProbeType::fexit) {
           std::string err;
           auto maybe_ap_args = bpftrace_.btf_->resolve_args(
-              func, probe_type == ProbeType::kretfunc, err);
+              func, probe_type == ProbeType::fexit, err);
           if (!maybe_ap_args.has_value()) {
-            LOG(WARNING) << "kfunc:" << ap->func << ": " << err;
+            LOG(WARNING) << "fentry:" << ap->func << ": " << err;
             continue;
           }
           ap_args = std::move(*maybe_ap_args);
@@ -227,12 +223,12 @@ void FieldAnalyser::resolve_args(Probe &probe)
       }
     } else {
       // Resolving args for an explicit function failed, print an error and fail
-      if (probe_type == ProbeType::kfunc || probe_type == ProbeType::kretfunc) {
+      if (probe_type == ProbeType::fentry || probe_type == ProbeType::fexit) {
         std::string err;
         auto maybe_probe_args = bpftrace_.btf_->resolve_args(
-            ap->func, probe_type == ProbeType::kretfunc, err);
+            ap->func, probe_type == ProbeType::fexit, err);
         if (!maybe_probe_args.has_value()) {
-          LOG(ERROR, ap->loc, err_) << "kfunc:" << ap->func << ": " << err;
+          LOG(ERROR, ap->loc, err_) << "fentry:" << ap->func << ": " << err;
           return;
         }
         probe_args = std::move(*maybe_probe_args);
@@ -245,7 +241,8 @@ void FieldAnalyser::resolve_args(Probe &probe)
           LOG(WARNING, ap->loc, err_)
               << "No debuginfo found for " << ap->target;
         }
-        if ((int)probe_args.fields.size() > (arch::max_arg() + 1)) {
+        if (static_cast<int>(probe_args.fields.size()) >
+            (arch::max_arg() + 1)) {
           LOG(ERROR, ap->loc, err_) << "\'args\' builtin is not supported for "
                                        "probes with stack-passed arguments.";
         }
@@ -272,7 +269,7 @@ void FieldAnalyser::resolve_fields(SizedType &type)
     return;
 
   if (probe_) {
-    for (auto &ap : *probe_->attach_points)
+    for (auto &ap : probe_->attach_points)
       if (Dwarf *dwarf = bpftrace_.get_dwarf(*ap))
         dwarf->resolve_fields(type);
   }
@@ -293,7 +290,7 @@ void FieldAnalyser::resolve_type(SizedType &type)
   auto name = inner_type->GetName();
 
   if (probe_) {
-    for (auto &ap : *probe_->attach_points)
+    for (auto &ap : probe_->attach_points)
       if (Dwarf *dwarf = bpftrace_.get_dwarf(*ap))
         sized_type_ = dwarf->get_stype(name);
   }
@@ -310,7 +307,7 @@ void FieldAnalyser::visit(Probe &probe)
 {
   probe_ = &probe;
 
-  for (AttachPoint *ap : *probe.attach_points) {
+  for (AttachPoint *ap : probe.attach_points) {
     probe_type_ = probetype(ap->provider);
     prog_type_ = progtype(probe_type_);
     attach_func_ = ap->func;
@@ -318,16 +315,14 @@ void FieldAnalyser::visit(Probe &probe)
   if (probe.pred) {
     Visit(*probe.pred);
   }
-  for (Statement *stmt : *probe.stmts) {
-    Visit(*stmt);
-  }
+  Visit(probe.block);
 }
 
 void FieldAnalyser::visit(Subprog &subprog)
 {
   probe_ = nullptr;
 
-  for (Statement *stmt : *subprog.stmts) {
+  for (Statement *stmt : subprog.stmts) {
     Visit(*stmt);
   }
 }
@@ -345,5 +340,4 @@ int FieldAnalyser::analyse()
   return 0;
 }
 
-} // namespace ast
-} // namespace bpftrace
+} // namespace bpftrace::ast

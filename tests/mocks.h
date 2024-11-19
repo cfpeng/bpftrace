@@ -39,7 +39,7 @@ public:
   {
     return resources.probes;
   }
-  std::vector<Probe> get_special_probes()
+  std::unordered_map<std::string, Probe> get_special_probes()
   {
     return resources.special_probes;
   }
@@ -94,7 +94,7 @@ public:
     has_send_signal_ = std::make_optional<bool>(has_features);
     has_get_current_cgroup_id_ = std::make_optional<bool>(has_features);
     has_override_return_ = std::make_optional<bool>(has_features);
-    has_prog_kfunc_ = std::make_optional<bool>(has_features);
+    has_prog_fentry_ = std::make_optional<bool>(has_features);
     has_loop_ = std::make_optional<bool>(has_features);
     has_probe_read_kernel_ = std::make_optional<bool>(has_features);
     has_features_ = has_features;
@@ -114,6 +114,11 @@ public:
   void has_loop(bool has)
   {
     has_loop_ = std::make_optional<bool>(has);
+  }
+
+  void mock_missing_kernel_func(Kfunc kfunc)
+  {
+    available_kernel_funcs_.emplace(kfunc, false);
   }
 
   bool has_features_;
@@ -157,6 +162,25 @@ public:
       return false;
   }
 };
+
+class MockUSDTHelper : public USDTHelper {
+public:
+  MockUSDTHelper()
+  {
+  }
+#pragma GCC diagnostic push
+#ifdef __clang__
+#pragma GCC diagnostic ignored "-Winconsistent-missing-override"
+#endif
+  MOCK_METHOD4(find,
+               std::optional<usdt_probe_entry>(int pid,
+                                               const std::string &target,
+                                               const std::string &provider,
+                                               const std::string &name));
+#pragma GCC diagnostic pop
+};
+
+std::unique_ptr<MockUSDTHelper> get_mock_usdt_helper(int num_locations);
 
 } // namespace test
 } // namespace bpftrace

@@ -16,7 +16,7 @@ endif()
 add_library(required_resources required_resources.cpp)
 add_dependencies(required_resources parser)
 
-add_library(runtime
+add_library(runtime STATIC
   attached_probe.cpp
   bpffeature.cpp
   bpftrace.cpp
@@ -29,8 +29,8 @@ add_library(runtime
   disasm.cpp
   dwarf_parser.cpp
   format_string.cpp
+  globalvars.cpp
   log.cpp
-  mapkey.cpp
   output.cpp
   probe_matcher.cpp
   procmon.cpp
@@ -49,7 +49,7 @@ add_library(runtime
 # Ensure flex+bison outputs are built first
 add_dependencies(runtime parser)
 
-add_library(libbpftrace
+add_library(libbpftrace STATIC
   build_info.cpp
   clang_parser.cpp
   driver.cpp
@@ -62,7 +62,6 @@ set_target_properties(libbpftrace PROPERTIES PREFIX "")
 add_executable(${BPFTRACE}
   ${MAIN_SRC}
 )
-target_include_directories(${BPFTRACE} PUBLIC ${CMAKE_BINARY_DIR}/src)
 
 install(TARGETS ${BPFTRACE} DESTINATION ${CMAKE_INSTALL_BINDIR})
 target_link_libraries(${BPFTRACE} libbpftrace)
@@ -90,17 +89,21 @@ endif()
 
 # compile definitions
 
-set(KERNEL_HEADERS_DIR "" CACHE PATH "Hard-code kernel headers directory")
 if (KERNEL_HEADERS_DIR)
   MESSAGE(STATUS "Using KERNEL_HEADERS_DIR=${KERNEL_HEADERS_DIR}")
-  target_compile_definitions(runtime PUBLIC KERNEL_HEADERS_DIR="${KERNEL_HEADERS_DIR}")
 endif()
+target_compile_definitions(runtime PUBLIC KERNEL_HEADERS_DIR="${KERNEL_HEADERS_DIR}")
+
+if (NOT SYSTEM_INCLUDE_PATHS EQUAL "auto")
+  MESSAGE(STATUS "Using SYSTEM_INCLUDE_PATHS=${SYSTEM_INCLUDE_PATHS}")
+endif()
+target_compile_definitions(runtime PUBLIC SYSTEM_INCLUDE_PATHS="${SYSTEM_INCLUDE_PATHS}")
 
 # This is run on every build to ensure the version string is always up-to-date
 add_custom_target(version_h
   COMMAND ${CMAKE_COMMAND}
     -DVERSION_H_IN=${CMAKE_CURRENT_SOURCE_DIR}/version.h.in
-    -DVERSION_H=${CMAKE_CURRENT_BINARY_DIR}/version.h
+    -DVERSION_H=${CMAKE_BINARY_DIR}/version.h
     -Dbpftrace_VERSION_MAJOR=${bpftrace_VERSION_MAJOR}
     -Dbpftrace_VERSION_MINOR=${bpftrace_VERSION_MINOR}
     -Dbpftrace_VERSION_PATCH=${bpftrace_VERSION_PATCH}
@@ -109,11 +112,7 @@ add_custom_target(version_h
 add_dependencies(${BPFTRACE} version_h)
 add_dependencies(libbpftrace version_h)
 
-target_include_directories(required_resources PRIVATE ${CMAKE_BINARY_DIR})
-target_include_directories(required_resources PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(required_resources PRIVATE ${BPFTRACE_FLAGS})
-target_include_directories(runtime PRIVATE ${CMAKE_BINARY_DIR})
-target_include_directories(runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(runtime PRIVATE ${BPFTRACE_FLAGS})
 target_include_directories(libbpftrace PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_definitions(libbpftrace PRIVATE ${BPFTRACE_FLAGS})

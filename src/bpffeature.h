@@ -1,6 +1,7 @@
 #pragma once
 
 #include "btf.h"
+#include "kfuncs.h"
 #include <memory>
 #include <optional>
 #include <string>
@@ -96,12 +97,14 @@ public:
   bool has_uprobe_refcnt();
   bool has_kprobe_multi();
   bool has_uprobe_multi();
-  bool has_kfunc();
+  bool has_fentry();
   bool has_skb_output();
-  bool has_raw_tp_special();
-  bool has_prog_kfunc();
+  bool has_prog_fentry();
   bool has_module_btf();
   bool has_iter(std::string name);
+  bool has_kernel_dwarf();
+
+  bool has_kernel_func(Kfunc kfunc);
 
   std::string report(void);
 
@@ -139,10 +142,12 @@ protected:
   std::optional<bool> has_kprobe_multi_;
   std::optional<bool> has_uprobe_multi_;
   std::optional<bool> has_skb_output_;
-  std::optional<bool> has_raw_tp_special_;
-  std::optional<bool> has_prog_kfunc_;
+  std::optional<bool> has_prog_fentry_;
   std::optional<bool> has_module_btf_;
   std::optional<bool> has_btf_func_global_;
+  std::optional<bool> has_kernel_dwarf_;
+
+  std::unordered_map<Kfunc, bool> available_kernel_funcs_;
 
 private:
   bool detect_map(libbpf::bpf_map_type map_type);

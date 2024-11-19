@@ -1,11 +1,14 @@
 #pragma once
 
+#include <time.h>
+
 #include <cstdint>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -35,45 +38,38 @@ namespace bpftrace {
 
 const int timeout_ms = 100;
 
-struct symbol {
-  std::string name;
-  uint64_t start;
-  uint64_t size;
-  uint64_t address;
-};
-
 struct stack_key {
   int64_t stackid;
   uint32_t nr_stack_frames;
 };
 
-enum class DebugLevel;
+enum class DebugStage;
 
 // globals
-extern DebugLevel bt_debug;
+extern std::set<DebugStage> bt_debug;
 extern bool bt_quiet;
 extern bool bt_verbose;
+extern bool dry_run;
 
-enum class DebugLevel { kNone, kDebug, kFullDebug };
+enum class DebugStage {
+  Ast,
+  Codegen,
+  CodegenOpt,
+  Disassemble,
+  Libbpf,
+  Verifier
+};
 
-inline DebugLevel operator++(DebugLevel &level, int)
-{
-  switch (level) {
-    case DebugLevel::kNone:
-      level = DebugLevel::kDebug;
-      break;
-    case DebugLevel::kDebug:
-      level = DebugLevel::kFullDebug;
-      break;
-    case DebugLevel::kFullDebug:
-      // NOTE (mmarchini): should be handled by the caller
-      level = DebugLevel::kNone;
-      break;
-    default:
-      break;
-  }
-  return level;
-}
+const std::unordered_map<std::string_view, DebugStage> debug_stages = {
+  { "ast", DebugStage::Ast },
+  { "codegen", DebugStage::Codegen },
+  { "codegen-opt", DebugStage::CodegenOpt },
+#ifndef NDEBUG
+  { "dis", DebugStage::Disassemble },
+#endif
+  { "libbpf", DebugStage::Libbpf },
+  { "verifier", DebugStage::Verifier },
+};
 
 class WildcardException : public std::exception {
 public:
@@ -99,11 +95,14 @@ public:
         feature_(std::make_unique<BPFfeature>(no_feature)),
         probe_matcher_(std::make_unique<ProbeMatcher>(this)),
         ncpus_(get_possible_cpus().size()),
+        max_cpu_id_(get_max_cpu_id()),
         config_(config)
   {
   }
   virtual ~BPFtrace();
-  virtual int add_probe(ast::Probe &p);
+  virtual int add_probe(const ast::AttachPoint &ap,
+                        const ast::Probe &p,
+                        int usdt_location_idx = 0);
   Probe generateWatchpointSetupProbe(const ast::AttachPoint &ap,
                                      const ast::Probe &probe);
   int num_probes() const;
@@ -119,16 +118,16 @@ public:
   int print_map(const BpfMap &map, uint32_t top, uint32_t div);
   std::string get_stack(int64_t stackid,
                         uint32_t nr_stack_frames,
-                        int pid,
-                        int probe_id,
+                        int32_t pid,
+                        int32_t probe_id,
                         bool ustack,
                         StackType stack_type,
                         int indent = 0);
-  std::string resolve_buf(char *buf, size_t size);
+  std::string resolve_buf(const char *buf, size_t size);
   std::string resolve_ksym(uint64_t addr, bool show_offset = false);
   std::string resolve_usym(uint64_t addr,
-                           int pid,
-                           int probe_id,
+                           int32_t pid,
+                           int32_t probe_id,
                            bool show_offset = false,
                            bool show_module = false);
   std::string resolve_inet(int af, const uint8_t *inet) const;
@@ -166,9 +165,15 @@ public:
   bool has_btf_data() const;
   Dwarf *get_dwarf(const std::string &filename);
   Dwarf *get_dwarf(const ast::AttachPoint &attachpoint);
+  bool has_dwarf_data() const
+  {
+    return !dwarves_.empty();
+  }
+  void fentry_recursion_check(ast::Program *prog);
 
   std::string cmd_;
   bool finalize_ = false;
+  static int exit_code;
   // Global variables checking if an exit/usr1 signal was received
   static volatile sig_atomic_t exitsig_recv;
   static volatile sig_atomic_t sigusr1_recv;
@@ -177,11 +182,15 @@ public:
   BpfBytecode bytecode_;
   StructManager structs;
   std::map<std::string, std::string> macros_;
-  std::map<std::string, uint64_t> enums_;
+  // Map of enum variant_name to (variant_value, enum_name)
+  std::map<std::string, std::tuple<uint64_t, std::string>> enums_;
+  // Map of enum_name to map of variant_value to variant_name
+  std::map<std::string, std::map<uint64_t, std::string>> enum_defs_;
   std::map<libbpf::bpf_func_id, location> helper_use_loc_;
   const FuncsModulesMap &get_traceable_funcs() const;
   KConfig kconfig;
   std::vector<std::unique_ptr<AttachedProbe>> attached_probes_;
+  std::optional<int> sigusr1_prog_fd_;
 
   std::map<std::string, std::unique_ptr<PCAPwriter>> pcap_writers;
 
@@ -199,11 +208,12 @@ public:
   bool debug_output_ = false;
   std::optional<struct timespec> boottime_;
   std::optional<struct timespec> delta_taitime_;
-  static constexpr uint32_t rb_loss_cnt_key_ = 0;
-  static constexpr uint64_t rb_loss_cnt_val_ = 0;
+  static constexpr uint32_t event_loss_cnt_key_ = 0;
+  static constexpr uint64_t event_loss_cnt_val_ = 0;
+  bool need_recursion_check_ = false;
 
   static void sort_by_key(
-      std::vector<SizedType> key_args,
+      const SizedType &key,
       std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
           &values_by_key);
 
@@ -219,12 +229,10 @@ public:
   }
   int ncpus_;
   int online_cpus_;
+  int max_cpu_id_;
   Config config_;
 
 private:
-  int run_special_probe(std::string name,
-                        const BpfBytecode &bytecode,
-                        void (*trigger)(void));
   void *ksyms_{ nullptr };
   // note: exe_sym_ is used when layout is same for all instances of program
   std::map<std::string, std::pair<int, void *>> exe_sym_; // exe -> (pid, cache)
@@ -237,12 +245,13 @@ private:
 
   std::vector<std::unique_ptr<AttachedProbe>> attach_usdt_probe(
       Probe &probe,
-      BpfProgram &&program,
+      const BpfProgram &program,
       int pid,
       bool file_activation);
   int setup_output();
   int setup_perf_events();
-  int setup_ringbuf();
+  void setup_ringbuf();
+  int setup_event_loss();
   // when the ringbuf feature is available, enable ringbuf for built-ins like
   // printf, cat.
   bool is_ringbuf_enabled(void) const
@@ -258,17 +267,17 @@ private:
   void teardown_output();
   void poll_output(bool drain = false);
   int poll_perf_events();
-  void handle_ringbuf_loss();
+  void handle_event_loss();
   int print_map_hist(const BpfMap &map, uint32_t top, uint32_t div);
-  int print_map_stats(const BpfMap &map, uint32_t top, uint32_t div);
   static uint64_t read_address_from_output(std::string output);
-  std::optional<std::vector<uint8_t>> find_empty_key(const BpfMap &map) const;
   struct bcc_symbol_option &get_symbol_opts();
-  Probe generate_probe(const ast::AttachPoint &ap, const ast::Probe &p);
+  Probe generate_probe(const ast::AttachPoint &ap,
+                       const ast::Probe &p,
+                       int usdt_location_idx = 0);
   bool has_iter_ = false;
   int epollfd_ = -1;
   struct ring_buffer *ringbuf_ = nullptr;
-  uint64_t ringbuf_loss_count_ = 0;
+  uint64_t event_loss_count_ = 0;
 
   // Mapping traceable functions to modules (or "vmlinux") they appear in.
   // Needs to be mutable to allow lazy loading of the mapping from const lookup

@@ -8,6 +8,7 @@
 #include "utils.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -50,6 +51,10 @@ BTF::BTF(const std::set<std::string> &modules) : state(NODATA)
     btf_objects.push_back(
         BTFObj{ .btf = btf__parse_raw(path), .id = 0, .name = "" });
     vmlinux_btf = btf_objects.back().btf;
+    if (!vmlinux_btf) {
+      LOG(WARNING) << "BTF: failed to parse BTF from " << path;
+      return;
+    }
   } else
     load_kernel_btfs(modules);
 
@@ -58,7 +63,7 @@ BTF::BTF(const std::set<std::string> &modules) : state(NODATA)
     return;
   }
 
-  vmlinux_btf_size = (__s32)type_cnt(vmlinux_btf);
+  vmlinux_btf_size = static_cast<__s32>(type_cnt(vmlinux_btf));
 
   state = OK;
 }
@@ -103,7 +108,7 @@ void BTF::load_kernel_btfs(const std::set<std::string> &modules)
     // Get BTF object info - needed to determine if this is a kernel module BTF
     char name[64];
     struct bpf_btf_info info = {};
-    info.name = (__u64)name;
+    info.name = reinterpret_cast<uintptr_t>(name);
     info.name_len = sizeof(name);
 
     __u32 info_len = sizeof(info);
@@ -195,7 +200,7 @@ std::string BTF::dump_defs_from_btf(
     return std::string("");
   }
 
-  __s32 id, max = (__s32)type_cnt(btf);
+  __s32 id, max = static_cast<__s32>(type_cnt(btf));
 
   // note that we're always iterating from 1 here as we need to go through the
   // vmlinux BTF entries, too (even for kernel module BTFs)
@@ -348,6 +353,21 @@ const struct btf_type *BTF::btf_type_skip_modifiers(const struct btf_type *t,
   return t;
 }
 
+__u32 BTF::get_type_tags(std::unordered_set<std::string> &tags,
+                         const BTFId &btf_id) const
+{
+  __u32 id = btf_id.id;
+  const struct btf_type *t = btf__type_by_id(btf_id.btf, btf_id.id);
+
+  while (t && btf_is_type_tag(t)) {
+    tags.insert(btf_str(btf_id.btf, t->name_off));
+    id = t->type;
+    t = btf__type_by_id(btf_id.btf, t->type);
+  }
+
+  return id;
+}
+
 SizedType BTF::get_stype(const BTFId &btf_id, bool resolve_structs)
 {
   const struct btf_type *t = btf__type_by_id(btf_id.btf, btf_id.id);
@@ -375,9 +395,12 @@ SizedType BTF::get_stype(const BTFId &btf_id, bool resolve_structs)
     if (resolve_structs)
       resolve_fields(stype);
   } else if (btf_is_ptr(t)) {
-    // t->type is the pointee type
+    const BTFId pointee_btf_id = { .btf = btf_id.btf, .id = t->type };
+    std::unordered_set<std::string> tags;
+    auto id = get_type_tags(tags, pointee_btf_id);
     stype = CreatePointer(
-        get_stype(BTFId{ .btf = btf_id.btf, .id = t->type }, false));
+        get_stype(BTFId{ .btf = btf_id.btf, .id = id }, false));
+    stype.SetBtfTypeTags(std::move(tags));
   } else if (btf_is_array(t)) {
     auto *array = btf_array(t);
     const auto &elem_type = get_stype(
@@ -448,20 +471,20 @@ std::optional<Struct> BTF::resolve_args(const std::string &func,
     stype.funcarg_idx = arg_idx;
     stype.is_funcarg = true;
     args.AddField(str, stype, args.size, std::nullopt, false);
-    // kfunc (fentry/fexit) args are stored in a u64 array.
+    // fentry args are stored in a u64 array.
     // Note that it's ok to represent them by a struct as we will use GEP with
     // funcarg_idx to access them in codegen.
     type_size = btf__resolve_size(func_id.btf, p->type);
     args.size += type_size;
-    arg_idx += std::ceil((float)type_size / (float)8);
+    arg_idx += std::ceil(static_cast<float>(type_size) / static_cast<float>(8));
   }
 
   if (ret) {
     SizedType stype = get_stype(BTFId{ .btf = func_id.btf, .id = t->type });
     stype.funcarg_idx = arg_idx;
     stype.is_funcarg = true;
-    args.AddField("$retval", stype, args.size, std::nullopt, false);
-    // kfunc (fentry/fexit) args (incl. retval) are stored in a u64 array
+    args.AddField(RETVAL_FIELD_NAME, stype, args.size, std::nullopt, false);
+    // fentry args (incl. retval) are stored in a u64 array
     args.size += btf__resolve_size(func_id.btf, t->type);
   }
   return args;
@@ -470,7 +493,7 @@ std::optional<Struct> BTF::resolve_args(const std::string &func,
 std::string BTF::get_all_funcs_from_btf(const BTFObj &btf_obj) const
 {
   std::string funcs;
-  __s32 id, max = (__s32)type_cnt(btf_obj.btf);
+  __s32 id, max = static_cast<__s32>(type_cnt(btf_obj.btf));
 
   for (id = start_id(btf_obj.btf); id <= max; id++) {
     const struct btf_type *t = btf__type_by_id(btf_obj.btf, id);
@@ -515,7 +538,7 @@ std::map<std::string, std::vector<std::string>> BTF::get_params_from_btf(
     const BTFObj &btf_obj,
     const std::set<std::string> &funcs) const
 {
-  __s32 id, max = (__s32)type_cnt(btf_obj.btf);
+  __s32 id, max = static_cast<__s32>(type_cnt(btf_obj.btf));
   std::string type = std::string("");
   struct btf_dump *dump;
   char err_buf[256];
@@ -549,16 +572,11 @@ std::map<std::string, std::vector<std::string>> BTF::get_params_from_btf(
     if (!t)
       continue;
 
-    _Pragma("GCC diagnostic push")
-        _Pragma("GCC diagnostic ignored \"-Wmissing-field-initializers\"")
+    BPFTRACE_LIBBPF_OPTS(btf_dump_emit_type_decl_opts,
+                         decl_opts,
+                         .field_name = "");
 
-            DECLARE_LIBBPF_OPTS(btf_dump_emit_type_decl_opts,
-                                decl_opts,
-                                .field_name = "");
-
-    _Pragma("GCC diagnostic pop")
-
-        const struct btf_param *p;
+    const struct btf_param *p;
     int j;
 
     for (j = 0, p = btf_params(t); j < btf_vlen(t); j++, p++) {
@@ -620,7 +638,7 @@ std::map<std::string, std::vector<std::string>> BTF::get_params(
 std::set<std::string> BTF::get_all_structs_from_btf(const struct btf *btf) const
 {
   std::set<std::string> struct_set;
-  __s32 id, max = (__s32)type_cnt(btf);
+  __s32 id, max = static_cast<__s32>(type_cnt(btf));
   std::string types = std::string("");
   struct btf_dump *dump;
   char err_buf[256];
@@ -700,7 +718,7 @@ std::unordered_set<std::string> BTF::get_all_iters_from_btf(
   // kernel commit 6fcd486b3a0a("bpf: Refactor RCU enforcement in the
   // verifier.") add 'struct bpf_iter__task__safe_trusted'
   const std::string suffix___safe_trusted = "__safe_trusted";
-  __s32 id, max = (__s32)type_cnt(btf);
+  __s32 id, max = static_cast<__s32>(type_cnt(btf));
   for (id = start_id(btf); id <= max; id++) {
     const struct btf_type *t = btf__type_by_id(btf, id);
 
@@ -732,10 +750,7 @@ std::unordered_set<std::string> BTF::get_all_iters() const
   return iters;
 }
 
-// Retrieves BTF id of the given function and the FD of the BTF object
-// containing it
-std::pair<int, int> BTF::get_btf_id_fd(const std::string &func,
-                                       const std::string &mod) const
+int BTF::get_btf_id(std::string_view func, std::string_view mod) const
 {
   for (auto &btf_obj : btf_objects) {
     if (!mod.empty() && mod != btf_obj.name)
@@ -743,10 +758,10 @@ std::pair<int, int> BTF::get_btf_id_fd(const std::string &func,
 
     auto id = find_id_in_btf(btf_obj.btf, func, BTF_KIND_FUNC);
     if (id >= 0)
-      return { id, btf_obj.id ? bpf_btf_get_fd_by_id(btf_obj.id) : 0 };
+      return id;
   }
 
-  return { -1, -1 };
+  return -1;
 }
 
 BTF::BTFId BTF::find_id(const std::string &name,
@@ -756,17 +771,19 @@ BTF::BTFId BTF::find_id(const std::string &name,
     __s32 id = kind ? btf__find_by_name_kind(btf_obj.btf, name.c_str(), *kind)
                     : btf__find_by_name(btf_obj.btf, name.c_str());
     if (id >= 0)
-      return { btf_obj.btf, (__u32)id };
+      return { btf_obj.btf, static_cast<__u32>(id) };
   }
 
   return { nullptr, 0 };
 }
 
 __s32 BTF::find_id_in_btf(struct btf *btf,
-                          const std::string &name,
+                          std::string_view name,
                           std::optional<__u32> kind) const
 {
-  for (__s32 id = start_id(btf), max = (__s32)type_cnt(btf); id <= max; ++id) {
+  for (__s32 id = start_id(btf), max = static_cast<__s32>(type_cnt(btf));
+       id <= max;
+       ++id) {
     const struct btf_type *t = btf__type_by_id(btf, id);
     if (!t)
       continue;

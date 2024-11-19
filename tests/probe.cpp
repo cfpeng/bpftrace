@@ -11,9 +11,7 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
-namespace bpftrace {
-namespace test {
-namespace probe {
+namespace bpftrace::test::probe {
 
 #include "btf_common.h"
 
@@ -28,23 +26,25 @@ void gen_bytecode(const std::string &input, std::stringstream &out)
 
   ASSERT_EQ(driver.parse_str(input), 0);
 
-  ast::FieldAnalyser fields(driver.root.get(), *bpftrace);
+  ast::FieldAnalyser fields(driver.ctx.root, *bpftrace);
   EXPECT_EQ(fields.analyse(), 0);
 
   ClangParser clang;
-  clang.parse(driver.root.get(), *bpftrace);
+  clang.parse(driver.ctx.root, *bpftrace);
 
   // Override to mockbpffeature.
   bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
-  ast::SemanticAnalyser semantics(driver.root.get(), *bpftrace);
+  ast::SemanticAnalyser semantics(driver.ctx, *bpftrace);
   ASSERT_EQ(semantics.analyse(), 0);
 
-  ast::ResourceAnalyser resource_analyser(driver.root.get());
+  ast::ResourceAnalyser resource_analyser(driver.ctx.root, *bpftrace);
   auto resources_optional = resource_analyser.analyse();
   ASSERT_TRUE(resources_optional.has_value());
+  // clang-tidy doesn't recognize ASSERT_*() as execution terminating
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
   bpftrace->resources = resources_optional.value();
 
-  ast::CodegenLLVM codegen(driver.root.get(), *bpftrace);
+  ast::CodegenLLVM codegen(driver.ctx.root, *bpftrace);
   codegen.generate_ir();
   codegen.DumpIR(out);
 }
@@ -77,13 +77,11 @@ class probe_btf : public test_btf {};
 
 TEST_F(probe_btf, short_name)
 {
-  compare_bytecode("kfunc:func_1 { 1 }", "f:func_1 { 1 }");
-  compare_bytecode("kretfunc:func_1 { 1 }", "fr:func_1 { 1 }");
+  compare_bytecode("fentry:func_1 { 1 }", "f:func_1 { 1 }");
+  compare_bytecode("fexit:func_1 { 1 }", "fr:func_1 { 1 }");
   compare_bytecode("iter:task { 1 }", "it:task { 1 }");
   compare_bytecode("iter:task_file { 1 }", "it:task_file { 1 }");
   compare_bytecode("iter:task_vma { 1 }", "it:task_vma { 1 }");
 }
 
-} // namespace probe
-} // namespace test
-} // namespace bpftrace
+} // namespace bpftrace::test::probe

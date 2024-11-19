@@ -7,9 +7,7 @@
 #include "driver.h"
 #include "mocks.h"
 
-namespace bpftrace {
-namespace test {
-namespace config_analyser {
+namespace bpftrace::test::config_analyser {
 
 using ::testing::_;
 
@@ -26,14 +24,14 @@ void test(BPFtrace &bpftrace,
   ASSERT_EQ(driver.parse_str(input), 0);
 
   ClangParser clang;
-  ASSERT_TRUE(clang.parse(driver.root.get(), bpftrace));
+  ASSERT_TRUE(clang.parse(driver.ctx.root, bpftrace));
 
   ASSERT_EQ(driver.parse_str(input), 0);
   out.str("");
-  ast::SemanticAnalyser semantics(driver.root.get(), bpftrace, out, false);
+  ast::SemanticAnalyser semantics(driver.ctx, bpftrace, out, false);
   ASSERT_EQ(semantics.analyse(), 0) << msg.str() << out.str();
 
-  ast::ConfigAnalyser config_analyser(driver.root.get(), bpftrace, out);
+  ast::ConfigAnalyser config_analyser(driver.ctx.root, bpftrace, out);
   EXPECT_EQ(config_analyser.analyse(), expected_result)
       << msg.str() << out.str();
   if (expected_error.data()) {
@@ -90,7 +88,7 @@ config = { BAD_CONFIG=1 } BEGIN { }
        false);
   test(
       "config = { BPFTRACE_MAX_PROBES=\"hello\" } BEGIN { }",
-      R"(stdin:1:12-32: ERROR: Invalid type for BPFTRACE_MAX_PROBES. Type: string. Expected Type: integer
+      R"(stdin:1:12-32: ERROR: Invalid type for BPFTRACE_MAX_PROBES. Type: string. Expected Type: int
 config = { BPFTRACE_MAX_PROBES="hello" } BEGIN { }
            ~~~~~~~~~~~~~~~~~~~~
 )",
@@ -127,8 +125,12 @@ TEST(config_analyser, config_setting)
   EXPECT_EQ(bpftrace->config_.get(ConfigKeyUserSymbolCacheType::default_),
             UserSymbolCacheType::per_program);
   EXPECT_EQ(bpftrace->config_.get(ConfigKeyInt::log_size), 150);
+
+  EXPECT_EQ(bpftrace->config_.get(ConfigKeySymbolSource::default_),
+            ConfigSymbolSource::dwarf);
+  test(*bpftrace, "config = { symbol_source = \"symbol_table\" } BEGIN { }");
+  EXPECT_EQ(bpftrace->config_.get(ConfigKeySymbolSource::default_),
+            ConfigSymbolSource::symbol_table);
 }
 
-} // namespace config_analyser
-} // namespace test
-} // namespace bpftrace
+} // namespace bpftrace::test::config_analyser

@@ -43,6 +43,17 @@ std::set<std::string> ProbeMatcher::get_matches_in_stream(
   bool start_wildcard, end_wildcard;
   auto tokens = get_wildcard_tokens(search_input, start_wildcard, end_wildcard);
 
+  // Since demangled_name contains function parameters, we need to remove
+  // them unless the user specified '(' in the search input (i.e. wants
+  // to match against the parameters explicitly).
+  // Only used for C++ when demangling is enabled.
+  auto has_parameter = [](const std::string& token) {
+    return token.find('(') != std::string::npos;
+  };
+  const bool truncate_parameters = std::none_of(tokens.begin(),
+                                                tokens.end(),
+                                                has_parameter);
+
   std::string line;
   std::set<std::string> matches;
   while (std::getline(symbol_stream, line, delim)) {
@@ -58,23 +69,15 @@ std::set<std::string> ProbeMatcher::get_matches_in_stream(
             continue;
 
           // Match against the demanled name.
-          // Since demangled_name contains function arguments, we need to remove
-          // them unless the user specified '(' in the search input (i.e. wants
-          // to match against the arguments explicitly).
           std::string match_line = prefix + demangled_name;
-          if (std::all_of(tokens.begin(),
-                          tokens.end(),
-                          [&](const std::string& token) {
-                            return token.find("(") == std::string::npos;
-                          })) {
-            match_line = match_line.substr(0, match_line.find_last_of("("));
+          if (truncate_parameters) {
+            erase_parameter_list(match_line);
           }
 
-          if (!wildcard_match(
+          free(demangled_name);
+
+          if (wildcard_match(
                   match_line, tokens, start_wildcard, end_wildcard)) {
-            free(demangled_name);
-          } else {
-            free(demangled_name);
             goto out;
           }
         }
@@ -141,8 +144,8 @@ std::set<std::string> ProbeMatcher::get_matches_for_probetype(
       symbol_stream = get_symbols_from_list(HW_PROBE_LIST);
       break;
     }
-    case ProbeType::kfunc:
-    case ProbeType::kretfunc: {
+    case ProbeType::fentry:
+    case ProbeType::fexit: {
       // If BTF is not parsed, yet, read available_filter_functions instead.
       // This is useful as we will use the result to extract the list of
       // potentially used kernel modules and then only parse BTF for them.
@@ -179,6 +182,8 @@ std::set<std::string> ProbeMatcher::get_matches_for_probetype(
       symbol_stream = std::make_unique<std::istringstream>(ret);
       break;
     }
+    case ProbeType::special:
+      return { target + ":" };
     default:
       return {};
   }
@@ -336,9 +341,9 @@ std::unique_ptr<std::istream> ProbeMatcher::kernel_probe_list()
     if (!p.show_in_kernel_list) {
       continue;
     }
-    if (p.type == ProbeType::kfunc) {
-      // kfunc must be available
-      if (bpftrace_->feature_->has_kfunc())
+    if (p.type == ProbeType::fentry) {
+      // fentry must be available
+      if (bpftrace_->feature_->has_fentry())
         probes += p.name + "\n";
     } else {
       probes += p.name + "\n";
@@ -445,16 +450,16 @@ FuncParamLists ProbeMatcher::get_uprobe_params(
 
 void ProbeMatcher::list_probes(ast::Program* prog)
 {
-  for (auto* probe : *prog->probes) {
-    for (auto* ap : *probe->attach_points) {
+  for (auto* probe : prog->probes) {
+    for (auto* ap : probe->attach_points) {
       auto matches = get_matches_for_ap(*ap);
       auto probe_type = probetype(ap->provider);
       FuncParamLists param_lists;
       if (bt_verbose) {
         if (probe_type == ProbeType::tracepoint)
           param_lists = get_tracepoints_params(matches);
-        else if (probe_type == ProbeType::kfunc ||
-                 probe_type == ProbeType::kretfunc)
+        else if (probe_type == ProbeType::fentry ||
+                 probe_type == ProbeType::fexit)
           param_lists = bpftrace_->btf_->get_params(matches);
         else if (probe_type == ProbeType::iter)
           param_lists = get_iters_params(matches);
@@ -480,7 +485,7 @@ void ProbeMatcher::list_probes(ast::Program* prog)
         std::cout << probe_type << ":" << match_print << std::endl;
         if (bt_verbose) {
           for (auto& param : param_lists[match])
-            LOG(V1) << "    " << param;
+            std::cout << "    " << param << std::endl;
         }
       }
     }
@@ -511,8 +516,8 @@ std::set<std::string> ProbeMatcher::get_matches_for_ap(
     case ProbeType::watchpoint:
     case ProbeType::asyncwatchpoint:
     case ProbeType::tracepoint:
-    case ProbeType::kfunc:
-    case ProbeType::kretfunc: {
+    case ProbeType::fentry:
+    case ProbeType::fexit: {
       // Do not expand "target:" as that would match all functions in target.
       // This may occur when an absolute address is given instead of a function.
       if (attach_point.func.empty())

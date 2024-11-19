@@ -1,19 +1,20 @@
 #include "bpffeature.h"
 
-#include <bcc/bcc_syms.h>
-#include <bcc/libbpf.h>
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
 #include <bpf/libbpf.h>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <fcntl.h>
 #include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "bpf_assembler.h"
 #include "btf.h"
 #include "debugfs.h"
+#include "dwarf_parser.h"
 #include "probe_matcher.h"
 #include "tracefs.h"
 #include "utils.h"
@@ -60,7 +61,7 @@ static bool try_load_(const char* name,
       continue;
     }
 
-    LIBBPF_OPTS(bpf_prog_load_opts, opts);
+    BPFTRACE_LIBBPF_OPTS(bpf_prog_load_opts, opts);
     opts.log_buf = logbuf;
     opts.log_size = logbuf_size;
     opts.log_level = loglevel;
@@ -103,10 +104,7 @@ bool BPFfeature::try_load(enum libbpf::bpf_prog_type prog_type,
 
   std::optional<unsigned> btf_id;
   if (prog_type == libbpf::BPF_PROG_TYPE_TRACING && has_btf()) {
-    auto id_fd = btf_.get_btf_id_fd(name, "vmlinux");
-    btf_id = id_fd.first;
-    if (id_fd.second >= 0)
-      close(id_fd.second);
+    btf_id = btf_.get_btf_id(name, "vmlinux");
   }
 
   if (prog_type == libbpf::BPF_PROG_TYPE_TRACING) {
@@ -132,11 +130,11 @@ bool BPFfeature::try_load_btf(const void* btf_data, size_t btf_size)
 {
   constexpr int log_size = 4096;
   char log_buf[log_size] = {};
-  LIBBPF_OPTS(bpf_btf_load_opts,
-              btf_opts,
-              .log_buf = log_buf,
-              .log_level = 0,
-              .log_size = log_size, );
+  BPFTRACE_LIBBPF_OPTS(bpf_btf_load_opts,
+                       btf_opts,
+                       .log_buf = log_buf,
+                       .log_level = 0,
+                       .log_size = log_size, );
 
   int fd = bpf_btf_load(btf_data, btf_size, &btf_opts);
   if (fd >= 0) {
@@ -221,7 +219,7 @@ bool BPFfeature::detect_map(enum libbpf::bpf_map_type map_type)
       break;
   }
 
-  LIBBPF_OPTS(bpf_map_create_opts, opts);
+  BPFTRACE_LIBBPF_OPTS(bpf_map_create_opts, opts);
   opts.map_flags = flags;
   map_fd = bpf_map_create(static_cast<enum ::bpf_map_type>(map_type),
                           nullptr,
@@ -236,7 +234,7 @@ bool BPFfeature::detect_map(enum libbpf::bpf_map_type map_type)
   return map_fd >= 0;
 }
 
-bool BPFfeature::has_loop(void)
+bool BPFfeature::has_loop()
 {
   if (has_loop_.has_value())
     return *has_loop_;
@@ -254,7 +252,7 @@ bool BPFfeature::has_loop(void)
   return has_loop();
 }
 
-bool BPFfeature::has_btf(void)
+bool BPFfeature::has_btf()
 {
   return btf_.has_data();
 }
@@ -280,7 +278,7 @@ bool BPFfeature::has_btf_func_global()
   return *has_btf_func_global_;
 }
 
-int BPFfeature::instruction_limit(void)
+int BPFfeature::instruction_limit()
 {
   if (insns_limit_.has_value())
     return *insns_limit_;
@@ -342,7 +340,7 @@ bool BPFfeature::has_map_batch()
   if (has_map_batch_.has_value())
     return *has_map_batch_;
 
-  LIBBPF_OPTS(bpf_map_create_opts, opts);
+  BPFTRACE_LIBBPF_OPTS(bpf_map_create_opts, opts);
   opts.map_flags = flags;
   map_fd = bpf_map_create(static_cast<enum ::bpf_map_type>(
                               libbpf::BPF_MAP_TYPE_HASH),
@@ -363,7 +361,7 @@ bool BPFfeature::has_map_batch()
   return *has_map_batch_;
 }
 
-bool BPFfeature::has_d_path(void)
+bool BPFfeature::has_d_path()
 {
   if (has_d_path_.has_value())
     return *has_d_path_;
@@ -414,7 +412,7 @@ bool BPFfeature::has_kprobe_multi()
   }
 
   const char* sym = "ksys_read";
-  DECLARE_LIBBPF_OPTS(bpf_link_create_opts, link_opts);
+  BPFTRACE_LIBBPF_OPTS(bpf_link_create_opts, link_opts);
   int progfd, linkfd = -1;
 
   struct bpf_insn insns[] = {
@@ -425,7 +423,7 @@ bool BPFfeature::has_kprobe_multi()
   link_opts.kprobe_multi.syms = &sym;
   link_opts.kprobe_multi.cnt = 1;
 
-  LIBBPF_OPTS(bpf_prog_load_opts, load_opts);
+  BPFTRACE_LIBBPF_OPTS(bpf_prog_load_opts, load_opts);
   load_opts.expected_attach_type = static_cast<enum ::bpf_attach_type>(
       libbpf::BPF_TRACE_KPROBE_MULTI);
 
@@ -467,10 +465,11 @@ bool BPFfeature::has_uprobe_multi()
     return *has_uprobe_multi_;
   }
 
-  LIBBPF_OPTS(bpf_prog_load_opts,
-              load_opts,
-              .expected_attach_type = static_cast<enum ::bpf_attach_type>(
-                  libbpf::BPF_TRACE_UPROBE_MULTI), );
+  BPFTRACE_LIBBPF_OPTS(
+      bpf_prog_load_opts,
+      load_opts,
+      .expected_attach_type = static_cast<enum ::bpf_attach_type>(
+          libbpf::BPF_TRACE_UPROBE_MULTI), );
 
   int err = 0, progfd, linkfd = -1;
 
@@ -488,7 +487,7 @@ bool BPFfeature::has_uprobe_multi()
                          &load_opts);
 
   if (progfd >= 0) {
-    LIBBPF_OPTS(bpf_link_create_opts, link_opts);
+    BPFTRACE_LIBBPF_OPTS(bpf_link_create_opts, link_opts);
     const unsigned long offset = 0;
 
     link_opts.uprobe_multi.path = "/";
@@ -517,9 +516,9 @@ bool BPFfeature::has_uprobe_multi()
   return *has_uprobe_multi_;
 }
 
-bool BPFfeature::has_skb_output(void)
+bool BPFfeature::has_skb_output()
 {
-  if (!has_kfunc())
+  if (!has_fentry())
     return false;
 
   if (has_skb_output_.has_value())
@@ -527,7 +526,7 @@ bool BPFfeature::has_skb_output(void)
 
   int map_fd = 0;
 
-  LIBBPF_OPTS(bpf_map_create_opts, opts);
+  BPFTRACE_LIBBPF_OPTS(bpf_map_create_opts, opts);
   opts.map_flags = 0;
   map_fd = bpf_map_create(static_cast<enum ::bpf_map_type>(
                               libbpf::BPF_MAP_TYPE_PERF_EVENT_ARRAY),
@@ -565,33 +564,7 @@ bool BPFfeature::has_skb_output(void)
   return *has_skb_output_;
 }
 
-bool BPFfeature::has_raw_tp_special()
-{
-  if (has_raw_tp_special_.has_value())
-    return *has_raw_tp_special_;
-
-  struct bpf_insn insns[] = { BPF_MOV64_IMM(BPF_REG_0, 0), BPF_EXIT_INSN() };
-  int fd;
-
-  // Check that we can both load BPF_PROG_TYPE_RAW_TRACEPOINT and that
-  // BPF_PROG_RUN is supported by the kernel
-  if (try_load(libbpf::BPF_PROG_TYPE_RAW_TRACEPOINT,
-               insns,
-               ARRAY_SIZE(insns),
-               nullptr,
-               std::nullopt,
-               &fd)) {
-    struct bpf_test_run_opts opts = {};
-    opts.sz = sizeof(opts);
-    has_raw_tp_special_ = !::bpf_prog_test_run_opts(fd, &opts);
-    close(fd);
-  } else
-    has_raw_tp_special_ = false;
-
-  return *has_raw_tp_special_;
-}
-
-std::string BPFfeature::report(void)
+std::string BPFfeature::report()
 {
   std::stringstream buf;
   auto to_str = [](bool f) -> auto { return f ? "yes\n" : "no\n"; };
@@ -623,6 +596,7 @@ std::string BPFfeature::report(void)
       << "  Loop support: " << to_str(has_loop())
       << "  btf: " << to_str(has_btf())
       << "  module btf: " << to_str(has_module_btf())
+      << "  Kernel DWARF: " << to_str(has_kernel_dwarf())
       << "  map batch: " << to_str(has_map_batch())
       << "  uprobe refcount (depends on Build:bcc bpf_attach_uprobe refcount): "
       << to_str(has_uprobe_refcnt()) << std::endl;
@@ -640,18 +614,17 @@ std::string BPFfeature::report(void)
       << "  kprobe: " << to_str(has_prog_kprobe())
       << "  tracepoint: " << to_str(has_prog_tracepoint())
       << "  perf_event: " << to_str(has_prog_perf_event())
-      << "  kfunc: " << to_str(has_kfunc())
+      << "  fentry: " << to_str(has_fentry())
       << "  kprobe_multi: " << to_str(has_kprobe_multi())
       << "  uprobe_multi: " << to_str(has_uprobe_multi())
-      << "  raw_tp_special: " << to_str(has_raw_tp_special())
       << "  iter: " << to_str(has_iter("task")) << std::endl;
 
   return buf.str();
 }
 
-bool BPFfeature::has_prog_kfunc()
+bool BPFfeature::has_prog_fentry()
 {
-  if (!has_prog_kfunc_.has_value()) {
+  if (!has_prog_fentry_.has_value()) {
     int progfd;
     if (!detect_prog_type(libbpf::BPF_PROG_TYPE_TRACING,
                           "sched_fork",
@@ -663,17 +636,17 @@ bool BPFfeature::has_prog_kfunc()
     if (tracing_fd < 0)
       goto out_false;
     close(tracing_fd);
-    has_prog_kfunc_ = std::make_optional<bool>(true);
+    has_prog_fentry_ = std::make_optional<bool>(true);
   }
-  return *(has_prog_kfunc_);
+  return *(has_prog_fentry_);
 out_false:
-  has_prog_kfunc_ = std::make_optional<bool>(false);
-  return *(has_prog_kfunc_);
+  has_prog_fentry_ = std::make_optional<bool>(false);
+  return *(has_prog_fentry_);
 }
 
-bool BPFfeature::has_kfunc()
+bool BPFfeature::has_fentry()
 {
-  return has_prog_kfunc() && btf_.has_data();
+  return has_prog_fentry() && btf_.has_data();
 }
 
 bool BPFfeature::has_module_btf()
@@ -683,7 +656,7 @@ bool BPFfeature::has_module_btf()
 
   char name[64];
   struct bpf_btf_info info = {};
-  info.name = (__u64)name;
+  info.name = reinterpret_cast<uintptr_t>(name);
   info.name_len = sizeof(name);
   __u32 id = 0, info_len = sizeof(info);
   int err = 0, fd = -1;
@@ -715,6 +688,42 @@ bool BPFfeature::has_iter(std::string name)
   return detect_prog_type(libbpf::BPF_PROG_TYPE_TRACING,
                           tracing_name.c_str(),
                           libbpf::BPF_TRACE_ITER);
+}
+
+bool BPFfeature::has_kernel_dwarf()
+{
+#ifndef HAVE_LIBLLDB
+  return false;
+#endif
+
+  auto vmlinux = find_vmlinux();
+  if (!vmlinux.has_value())
+    return false;
+
+  // WARNING: we are not passing a pointer to BPFtrace, so we can only use:
+  // * Dwarf::has_debug_info
+  // * Dwarf::get_function_locations
+  // * Dwarf::get_function_params
+  // Otherwise, Dwarf will try to use the BPFtrace pointer and will segfault.
+  auto dwarf = Dwarf::GetFromBinary(nullptr, vmlinux.value());
+  if (!dwarf)
+    return false;
+
+  return dwarf->has_debug_info();
+}
+
+bool BPFfeature::has_kernel_func(Kfunc kfunc)
+{
+  if (!has_btf())
+    return false;
+
+  auto find_kfunc = available_kernel_funcs_.find(kfunc);
+  if (find_kfunc != available_kernel_funcs_.end())
+    return find_kfunc->second;
+
+  bool result = btf_.get_btf_id(kfunc_name(kfunc), "") >= 0;
+  available_kernel_funcs_.emplace(kfunc, result);
+  return result;
 }
 
 } // namespace bpftrace

@@ -1,9 +1,9 @@
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <climits>
 #include <cmath>
 #include <cstring>
-#include <errno.h>
 #include <fcntl.h>
 #include <fstream>
 #include <gelf.h>
@@ -13,6 +13,7 @@
 #include <link.h>
 #include <map>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -107,6 +108,72 @@ const struct vmlinux_location vmlinux_locs[] = {
   { "/usr/lib/debug/lib/modules/%1$s/vmlinux", false },
   { nullptr, false },
 };
+
+std::optional<std::string> find_vmlinux(struct vmlinux_location const *locs,
+                                        struct symbol *sym)
+{
+  struct utsname uts;
+  if (uname(&uts) != 0)
+    return std::nullopt;
+
+  for (size_t i = 0; locs[i].path; ++i) {
+    auto &loc = locs[i];
+    if (loc.raw)
+      continue; // This file is for BTF. skip
+
+    // Format the loc.path with the current release.
+    char path[PATH_MAX] = {};
+    int bytes_written = std::snprintf(
+        path, sizeof(path), loc.path, uts.release);
+    if (bytes_written < 0) {
+      LOG(ERROR) << "Failed to format vmlinux path '" << loc.path << "' using "
+                 << uts.release;
+      continue;
+    } else if (static_cast<size_t>(bytes_written) > sizeof(path)) {
+      LOG(WARNING) << "Truncated format for vmlinux path '" << loc.path
+                   << "' using " << uts.release;
+      continue;
+    }
+
+    if (access(path, R_OK))
+      continue;
+
+    if (sym == nullptr) {
+      return path;
+    } else {
+      bcc_elf_symcb callback = !sym->name.empty() ? sym_name_cb
+                                                  : sym_address_cb;
+      struct bcc_symbol_option options = {
+        .use_debug_file = 0,
+        .check_debug_file_crc = 0,
+        .lazy_symbolize = 0,
+        .use_symbol_type = BCC_SYM_ALL_TYPES ^ (1 << STT_NOTYPE),
+      };
+      if (bcc_elf_foreach_sym(path, callback, &options, sym) == -1) {
+        LOG(ERROR) << "Failed to iterate over symbols in " << path;
+        continue;
+      }
+
+      if (sym->start) {
+        LOG(V1) << "vmlinux: using " << path;
+        return path;
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+// find vmlinux file.
+// if sym is not null, check vmlinux contains the given symbol information
+std::optional<std::string> find_vmlinux(struct symbol *sym)
+{
+  struct vmlinux_location locs_env[] = {
+    { std::getenv("BPFTRACE_VMLINUX"), false },
+    { nullptr, false },
+  };
+  return find_vmlinux(locs_env[0].path ? locs_env : vmlinux_locs, sym);
+}
 
 static bool pid_in_different_mountns(int pid);
 static std::vector<std::string> resolve_binary_path(const std::string &cmd,
@@ -428,8 +495,31 @@ std::string erase_prefix(std::string &str)
   return prefix;
 }
 
-bool wildcard_match(const std::string &str,
-                    std::vector<std::string> &tokens,
+void erase_parameter_list(std::string &demangled_name)
+{
+  size_t args_start = std::string::npos;
+  ssize_t stack = 0;
+  // Look for the parenthesis closing the parameter list, then find
+  // the matching parenthesis at the start of the parameter list...
+  for (ssize_t it = demangled_name.find_last_of(')'); it >= 0; --it) {
+    if (demangled_name[it] == ')')
+      stack++;
+    if (demangled_name[it] == '(')
+      stack--;
+    if (stack == 0) {
+      args_start = it;
+      break;
+    }
+  }
+
+  // If we found the start of the parameter list,
+  // remove the parameters from the match line.
+  if (args_start != std::string::npos)
+    demangled_name.resize(args_start);
+}
+
+bool wildcard_match(std::string_view str,
+                    const std::vector<std::string> &tokens,
                     bool start_wildcard,
                     bool end_wildcard)
 {
@@ -439,7 +529,7 @@ bool wildcard_match(const std::string &str,
     if (str.find(tokens[0], next) != next)
       return false;
 
-  for (std::string token : tokens) {
+  for (const std::string &token : tokens) {
     size_t found = str.find(token, next);
     if (found == std::string::npos)
       return false;
@@ -481,6 +571,25 @@ std::vector<int> get_online_cpus()
 std::vector<int> get_possible_cpus()
 {
   return read_cpu_range("/sys/devices/system/cpu/possible");
+}
+
+int get_max_cpu_id()
+{
+  // When booting, the kernel ensures CPUs are ordered from 0 -> N so there
+  // are no gaps in possible CPUs. CPU ID is also u32 so this cast is safe
+  const auto num_possible_cpus = static_cast<uint32_t>(
+      get_possible_cpus().size());
+  assert(num_possible_cpus > 0);
+  // Using global scratch variables for big string usage looks like:
+  //   bounded_cpu_id = bpf_get_smp_processor_id() & MAX_CPU_ID
+  //   buf = global_var[bounded_cpu_id][slot_id]
+  // We bound CPU ID to satisfy the BPF verifier on older kernels. We use an AND
+  // instruction vs. LLVM umin function to reduce the number of jumps in BPF to
+  // ensure we don't hit the complexity limit of 8192 jumps
+  //
+  // To bound using AND, we need to ensure NUM_POSSIBLE_CPUS is rounded up to
+  // next nearest power of 2.
+  return round_up_to_next_power_of_two(num_possible_cpus) - 1;
 }
 
 std::vector<std::string> get_kernel_cflags(const char *uname_machine,
@@ -612,7 +721,9 @@ std::vector<std::pair<std::string, std::string>> get_cgroup_hierarchy_roots()
   for (std::string line; std::getline(mounts_file, line);) {
     std::smatch match;
     if (std::regex_match(line, match, cgroup_mount_regex)) {
-      result.push_back({ match[1].str(), match[2].str() });
+      if (std_filesystem::is_directory(match[2].str())) {
+        result.push_back({ match[1].str(), match[2].str() });
+      }
     }
   }
 
@@ -702,8 +813,8 @@ bool is_dir(const std::string &path)
   return std_filesystem::is_directory(buf, ec);
 }
 
-// get_kernel_dirs returns {ksrc, kobj} - directories for pristine and
-// generated kernel sources.
+// get_kernel_dirs fills {ksrc, kobj} - directories for pristine and
+// generated kernel sources - and returns if they were found.
 //
 // When the kernel was built in its source tree ksrc == kobj, however when
 // the kernel was build in a different directory than its source, ksrc != kobj.
@@ -716,55 +827,48 @@ bool is_dir(const std::string &path)
 //
 //   /lib/modules/`uname -r`/build/
 //
-// {"", ""} is returned if no trace of kernel headers was found at all.
-// Both ksrc and kobj are guaranteed to be != "", if at least some trace of
-// kernel sources was found.
-std::tuple<std::string, std::string> get_kernel_dirs(
-    const struct utsname &utsname)
+// false is returned if no trace of kernel headers was found at all, with the
+// guessed location set anyway for later warning.
+//
+// Both ksrc and kobj are guaranteed to be != ""
+bool get_kernel_dirs(const struct utsname &utsname,
+                     std::string &ksrc,
+                     std::string &kobj)
 {
-#ifdef KERNEL_HEADERS_DIR
-  return { KERNEL_HEADERS_DIR, KERNEL_HEADERS_DIR };
-#endif
+  ksrc = kobj = std::string(KERNEL_HEADERS_DIR);
+  if (!ksrc.empty())
+    return true;
 
   const char *kpath_env = ::getenv("BPFTRACE_KERNEL_SOURCE");
   if (kpath_env) {
+    ksrc = std::string(kpath_env);
     const char *kpath_build_env = ::getenv("BPFTRACE_KERNEL_BUILD");
-    if (!kpath_build_env) {
-      kpath_build_env = kpath_env;
+    if (kpath_build_env) {
+      kobj = std::string(kpath_build_env);
+    } else {
+      kobj = ksrc;
     }
-    return std::make_tuple(kpath_env, kpath_build_env);
+    return true;
   }
 
   std::string kdir = std::string("/lib/modules/") + utsname.release;
-  auto ksrc = kdir + "/source";
-  auto kobj = kdir + "/build";
+  ksrc = kdir + "/source";
+  kobj = kdir + "/build";
 
   // if one of source/ or build/ is not present - try to use the other one for
   // both.
-  if (!is_dir(ksrc)) {
-    ksrc = "";
+  auto has_ksrc = is_dir(ksrc);
+  auto has_kobj = is_dir(kobj);
+  if (!has_ksrc && !has_kobj) {
+    return false;
   }
-  if (!is_dir(kobj)) {
-    kobj = "";
-  }
-  if (ksrc.empty() && kobj.empty()) {
-    LOG(WARNING) << "Could not find kernel headers in " << ksrc << " or "
-                 << kobj
-                 << ". To specify a particular path to kernel headers, set the "
-                    "env variables BPFTRACE_KERNEL_SOURCE and, optionally, "
-                    "BPFTRACE_KERNEL_BUILD if the kernel was built in a "
-                    "different directory than its source. To create kernel "
-                    "headers run 'modprobe kheaders', which will create a tar "
-                    "file at /sys/kernel/kheaders.tar.xz";
-    return std::make_tuple("", "");
-  }
-  if (ksrc.empty()) {
+  if (!has_ksrc) {
     ksrc = kobj;
-  } else if (kobj.empty()) {
+  } else if (!has_kobj) {
     kobj = ksrc;
   }
 
-  return std::make_tuple(ksrc, kobj);
+  return true;
 }
 
 const std::string &is_deprecated(const std::string &str)
@@ -872,6 +976,68 @@ std::vector<std::string> resolve_binary_path(const std::string &cmd, int pid)
 }
 
 /*
+Check whether 'path' refers to a ELF file. Errors are swallowed silently and
+result in return of 'nullopt'. On success, the ELF type (e.g., ET_DYN) is
+returned.
+*/
+static std::optional<int> is_elf(const std::string &path)
+{
+  int fd;
+  Elf *elf;
+  GElf_Ehdr ehdr;
+  std::optional<int> result = {};
+
+  if (elf_version(EV_CURRENT) == EV_NONE) {
+    return result;
+  }
+
+  fd = open(path.c_str(), O_RDONLY, 0);
+  if (fd < 0) {
+    return result;
+  }
+
+  elf = elf_begin(fd, ELF_C_READ, nullptr);
+  if (elf == nullptr) {
+    goto err_close;
+  }
+
+  if (elf_kind(elf) != ELF_K_ELF) {
+    goto err_close;
+  }
+
+  if (!gelf_getehdr(elf, &ehdr)) {
+    goto err_end;
+  }
+
+  result = ehdr.e_type;
+
+err_end:
+  (void)elf_end(elf);
+err_close:
+  (void)close(fd);
+  return result;
+}
+
+static bool has_exec_permission(const std::string &path)
+{
+  using std::filesystem::perms;
+
+  auto perms = std::filesystem::status(path).permissions();
+  return (perms & perms::owner_exec) != perms::none;
+}
+
+/*
+Check whether 'path' refers to an executable ELF file.
+*/
+bool is_exe(const std::string &path)
+{
+  if (auto e_type = is_elf(path)) {
+    return e_type == ET_EXEC && has_exec_permission(path);
+  }
+  return false;
+}
+
+/*
 Private interface to resolve_binary_path, used for the exposed variants above,
 allowing for a PID whose mount namespace should be optionally considered.
 */
@@ -895,9 +1061,14 @@ static std::vector<std::string> resolve_binary_path(const std::string &cmd,
       rel_path = path_for_pid_mountns(pid, path);
     else
       rel_path = path;
-    if (bcc_elf_is_exe(rel_path.c_str()) ||
-        bcc_elf_is_shared_obj(rel_path.c_str()))
-      valid_executable_paths.push_back(rel_path);
+
+    // Both executables and shared objects are game.
+    if (auto e_type = is_elf(rel_path)) {
+      if ((e_type == ET_EXEC && has_exec_permission(rel_path)) ||
+          e_type == ET_DYN) {
+        valid_executable_paths.push_back(rel_path);
+      }
+    }
   }
 
   return valid_executable_paths;
@@ -1014,15 +1185,47 @@ std::string str_join(const std::vector<std::string> &list,
   return str;
 }
 
-bool is_numeric(const std::string &s)
+std::optional<std::variant<int64_t, uint64_t>> get_int_from_str(
+    const std::string &s)
 {
-  std::size_t idx;
-  try {
-    std::stoll(s, &idx, 0);
-  } catch (...) {
-    return false;
+  if (s.size() == 0) {
+    return std::nullopt;
   }
-  return idx == s.size();
+
+  if (s.starts_with("0x") || s.starts_with("0X")) {
+    // Treat all hex's as unsigned
+    std::size_t idx;
+    try {
+      uint64_t ret = std::stoull(s, &idx, 0);
+      if (idx == s.size()) {
+        return ret;
+      } else {
+        return std::nullopt;
+      }
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+
+  char *endptr;
+  const char *s_ptr = s.c_str();
+  errno = 0;
+
+  if (s.at(0) == '-') {
+    int64_t ret = strtol(s_ptr, &endptr, 0);
+    if (endptr == s_ptr || *endptr != '\0' || errno == ERANGE ||
+        errno == EINVAL) {
+      return std::nullopt;
+    }
+    return ret;
+  }
+
+  uint64_t ret = strtoul(s_ptr, &endptr, 0);
+  if (endptr == s_ptr || *endptr != '\0' || errno == ERANGE ||
+      errno == EINVAL) {
+    return std::nullopt;
+  }
+  return ret;
 }
 
 bool symbol_has_cpp_mangled_signature(const std::string &sym_name)
@@ -1075,22 +1278,65 @@ std::string hex_format_buffer(const char *buf,
                               bool escape_hex)
 {
   // Allow enough space for every byte to be sanitized in the form "\x00"
-  char s[size * 4 + 1];
+  std::string str(size * 4 + 1, '\0');
+  char *s = str.data();
 
   size_t offset = 0;
   for (size_t i = 0; i < size; i++)
     if (keep_ascii && buf[i] >= 32 && buf[i] <= 126)
-      offset += sprintf(s + offset, "%c", ((const uint8_t *)buf)[i]);
+      offset += sprintf(s + offset,
+                        "%c",
+                        (reinterpret_cast<const uint8_t *>(buf))[i]);
     else if (escape_hex)
-      offset += sprintf(s + offset, "\\x%02x", ((const uint8_t *)buf)[i]);
+      offset += sprintf(s + offset,
+                        "\\x%02x",
+                        (reinterpret_cast<const uint8_t *>(buf))[i]);
     else
       offset += sprintf(s + offset,
                         i == size - 1 ? "%02x" : "%02x ",
-                        ((const uint8_t *)buf)[i]);
+                        (reinterpret_cast<const uint8_t *>(buf))[i]);
 
-  s[offset] = '\0';
+  // Fit return value to actual length
+  str.resize(offset);
+  return str;
+}
 
-  return std::string(s);
+/*
+ * Attaching to these kernel functions with fentry/fexit (kfunc/kretfunc)
+ * could lead to a recursive loop and kernel crash so we need additional
+ * generated BPF code to protect against this if one of these are being
+ * attached to.
+ */
+bool is_recursive_func(const std::string &func_name)
+{
+  return RECURSIVE_KERNEL_FUNCS.find(func_name) != RECURSIVE_KERNEL_FUNCS.end();
+}
+
+static bool is_bad_func(std::string &func)
+{
+  /*
+   * Certain kernel functions are known to cause system stability issues if
+   * traced (but not marked "notrace" in the kernel) so they should be filtered
+   * out as the list is built. The list of functions have been taken from the
+   * bpf kernel selftests (bpf/prog_tests/kprobe_multi_test.c).
+   */
+  static const std::unordered_set<std::string> bad_funcs = {
+    "arch_cpu_idle", "default_idle", "bpf_dispatcher_xdp_func"
+  };
+
+  static const std::vector<std::string> bad_funcs_partial = {
+    "__ftrace_invalid_address__", "rcu_"
+  };
+
+  if (bad_funcs.find(func) != bad_funcs.end())
+    return true;
+
+  for (const auto &s : bad_funcs_partial) {
+    if (!std::strncmp(func.c_str(), s.c_str(), s.length()))
+      return true;
+  }
+
+  return false;
 }
 
 FuncsModulesMap parse_traceable_funcs()
@@ -1117,7 +1363,9 @@ FuncsModulesMap parse_traceable_funcs()
     auto func_mod = split_symbol_module(line);
     if (func_mod.second.empty())
       func_mod.second = "vmlinux";
-    result[func_mod.first].insert(func_mod.second);
+
+    if (!is_bad_func(func_mod.first))
+      result[func_mod.first].insert(func_mod.second);
   }
 
   // Filter out functions from the kprobe blacklist.
@@ -1169,7 +1417,7 @@ static uint32_t _find_version_note(unsigned long base)
   return 0;
 }
 
-static uint32_t kernel_version_from_vdso(void)
+static uint32_t kernel_version_from_vdso()
 {
   // Fetch LINUX_VERSION_CODE from the vDSO .note section, falling back on
   // the build-time constant if unavailable. This always matches the
@@ -1183,7 +1431,7 @@ static uint32_t kernel_version_from_vdso(void)
   return code;
 }
 
-static uint32_t kernel_version_from_uts(void)
+static uint32_t kernel_version_from_uts()
 {
   struct utsname utsname;
   if (uname(&utsname) < 0)
@@ -1194,14 +1442,14 @@ static uint32_t kernel_version_from_uts(void)
   return KERNEL_VERSION(x, y, z);
 }
 
-static uint32_t kernel_version_from_khdr(void)
+static uint32_t kernel_version_from_khdr()
 {
   // Try to get the definition of LINUX_VERSION_CODE at runtime.
   std::ifstream linux_version_header{ "/usr/include/linux/version.h" };
   const std::string content{ std::istreambuf_iterator<char>(
                                  linux_version_header),
                              std::istreambuf_iterator<char>() };
-  const std::regex regex{ "#define\\s+LINUX_VERSION_CODE\\s+(\\d+)" };
+  const std::regex regex{ R"(#define\s+LINUX_VERSION_CODE\s+(\d+))" };
   std::smatch match;
 
   if (std::regex_search(content.begin(), content.end(), match, regex))
@@ -1258,29 +1506,6 @@ std::optional<std::string> abs_path(const std::string &rel_path)
   } else {
     return rel_path;
   }
-}
-
-int64_t min_value(const std::vector<uint8_t> &value, int nvalues)
-{
-  int64_t val, max = 0;
-  for (int i = 0; i < nvalues; i++) {
-    val = read_data<int64_t>(value.data() + i * sizeof(int64_t));
-    if (val > max)
-      max = val;
-  }
-
-  return max;
-}
-
-uint64_t max_value(const std::vector<uint8_t> &value, int nvalues)
-{
-  uint64_t val, max = 0;
-  for (int i = 0; i < nvalues; i++) {
-    val = read_data<uint64_t>(value.data() + i * sizeof(uint64_t));
-    if (val > max)
-      max = val;
-  }
-  return max;
 }
 
 bool symbol_has_module(const std::string &symbol)
@@ -1347,7 +1572,7 @@ std::map<uintptr_t, elf_symbol, std::greater<>> get_symbol_table_for_elf(
   };
   struct bcc_symbol_option option;
   memset(&option, 0, sizeof(option));
-  option.use_symbol_type = BCC_SYM_ALL_TYPES;
+  option.use_symbol_type = BCC_SYM_ALL_TYPES ^ (1 << STT_NOTYPE);
   bcc_elf_foreach_sym(
       elf_file.c_str(), sym_resolve_callback, &option, &symbol_table);
 
@@ -1418,6 +1643,25 @@ std::string sanitise_bpf_program_name(const std::string &name)
     sanitised_name = os.str();
   }
   return sanitised_name;
+}
+
+uint32_t round_up_to_next_power_of_two(uint32_t n)
+{
+  // http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
+  if (n == 0) {
+    return 0;
+  }
+  // Note this function doesn't work if n > 2^31 since there are not enough
+  // bits in unsigned 32 bit integers. This should be fine since its unlikely
+  // anyone has > 2^31 CPUs.
+  assert(n <= 2147483648);
+  n--;
+  n |= n >> 1;
+  n |= n >> 2;
+  n |= n >> 4;
+  n |= n >> 8;
+  n |= n >> 16;
+  return n + 1;
 }
 
 } // namespace bpftrace

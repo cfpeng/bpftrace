@@ -10,32 +10,59 @@
 #include <lldb/API/LLDB.h>
 #include <llvm/Config/llvm-config.h>
 #include <memory>
+#include <queue>
 #include <string>
 
 namespace bpftrace {
 
-std::atomic<size_t> Dwarf::instance_count = 0;
+std::atomic<size_t> Dwarf::InstanceCounter::count = 0;
+
+Dwarf::InstanceCounter::InstanceCounter()
+{
+  if (count++ == 0)
+    lldb::SBDebugger::Initialize();
+}
+
+Dwarf::InstanceCounter::~InstanceCounter()
+{
+  if (--count == 0)
+    lldb::SBDebugger::Terminate();
+}
 
 Dwarf::Dwarf(BPFtrace *bpftrace, std::string file_path)
-    : bpftrace_(bpftrace), file_path_(std::move(file_path))
+    : counter_(), bpftrace_(bpftrace), file_path_(std::move(file_path))
 {
-  if (instance_count++ == 0)
-    lldb::SBDebugger::Initialize();
-
-  debugger_ = lldb::SBDebugger::Create(false);
+  // Create a "hardened" debugger instance with no scripting, nor .lldbinit.
+  // We don't want a Python extension or .lldbinit to influence the byte-code
+  // that will get executed by the Kernel. It would be a security risk!
+  debugger_ = lldb::SBDebugger::Create(/* source_init_file = */ false);
+  debugger_.SetScriptLanguage(lldb::ScriptLanguage::eScriptLanguageNone);
 
   lldb::SBError error;
   target_ = debugger_.CreateTarget(
-      file_path_.c_str(), nullptr, nullptr, false, error);
+      file_path_.c_str(), nullptr, nullptr, true, error);
   if (!error.Success() || !target_.IsValid()) {
     throw error;
   }
 }
 
-Dwarf::~Dwarf()
+bool Dwarf::has_debug_info()
 {
-  if (--instance_count == 0)
-    lldb::SBDebugger::Terminate();
+#if LLVM_VERSION_MAJOR <= 13
+  // LLVM 13 statistics does not contain a field for the DebugInfo size.
+  // So we can't verify the presence of DebugInfo and we assume it is present.
+  return true;
+#else
+  // Verify that the target contains DebugInfo.
+  if (auto stats = target_.GetStatistics())
+    if (auto modules = stats.GetValueForKey("modules"))
+      if (auto module = modules.GetItemAtIndex(0))
+        if (auto hasDebugInfo = module.GetValueForKey("debugInfoByteSize"))
+          if (hasDebugInfo.GetIntegerValue() > 0)
+            return true;
+#endif
+
+  return false;
 }
 
 std::unique_ptr<Dwarf> Dwarf::GetFromBinary(BPFtrace *bpftrace,
@@ -177,27 +204,21 @@ SizedType Dwarf::get_stype(lldb::SBType type, bool resolve_structs)
         default:
           return CreateNone();
       }
-      break;
     }
     case lldb::eTypeClassEnumeration:
       return CreateUInt(bit_size);
     case lldb::eTypeClassPointer:
-    case lldb::eTypeClassReference: {
-      if (auto inner_type = type.GetPointeeType()) {
-        return CreatePointer(get_stype(inner_type, false));
-      }
-      // void *
-      return CreatePointer(CreateNone());
-    }
+      return CreatePointer(get_stype(type.GetPointeeType(), false));
+    case lldb::eTypeClassReference:
+      return CreateReference(get_stype(type.GetDereferencedType(), true));
     case lldb::eTypeClassClass:
     case lldb::eTypeClassStruct:
     case lldb::eTypeClassUnion: {
       auto name = get_type_name(type);
-      auto result = CreateRecord(
-          name, bpftrace_->structs.LookupOrAdd(name, bit_size / 8));
+      auto str = bpftrace_->structs.LookupOrAdd(name, bit_size / 8);
       if (resolve_structs)
-        resolve_fields(result);
-      return result;
+        resolve_fields(str.lock(), type);
+      return CreateRecord(name, str);
     }
     case lldb::eTypeClassArray: {
       auto inner_type = type.GetArrayElementType();
@@ -208,11 +229,17 @@ SizedType Dwarf::get_stype(lldb::SBType type, bool resolve_structs)
       switch (inner_type.GetBasicType()) {
         case lldb::eBasicTypeChar:
         case lldb::eBasicTypeSignedChar:
+        case lldb::eBasicTypeUnsignedChar:
+#if LLVM_VERSION_MAJOR >= 15
+        case lldb::eBasicTypeChar8:
+#endif
           return CreateString(length);
         default:
           return CreateArray(length, inner_stype);
       }
     }
+    case lldb::eTypeClassTypedef:
+      return get_stype(type.GetTypedefedType(), resolve_structs);
     default:
       return CreateNone();
   }
@@ -226,6 +253,11 @@ SizedType Dwarf::get_stype(const std::string &type_name)
   return CreateNone();
 }
 
+struct Subobject {
+  lldb::SBType type;
+  size_t offset;
+};
+
 void Dwarf::resolve_fields(const SizedType &type)
 {
   if (!type.IsRecordTy())
@@ -237,18 +269,53 @@ void Dwarf::resolve_fields(const SizedType &type)
     return;
 
   auto type_dbg = target_.FindFirstType(type_name.c_str());
-  if (!type_dbg)
+  if (!type_dbg.IsValid())
     return;
 
-  for (uint32_t i = 0; i < type_dbg.GetNumberOfFields(); i++) {
-    auto field = type_dbg.GetFieldAtIndex(i);
-    auto field_type = get_stype(field.GetType());
-    str->AddField(field.GetName() ?: "",
-                  get_stype(field.GetType()),
-                  field.GetOffsetInBytes(),
-                  resolve_bitfield(field),
-                  false);
+  resolve_fields(std::move(str), std::move(type_dbg));
+}
+
+void Dwarf::resolve_fields(std::shared_ptr<Struct> str, lldb::SBType type)
+{
+  if (!str || str->HasFields())
+    return;
+
+  if (!type.IsValid())
+    return;
+
+  std::queue<Subobject> subobjects{ std::deque{
+      Subobject{ std::move(type), 0 } } };
+  while (!subobjects.empty()) {
+    auto &subobject = subobjects.front();
+
+    // Collect the fields into str, duplicates will be ignored.
+    for (uint32_t i = 0; i < subobject.type.GetNumberOfFields(); i++) {
+      auto field = subobject.type.GetFieldAtIndex(i);
+      str->AddField(field.GetName() ?: "",
+                    get_stype(field.GetType()),
+                    subobject.offset + field.GetOffsetInBytes(),
+                    resolve_bitfield(field),
+                    false);
+    }
+
+    // Queue the bases for further processing.
+    for (uint32_t i = 0; i < subobject.type.GetNumberOfDirectBaseClasses();
+         i++) {
+      auto base = subobject.type.GetDirectBaseClassAtIndex(i);
+      subobjects.push(Subobject{ base.GetType(),
+                                 subobject.offset + base.GetOffsetInBytes() });
+    }
+
+    subobjects.pop();
   }
+
+  // Order the fields for consistent output when printing record types.
+  std::sort(str->fields.begin(),
+            str->fields.end(),
+            [](const Field &a, const Field &b) {
+              return a.offset < b.offset ||
+                     (a.offset == b.offset && a.name < b.name);
+            });
 }
 
 std::optional<Bitfield> Dwarf::resolve_bitfield(lldb::SBTypeMember field)

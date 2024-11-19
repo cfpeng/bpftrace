@@ -1,16 +1,18 @@
-add_library(ast_defs ast.cpp)
+add_library(ast_defs STATIC ast.cpp)
+add_dependencies(ast_defs parser)
 
-add_library(ast
+add_library(ast STATIC
   async_event_types.cpp
   attachpoint_parser.cpp
+  codegen_helper.cpp
   dibuilderbpf.cpp
-  elf_parser.cpp
   int_parser.cpp
   irbuilderbpf.cpp
   pass_manager.cpp
   signal.cpp
   visitors.cpp
 
+  passes/codegen_resources.cpp
   passes/config_analyser.cpp
   passes/field_analyser.cpp
   passes/portability_analyser.cpp
@@ -21,13 +23,8 @@ add_library(ast
   passes/return_path_analyser.cpp
 )
 
-target_include_directories(ast_defs PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_include_directories(ast_defs PUBLIC ${CMAKE_BINARY_DIR})
-target_link_libraries(ast ast_defs arch parser)
-
-add_dependencies(ast_defs parser)
-
 target_compile_definitions(ast PRIVATE ${BPFTRACE_FLAGS})
+target_link_libraries(ast PUBLIC ast_defs arch parser)
 
 if(STATIC_LINKING)
   include(Util)
@@ -69,23 +66,19 @@ if(STATIC_LINKING)
   unlink_transitive_dependency("${CLANG_EXPORTED_TARGETS}" "$<LINK_ONLY:clang-cpp>")
 
   if(TARGET libclang_static)
-    target_link_libraries(ast libclang_static)
+    target_link_libraries(ast PUBLIC libclang_static)
   else()
     # old LLVM versions don't export libclang_static in ClangTargets.cmake; fall back to
     # libclang.a in that case
-    target_link_libraries(ast libclang.a)
+    target_link_libraries(ast PUBLIC libclang.a)
   endif()
 
-  target_link_libraries(ast ${clang_libs})
-  target_link_libraries(ast ${llvm_libs})
+  target_link_libraries(ast PUBLIC ${clang_libs})
+  target_link_libraries(ast PUBLIC ${llvm_libs})
 else()
-  find_library(found_LLVM LLVM HINTS ${LLVM_LIBRARY_DIRS})
-  if(found_LLVM)
-    target_link_libraries(ast LLVM)
-  else()
-    llvm_map_components_to_libnames(_llvm_libs bpfcodegen ipo irreader mcjit orcjit)
-    llvm_expand_dependencies(llvm_libs ${_llvm_libs})
-    target_link_libraries(ast ${llvm_libs})
-  endif()
-  target_link_libraries(ast libclang)
+  # llvm_config macro comes from the LLVM toolchain and will auto-resolve component
+  # names to library names. USE_SHARED option will tell llvm_config macro to prefer
+  # shared library / DLL on the system over the static libraries
+  llvm_config(ast USE_SHARED bpfcodegen ipo irreader mcjit orcjit)
+  target_link_libraries(ast PUBLIC libclang)
 endif()

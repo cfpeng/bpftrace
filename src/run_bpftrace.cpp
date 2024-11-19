@@ -19,11 +19,19 @@ static const char *libbpf_print_level_string(enum libbpf_print_level level)
 
 int libbpf_print(enum libbpf_print_level level, const char *msg, va_list ap)
 {
-  if (bt_debug == DebugLevel::kNone)
+  if (bt_debug.find(DebugStage::Libbpf) == bt_debug.end())
     return 0;
 
-  fprintf(stderr, "[%s] ", libbpf_print_level_string(level));
-  return vfprintf(stderr, msg, ap);
+  printf("[%s] ", libbpf_print_level_string(level));
+  return vprintf(msg, ap);
+}
+
+void check_is_root()
+{
+  if (geteuid() != 0) {
+    LOG(ERROR) << "bpftrace currently only supports running as the root user.";
+    exit(1);
+  }
 }
 
 int run_bpftrace(BPFtrace &bpftrace, BpfBytecode &bytecode)
@@ -33,12 +41,12 @@ int run_bpftrace(BPFtrace &bpftrace, BpfBytecode &bytecode)
   // Signal handler that lets us know an exit signal was received.
   struct sigaction act = {};
   act.sa_handler = [](int) { BPFtrace::exitsig_recv = true; };
-  sigaction(SIGINT, &act, NULL);
-  sigaction(SIGTERM, &act, NULL);
+  sigaction(SIGINT, &act, nullptr);
+  sigaction(SIGTERM, &act, nullptr);
 
   // Signal handler that prints all maps when SIGUSR1 was received.
   act.sa_handler = [](int) { BPFtrace::sigusr1_recv = true; };
-  sigaction(SIGUSR1, &act, NULL);
+  sigaction(SIGUSR1, &act, nullptr);
 
   err = bpftrace.run(std::move(bytecode));
   if (err)
@@ -47,11 +55,13 @@ int run_bpftrace(BPFtrace &bpftrace, BpfBytecode &bytecode)
   // We are now post-processing. If we receive another SIGINT,
   // handle it normally (exit)
   act.sa_handler = SIG_DFL;
-  sigaction(SIGINT, &act, NULL);
+  sigaction(SIGINT, &act, nullptr);
 
   std::cout << "\n\n";
 
-  err = bpftrace.print_maps();
+  // Print maps if needed (true by default).
+  if (bpftrace.config_.get(ConfigKeyBool::print_maps_on_exit))
+    err = bpftrace.print_maps();
 
   if (bpftrace.child_) {
     auto val = 0;
@@ -63,5 +73,8 @@ int run_bpftrace(BPFtrace &bpftrace, BpfBytecode &bytecode)
 
   bpftrace.close_pcaps();
 
-  return err;
+  if (err)
+    return err;
+
+  return BPFtrace::exit_code;
 }

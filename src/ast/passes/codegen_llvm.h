@@ -6,16 +6,20 @@
 #include <ostream>
 #include <tuple>
 
-#include <llvm/ExecutionEngine/MCJIT.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/raw_os_ostream.h>
+#include <llvm/Target/TargetMachine.h>
 
+#include "ast/async_ids.h"
 #include "ast/dibuilderbpf.h"
 #include "ast/irbuilderbpf.h"
 #include "ast/visitors.h"
 #include "bpftrace.h"
+#include "codegen_resources.h"
 #include "format_string.h"
+#include "kfuncs.h"
 #include "location.hh"
 #include "required_resources.h"
 
@@ -26,9 +30,17 @@ using namespace llvm;
 
 using CallArgs = std::vector<std::tuple<FormatString, std::vector<Field>>>;
 
+struct VariableLLVM {
+  llvm::Value *value;
+  llvm::Type *type;
+};
+
 class CodegenLLVM : public Visitor {
 public:
   explicit CodegenLLVM(Node *root, BPFtrace &bpftrace);
+  explicit CodegenLLVM(Node *root,
+                       BPFtrace &bpftrace,
+                       std::unique_ptr<USDTHelper> usdt_helper);
 
   void visit(Integer &integer) override;
   void visit(PositionalParameter &param) override;
@@ -51,7 +63,8 @@ public:
   void visit(ExprStatement &expr) override;
   void visit(AssignMapStatement &assignment) override;
   void visit(AssignVarStatement &assignment) override;
-  void visit(If &if_block) override;
+  void visit(VarDeclStatement &decl) override;
+  void visit(If &if_node) override;
   void visit(Unroll &unroll) override;
   void visit(While &while_block) override;
   void visit(For &f) override;
@@ -61,8 +74,9 @@ public:
   void visit(Probe &probe) override;
   void visit(Subprog &subprog) override;
   void visit(Program &program) override;
+  void visit(Block &block) override;
 
-  AllocaInst *getHistMapKey(Map &map, Value *log2);
+  Value *getHistMapKey(Map &map, Value *log2, const location &loc);
   int getNextIndexForProbe();
   Value *createLogicalAnd(Binop &binop);
   Value *createLogicalOr(Binop &binop);
@@ -72,29 +86,41 @@ public:
   void DumpIR(std::ostream &out);
   void DumpIR(const std::string filename);
   void createFormatStringCall(Call &call,
-                              int &id,
-                              CallArgs &call_args,
+                              int id,
+                              const CallArgs &call_args,
                               const std::string &call_name,
                               AsyncAction async_action);
 
   void createPrintMapCall(Call &call);
-  void createPrintNonMapCall(Call &call, int &id);
+  void createPrintNonMapCall(Call &call, int id);
 
   void createMapDefinition(const std::string &name,
                            libbpf::bpf_map_type map_type,
                            uint64_t max_entries,
-                           const MapKey &key,
+                           const SizedType &key_type,
                            const SizedType &value_type);
-  AllocaInst *createTuple(
+  Value *createTuple(
       const SizedType &tuple_type,
       const std::vector<std::pair<llvm::Value *, const location *>> &vals,
-      const std::string &name);
+      const std::string &name,
+      const location &loc);
+  void createTupleCopy(const SizedType &expr_type,
+                       const SizedType &var_type,
+                       Value *dst_val,
+                       Value *src_val);
 
   void generate_ir(void);
-  void generate_maps(const RequiredResources &resources);
+  libbpf::bpf_map_type get_map_type(const SizedType &val_type,
+                                    const SizedType &key_type);
+  bool is_array_map(const SizedType &val_type, const SizedType &key_type);
+  bool map_has_single_elem(const SizedType &val_type,
+                           const SizedType &key_type);
+  void generate_maps(const RequiredResources &rr, const CodegenResources &cr);
+  void generate_global_vars(const RequiredResources &resources,
+                            const ::bpftrace::Config &bpftrace_config);
   void optimize(void);
   bool verify(void);
-  BpfBytecode emit(void);
+  BpfBytecode emit(bool disassemble);
   void emit_elf(const std::string &filename);
   void emit(raw_pwrite_stream &stream);
   // Combine generate_ir, optimize and emit into one call
@@ -152,9 +178,20 @@ private:
                      std::optional<int> usdt_location_index = std::nullopt,
                      bool dummy = false);
 
+  // Generate a probe and register it to the BPFtrace class.
+  void add_probe(AttachPoint &ap,
+                 Probe &probe,
+                 const std::string &name,
+                 FunctionType *func_type);
+
   [[nodiscard]] ScopedExprDeleter accept(Node *node);
   [[nodiscard]] std::tuple<Value *, ScopedExprDeleter> getMapKey(Map &map);
-  AllocaInst *getMultiMapKey(Map &map, const std::vector<Value *> &extra_keys);
+  [[nodiscard]] std::tuple<Value *, ScopedExprDeleter> getMapKey(
+      Map &map,
+      Expression *key_expr);
+  Value *getMultiMapKey(Map &map,
+                        const std::vector<Value *> &extra_keys,
+                        const location &loc);
 
   void compareStructure(SizedType &our_type, llvm::Type *llvm_type);
 
@@ -183,6 +220,7 @@ private:
   //
   // If null, return value will depend on current attach point (void in subprog)
   void createRet(Value *value = nullptr);
+  int getReturnValueForProbe(ProbeType probe_type);
 
   // Every time we see a watchpoint that specifies a function + arg pair, we
   // generate a special "setup" probe that:
@@ -220,22 +258,34 @@ private:
   void createIncDec(Unop &unop);
 
   Function *createMapLenCallback();
-  Function *createForEachMapCallback(const Variable &decl,
-                                     const std::vector<Statement *> &stmts);
+  Function *createForEachMapCallback(const For &f, llvm::Type *ctx_t);
   Function *createMurmurHash2Func();
 
-  // Return a lambda that has captured-by-value CodegenLLVM's async id state
-  // (ie `printf_id_`, `mapped_printf_id_`, etc.).  Running the returned lambda
-  // will restore `CodegenLLVM`s async id state back to when this function was
-  // first called.
-  std::function<void()> create_reset_ids();
+  Value *createFmtString(int print_id);
+
+  bool canAggPerCpuMapElems(const SizedType &val_type,
+                            const SizedType &key_type);
+
+  void maybeAllocVariable(const std::string &var_ident,
+                          const SizedType &var_type,
+                          const location &loc);
+  VariableLLVM *maybeGetVariable(const std::string &);
+  VariableLLVM &getVariable(const std::string &);
+
+  Function *DeclareKernelFunc(Kfunc kfunc);
+
+  CallInst *CreateKernelFuncCall(Kfunc kfunc,
+                                 ArrayRef<Value *> args,
+                                 const Twine &name);
 
   Node *root_ = nullptr;
 
   BPFtrace &bpftrace_;
+  std::unique_ptr<USDTHelper> usdt_helper_;
   std::unique_ptr<LLVMContext> context_;
   std::unique_ptr<TargetMachine> target_machine_;
   std::unique_ptr<Module> module_;
+  AsyncIds async_ids_;
   IRBuilderBPF b_;
 
   DIBuilderBPF debug_;
@@ -259,18 +309,8 @@ private:
   int current_usdt_location_index_{ 0 };
   bool inside_subprog_ = false;
 
-  std::map<std::string, AllocaInst *> variables_;
-  int printf_id_ = 0;
-  int mapped_printf_id_ = 0;
-  int time_id_ = 0;
-  int cat_id_ = 0;
-  int strftime_id_ = 0;
-  uint64_t join_id_ = 0;
-  int system_id_ = 0;
-  int non_map_print_id_ = 0;
-  uint64_t watchpoint_id_ = 0;
-  int cgroup_path_id_ = 0;
-  int skb_output_id_ = 0;
+  std::vector<Node *> scope_stack_;
+  std::unordered_map<Node *, std::map<std::string, VariableLLVM>> variables_;
 
   std::unordered_map<std::string, libbpf::bpf_map_type> map_types_;
 

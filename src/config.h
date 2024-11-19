@@ -26,6 +26,7 @@ enum class ConfigKeyBool {
   cpp_demangle,
   lazy_symbolication,
   probe_inline,
+  print_maps_on_exit,
 };
 
 enum class ConfigKeyInt {
@@ -36,6 +37,7 @@ enum class ConfigKeyInt {
   max_probes,
   max_strlen,
   max_type_res_iterations,
+  on_stack_limit,
   perf_rb_pages,
 };
 
@@ -51,11 +53,32 @@ enum class ConfigKeyUserSymbolCacheType {
   default_,
 };
 
+enum class ConfigSymbolSource {
+  symbol_table,
+  dwarf,
+};
+
+enum class ConfigKeySymbolSource {
+  default_,
+};
+
+enum class ConfigMissingProbes {
+  ignore,
+  warn,
+  error,
+};
+
+enum class ConfigKeyMissingProbes {
+  default_,
+};
+
 typedef std::variant<ConfigKeyBool,
                      ConfigKeyInt,
                      ConfigKeyString,
                      ConfigKeyStackMode,
-                     ConfigKeyUserSymbolCacheType>
+                     ConfigKeyUserSymbolCacheType,
+                     ConfigKeySymbolSource,
+                     ConfigKeyMissingProbes>
     ConfigKey;
 
 // The strings in CONFIG_KEY_MAP AND ENV_ONLY match the env variables (minus the
@@ -71,10 +94,14 @@ const std::map<std::string, ConfigKey> CONFIG_KEY_MAP = {
   { "max_probes", ConfigKeyInt::max_probes },
   { "max_strlen", ConfigKeyInt::max_strlen },
   { "max_type_res_iterations", ConfigKeyInt::max_type_res_iterations },
+  { "on_stack_limit", ConfigKeyInt::on_stack_limit },
   { "perf_rb_pages", ConfigKeyInt::perf_rb_pages },
   { "probe_inline", ConfigKeyBool::probe_inline },
   { "stack_mode", ConfigKeyStackMode::default_ },
   { "str_trunc_trailer", ConfigKeyString::str_trunc_trailer },
+  { "symbol_source", ConfigKeySymbolSource::default_ },
+  { "missing_probes", ConfigKeyMissingProbes::default_ },
+  { "print_maps_on_exit", ConfigKeyBool::print_maps_on_exit },
 };
 
 // These are not tracked by the config class
@@ -85,13 +112,19 @@ const std::set<std::string> ENV_ONLY = {
 
 struct ConfigValue {
   ConfigSource source = ConfigSource::default_;
-  std::variant<bool, uint64_t, std::string, StackMode, UserSymbolCacheType>
+  std::variant<bool,
+               uint64_t,
+               std::string,
+               StackMode,
+               UserSymbolCacheType,
+               ConfigSymbolSource,
+               ConfigMissingProbes>
       value;
 };
 
 class Config {
 public:
-  explicit Config(bool has_cmd = false, bool bt_verbose = false);
+  explicit Config(bool has_cmd = false);
 
   bool get(ConfigKeyBool key) const
   {
@@ -116,6 +149,16 @@ public:
   UserSymbolCacheType get(ConfigKeyUserSymbolCacheType key) const
   {
     return get<UserSymbolCacheType>(key);
+  }
+
+  ConfigSymbolSource get(ConfigKeySymbolSource key) const
+  {
+    return get<ConfigSymbolSource>(key);
+  }
+
+  ConfigMissingProbes get(ConfigKeyMissingProbes key) const
+  {
+    return get<ConfigMissingProbes>(key);
   }
 
   static std::optional<StackMode> get_stack_mode(const std::string &s);
@@ -159,7 +202,6 @@ private:
 private:
   bool can_set(ConfigSource prevSource, ConfigSource);
   bool is_aslr_enabled();
-  bool bt_verbose_ = false;
 
   std::map<ConfigKey, ConfigValue> config_map_;
 };
@@ -194,8 +236,15 @@ public:
     return config_.set(ConfigKeyUserSymbolCacheType::default_, val, source_);
   }
 
+  bool set(ConfigMissingProbes val)
+  {
+    return config_.set(ConfigKeyMissingProbes::default_, val, source_);
+  }
+
   bool set_stack_mode(const std::string &s);
   bool set_user_symbol_cache_type(const std::string &s);
+  bool set_symbol_source_config(const std::string &s);
+  bool set_missing_probes_config(const std::string &s);
 
   Config &config_;
 

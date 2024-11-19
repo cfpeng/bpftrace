@@ -1,6 +1,5 @@
 #pragma once
 
-#include "mapkey.h"
 #include "types.h"
 
 #include <linux/bpf.h>
@@ -20,7 +19,11 @@ class DIBuilderBPF : public DIBuilder {
 public:
   DIBuilderBPF(Module &module);
 
-  void createFunctionDebugInfo(Function &func);
+  void createFunctionDebugInfo(Function &func,
+                               const SizedType &ret_type,
+                               const Struct &args,
+                               bool is_declaration = false);
+  void createProbeDebugInfo(Function &probe_func);
 
   DIType *getInt8Ty();
   DIType *getInt16Ty();
@@ -32,18 +35,24 @@ public:
   // DIBuilderBPF::GetMapFieldInt.
   DIType *getIntTy();
 
-  DIType *GetType(const SizedType &stype);
+  DIType *GetType(const SizedType &stype, bool emit_codegen_types = true);
   DIType *CreateTupleType(const SizedType &stype);
+  DIType *CreateMapStructType(const SizedType &stype);
+  DIType *CreateByteArrayType(uint64_t num_bytes);
   DIType *createPointerMemberType(const std::string &name,
                                   uint64_t offset,
                                   DIType *type);
-  DIType *GetMapKeyType(const MapKey &key, const SizedType &value_type);
+  DIType *GetMapKeyType(const SizedType &key_type,
+                        const SizedType &value_type,
+                        libbpf::bpf_map_type map_type);
   DIType *GetMapFieldInt(int value);
   DIGlobalVariableExpression *createMapEntry(const std::string &name,
                                              libbpf::bpf_map_type map_type,
                                              uint64_t max_entries,
-                                             const MapKey &key,
+                                             DIType *key_type,
                                              const SizedType &value_type);
+  DIGlobalVariableExpression *createGlobalVariable(std::string_view name,
+                                                   const SizedType &stype);
 
   DIFile *file = nullptr;
 
