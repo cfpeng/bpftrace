@@ -212,8 +212,16 @@ DIType *DIBuilderBPF::CreateByteArrayType(uint64_t num_bytes)
 DIType *DIBuilderBPF::GetType(const SizedType &stype, bool emit_codegen_types)
 {
   if (!emit_codegen_types && stype.IsRecordTy()) {
+    std::string name = stype.GetName();
+    static constexpr std::string struct_prefix = "struct ";
+    static constexpr std::string union_prefix = "union ";
+    if (name.find(struct_prefix) == 0)
+      name = name.substr(struct_prefix.length());
+    else if (name.find(union_prefix) == 0)
+      name = name.substr(union_prefix.length());
+
     return createStructType(file,
-                            stype.GetName(),
+                            name,
                             file,
                             0,
                             stype.GetSize() * 8,
@@ -347,7 +355,7 @@ DIGlobalVariableExpression *DIBuilderBPF::createGlobalVariable(
     const SizedType &stype)
 {
   return createGlobalVariableExpression(
-      file, name, "global", file, 0, GetType(stype), false);
+      file, name, "global", file, 0, GetType(stype, false), false);
 }
 
 } // namespace bpftrace::ast

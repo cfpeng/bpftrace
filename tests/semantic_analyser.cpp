@@ -694,6 +694,9 @@ kprobe:f { $x = hist(1); }
 stdin:1:12-22: ERROR: hist() should be directly assigned to a map
 kprobe:f { @x[hist(1)] = 1; }
            ~~~~~~~~~~
+stdin:1:12-22: ERROR: hist_t cannot be used as a map key
+kprobe:f { @x[hist(1)] = 1; }
+           ~~~~~~~~~~
 )");
   test_error("kprobe:f { if(hist()) { 123 } }", R"(
 stdin:1:12-21: ERROR: hist() should be directly assigned to a map
@@ -764,6 +767,9 @@ stdin:1:12-21: ERROR: lhist() should be directly assigned to a map
 kprobe:f { @[lhist()] = 1; }
            ~~~~~~~~~
 stdin:1:12-21: ERROR: lhist() requires 4 arguments (0 provided)
+kprobe:f { @[lhist()] = 1; }
+           ~~~~~~~~~
+stdin:1:12-21: ERROR: lhist_t cannot be used as a map key
 kprobe:f { @[lhist()] = 1; }
            ~~~~~~~~~
 )");
@@ -2556,6 +2562,33 @@ stdin:4:9-30: ERROR: Argument mismatch for @x: trying to access with arguments: 
 )");
 }
 
+TEST(semantic_analyser, per_cpu_map_as_map_key)
+{
+  test("BEGIN { @x = count(); @y[@x] = 1; }");
+  test("BEGIN { @x = sum(10); @y[@x] = 1; }");
+  test("BEGIN { @x = min(1); @y[@x] = 1; }");
+  test("BEGIN { @x = max(1); @y[@x] = 1; }");
+  test("BEGIN { @x = avg(1); @y[@x] = 1; }");
+
+  test_error("BEGIN { @x = hist(10); @y[@x] = 1; }", R"(
+stdin:1:24-29: ERROR: hist_t cannot be used as a map key
+BEGIN { @x = hist(10); @y[@x] = 1; }
+                       ~~~~~
+)");
+
+  test_error("BEGIN { @x = lhist(10, 0, 10, 1); @y[@x] = 1; }", R"(
+stdin:1:35-40: ERROR: lhist_t cannot be used as a map key
+BEGIN { @x = lhist(10, 0, 10, 1); @y[@x] = 1; }
+                                  ~~~~~
+)");
+
+  test_error("BEGIN { @x = stats(10); @y[@x] = 1; }", R"(
+stdin:1:25-30: ERROR: stats_t cannot be used as a map key
+BEGIN { @x = stats(10); @y[@x] = 1; }
+                        ~~~~~
+)");
+}
+
 TEST(semantic_analyser, probe_short_name)
 {
   test("t:a:b { args }");
@@ -3840,6 +3873,24 @@ fentry:func_1 { skboutput("one.pcap", args.foo1, 1500, 0); }
 )");
 }
 
+TEST_F(semantic_analyser_btf, call_percpu_kaddr)
+{
+  test("kprobe:f { percpu_kaddr(\"process_counts\"); }");
+  test("kprobe:f { percpu_kaddr(\"process_counts\", 0); }");
+  test("kprobe:f { @x = percpu_kaddr(\"process_counts\"); }");
+  test("kprobe:f { @x = percpu_kaddr(\"process_counts\", 0); }");
+  test("kprobe:f { percpu_kaddr(); }", 1);
+  test("kprobe:f { percpu_kaddr(0); }", 1);
+
+  test_error("kprobe:f { percpu_kaddr(\"nonsense\"); }",
+             R"(
+stdin:1:12-36: ERROR: Could not resolve variable "nonsense" from BTF
+kprobe:f { percpu_kaddr("nonsense"); }
+           ~~~~~~~~~~~~~~~~~~~~~~~~
+)",
+             false);
+}
+
 TEST_F(semantic_analyser_btf, iter)
 {
   test("iter:task { 1 }");
@@ -4230,6 +4281,11 @@ stdin:1:44-48: ERROR: The args builtin can only be used within the context of a 
 fentry:func_1,tracepoint:sched:sched_one { args }
                                            ~~~~
 )");
+}
+
+TEST_F(semantic_analyser_btf, binop_late_ptr_resolution)
+{
+  test(R"(fentry:func_1 { if (@a[1] == args.foo1) { } @a[1] = args.foo1; })");
 }
 
 TEST(semantic_analyser, buf_strlen_too_large)
