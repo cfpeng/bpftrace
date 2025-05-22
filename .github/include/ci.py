@@ -23,7 +23,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Self, Union
 
 BUILD_DIR = "build-ci"
 
@@ -37,16 +37,14 @@ BUILD_DIR = "build-ci"
 NIX_TARGET = os.environ.get("NIX_TARGET", "")
 CMAKE_BUILD_TYPE = os.environ.get("CMAKE_BUILD_TYPE", "Release")
 RUN_TESTS = os.environ.get("RUN_TESTS", "1")
-RUN_MEMLEAK_TEST = os.environ.get("RUN_MEMLEAK_TEST", "0")
 RUN_AOT_TESTS = os.environ.get("RUN_AOT_TESTS", "0")
 CC = os.environ.get("CC", "cc")
 CXX = os.environ.get("CXX", "c++")
-GTEST_COLOR = os.environ.get("GTEST_COLOR", "auto")
 CI = os.environ.get("CI", "false")
-RUNTIME_TEST_COLOR = os.environ.get("RUNTIME_TEST_COLOR", "auto")
+NIX_TARGET_KERNEL = os.environ.get("NIX_TARGET_KERNEL", "")
 TOOLS_TEST_OLDVERSION = os.environ.get("TOOLS_TEST_OLDVERSION", "")
 TOOLS_TEST_DISABLE = os.environ.get("TOOLS_TEST_DISABLE", "")
-AOT_SKIPLIST_FILE = os.environ.get("AOT_SKIPLIST_FILE", "")
+AOT_ALLOWLIST_FILE = os.environ.get("AOT_ALLOWLIST_FILE", "")
 
 
 class TestStatus(Enum):
@@ -90,6 +88,32 @@ def sudo() -> Path:
     return _which("sudo")
 
 
+class FoldOutput:
+    """
+    GitHub Actions output folding context manager.
+
+    Will automatically fold output for all operations. In an ideal world we'd
+    like to leave the failed operations unfolded, but there's currently no way
+    to do this in GHA without buffering output.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self.in_ci = truthy(CI)
+
+    def __enter__(self) -> Self:
+        if self.in_ci:
+            # Start a collapsible section in GitHub Actions logs
+            print(f"::group::{self.name}")
+        else:
+            print(f"\n======= {self.name} ======")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.in_ci:
+            print("::endgroup::")
+
+
 def shell(
     cmd: List[str],
     as_root: bool = False,
@@ -111,9 +135,15 @@ def shell(
     if NIX_TARGET:
         c.append(NIX_TARGET)
 
+    if not env:
+        env = {}
+
+    # Nix needs to know the home dir
+    if "HOME" in os.environ:
+        env["HOME"] = os.environ["HOME"]
+
     c.append("--command")
     if as_root:
-        to_preserve = ",".join([n for n in env]) if env else []
         c += [
             sudo(),
             # We need to preserve path so that default root PATH is not
@@ -126,17 +156,10 @@ def shell(
             # play nice with root or writing temporary files. So that
             # requires further investigation.
             "--preserve-env=PATH",
-            # Also preserve any caller specified env vars
-            f"--preserve-env={to_preserve}",
+            "--preserve-env=PYTHONPATH",
+            "--preserve-env=" + ",".join([n for n in env]),
         ]
     c += cmd
-
-    if not env:
-        env = {}
-
-    # Nix needs to know the home dir
-    if "HOME" in os.environ:
-        env["HOME"] = os.environ["HOME"]
 
     subprocess.run(
         c,
@@ -152,32 +175,35 @@ def shell(
 
 def configure():
     """Run cmake configure step"""
-    # fmt: off
-    c = [
-        "cmake",
-        "-B",
-        BUILD_DIR,
+    with FoldOutput("configure"):
+        # fmt: off
+        c = [
+            "cmake",
+            "-B",
+            BUILD_DIR,
 
-        # Dynamic configs
-        f"-DCMAKE_C_COMPILER={CC}",
-        f"-DCMAKE_CXX_COMPILER={CXX}",
-        f"-DCMAKE_BUILD_TYPE={CMAKE_BUILD_TYPE}",
-        f"-DBUILD_ASAN={RUN_MEMLEAK_TEST}",
+            # Dynamic configs
+            f"-DCMAKE_C_COMPILER={CC}",
+            f"-DCMAKE_CXX_COMPILER={CXX}",
+            f"-DCMAKE_BUILD_TYPE={CMAKE_BUILD_TYPE}",
 
-        # Static configs
-        f"-DCMAKE_VERBOSE_MAKEFILE=1",
-        f"-DBUILD_TESTING=1",
-        f"-DENABLE_SKB_OUTPUT=1",
-    ]
-    # fmt: on
+            # Static configs
+            f"-DCMAKE_VERBOSE_MAKEFILE=1",
+            f"-DBUILD_TESTING=1",
+            f"-DENABLE_SKB_OUTPUT=1",
+            f"-DBUILD_ASAN=1",
+            f"-DHARDENED_STDLIB=1",
+        ]
+        # fmt: on
 
-    shell(c)
+        shell(c)
 
 
 def build():
     """Build everything"""
-    cpus = multiprocessing.cpu_count()
-    shell(["make", "-C", BUILD_DIR, "-j", str(cpus)])
+    with FoldOutput("build"):
+        cpus = multiprocessing.cpu_count()
+        shell(["make", "-C", BUILD_DIR, "-j", str(cpus)], env={"AFL_USE_ASAN": "1"})
 
 
 def test_one(name: str, cond: Callable[[], bool], fn: Callable[[], None]) -> TestResult:
@@ -185,10 +211,10 @@ def test_one(name: str, cond: Callable[[], bool], fn: Callable[[], None]) -> Tes
     status = TestStatus.PASSED
 
     if cond():
-        print(f"\n======= {name} ======")
         try:
-            fn()
-        except subprocess.CalledProcessError as e:
+            with FoldOutput(name):
+                fn()
+        except subprocess.CalledProcessError:
             status = TestStatus.FAILED
     else:
         status = TestStatus.SKIPPED
@@ -220,6 +246,96 @@ def tests_finish(results: List[TestResult]):
         print(output.getvalue())
 
 
+def run_runtime_tests():
+    """Runs runtime tests, under a controlled kernel if requested"""
+    script = "./tests/runtime-tests.sh"
+
+    if NIX_TARGET_KERNEL:
+        # Bring kernel into nix store then grab the path
+        subprocess.run([nix(), "build", NIX_TARGET_KERNEL], check=True)
+        eval = subprocess.run(
+            [nix(), "eval", "--raw", NIX_TARGET_KERNEL],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # nf_tables and xfs are necessary for testing kernel modules BTF support
+        modules = ["kvm", "nf_tables", "xfs"]
+        modprobe = f"modprobe -d {eval.stdout} -a {' '.join(modules)}"
+
+        c = f"{modprobe} && {script}"
+        cmd = ["vmtest", "-k", f"{eval.stdout}/bzImage", c]
+    else:
+        cmd = [script]
+
+    shell(
+        cmd,
+        # Don't need root if running tests in a VM
+        as_root=not NIX_TARGET_KERNEL,
+        cwd=Path(BUILD_DIR),
+        env={
+            "CI": CI,
+            "RUNTIME_TEST_COLOR": "yes",
+            # Disable UI to make CI and manual runs behave identically
+            "VMTEST_NO_UI": "1",
+        },
+    )
+
+
+def fuzz():
+    """
+    Run a basic fuzz smoke test.
+    """
+    # Make basic inputs and output directories.
+    Path(BUILD_DIR, "inputs").mkdir(exist_ok=True)
+    Path(BUILD_DIR, "outputs").mkdir(exist_ok=True)
+
+    # For now, seed the inputs directly with a trivial program. These can be
+    # codified differently in the future, but this is sufficient for a basic
+    # fuzz smoke test. Actual fuzzing should have a wide variety of inputs.
+    Path(BUILD_DIR, "inputs", "seed.bt").write_text("BEGIN {}")
+
+    results = [
+        test_one(
+            "fuzz",
+            lambda: truthy(RUN_TESTS),
+            lambda: shell(
+                # fmt: off
+                cmd = [
+                    "afl-fuzz",
+                    "-M", "0",
+                    "-m", "none",
+                    "-i", "inputs",
+                    "-o", "outputs",
+                    "-E", "10", # 10 execs, smoke test only.
+                    "-t", "60000",
+                    "--",
+                    "src/bpftrace",
+                    "--test=codegen",
+                    "@@",
+                ],
+                env = {
+                    "AFL_NO_AFFINITY": "1",
+                    "ASAN_OPTIONS": "abort_on_error=1,symbolize=0",
+                    "BPFTRACE_BTF": "",
+                    "BPFTRACE_MAX_AST_NODES": "200",
+                    "BPFTRACE_AVAILABLE_FUNCTIONS_TEST": "",
+                    # This setting [1] is used to skip the core pattern check,
+                    # so crashes may be missed. Since this is just a smoke
+                    # test, we use this rather than change the system state.
+                    # [1] https://github.com/mirrorer/afl/blob/master/docs/env_variables.txt
+                    "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES": "",
+                },
+                cwd=Path(BUILD_DIR),
+                # fmt: on
+            ),
+        ),
+    ]
+
+    tests_finish(results)
+
+
 def test():
     """
     Run all requested tests
@@ -239,7 +355,7 @@ def test():
             lambda: shell(
                 ["./tests/bpftrace_test"],
                 cwd=Path(BUILD_DIR),
-                env={"GTEST_COLOR": GTEST_COLOR},
+                env={"GTEST_COLOR": "yes"},
             ),
         )
     )
@@ -247,15 +363,7 @@ def test():
         test_one(
             "runtime-tests.sh",
             lambda: truthy(RUN_TESTS),
-            lambda: shell(
-                ["./tests/runtime-tests.sh"],
-                as_root=True,
-                cwd=Path(BUILD_DIR),
-                env={
-                    "CI": CI,
-                    "RUNTIME_TEST_COLOR": RUNTIME_TEST_COLOR,
-                },
-            ),
+            run_runtime_tests,
         )
     )
     results.append(
@@ -288,27 +396,18 @@ def test():
                         "aot.*",
                     ]
                     + [
-                        "--skiplist_file",
-                        f"{root()}/{AOT_SKIPLIST_FILE}",
+                        "--allowlist_file",
+                        f"{root()}/{AOT_ALLOWLIST_FILE}",
                     ]
-                    if AOT_SKIPLIST_FILE
+                    if AOT_ALLOWLIST_FILE
                     else []
                 ),
                 as_root=True,
                 cwd=Path(BUILD_DIR),
                 env={
                     "CI": CI,
-                    "RUNTIME_TEST_COLOR": RUNTIME_TEST_COLOR,
+                    "RUNTIME_TEST_COLOR": "yes",
                 },
-            ),
-        )
-    )
-    results.append(
-        test_one(
-            "memleak-tests.sh.sh",
-            lambda: truthy(RUN_MEMLEAK_TEST),
-            lambda: shell(
-                ["./tests/memleak-tests.sh"], as_root=True, cwd=Path(BUILD_DIR)
             ),
         )
     )
@@ -319,7 +418,10 @@ def test():
 def main():
     configure()
     build()
-    test()
+    if CC.startswith("afl-"):
+        fuzz()
+    else:
+        test()
 
 
 if __name__ == "__main__":

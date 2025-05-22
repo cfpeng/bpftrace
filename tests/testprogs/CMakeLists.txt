@@ -34,7 +34,38 @@ foreach(testprog_source ${testprog_sources})
   endif(HAVE_SYSTEMTAP_SYS_SDT_H)
   list(APPEND testprogtargets ${testprog_name})
 endforeach()
-add_custom_target(testprogs DEPENDS ${testprogtargets})
+
+find_program(GO_EXECUTABLE go)
+if(GO_EXECUTABLE)
+  file(GLOB testprog_go_sources CONFIGURE_DEPENDS *.go)
+  foreach(testprog_source ${testprog_go_sources})
+    get_filename_component(testprog_name ${testprog_source} NAME_WE)
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${testprog_name}
+      COMMAND ${GO_EXECUTABLE} build -o ${CMAKE_CURRENT_BINARY_DIR}/${testprog_name} ${testprog_source}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      DEPENDS ${testprog_source}
+    )
+    list(APPEND testprogtargets ${testprog_name})
+  endforeach()
+endif()
+
+find_program(RUSTC_EXECUTABLE rustc)
+if(RUSTC_EXECUTABLE)
+  file(GLOB testprog_rust_sources CONFIGURE_DEPENDS *.rs)
+  foreach(testprog_source ${testprog_rust_sources})
+    get_filename_component(testprog_name ${testprog_source} NAME_WE)
+    add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${testprog_name}
+      COMMAND ${RUSTC_EXECUTABLE} -C symbol_mangling_version=v0 -o ${CMAKE_CURRENT_BINARY_DIR}/${testprog_name} ${testprog_source}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      DEPENDS ${testprog_source}
+    )
+    list(APPEND testprogtargets ${testprog_name})
+  endforeach()
+endif()
+
+add_custom_target(testprogs ALL DEPENDS ${testprogtargets})
 
 target_include_directories(usdt_lib PRIVATE ${CMAKE_SOURCE_DIR}/tests/testlibs/)
 target_compile_options(usdt_lib PRIVATE -fPIC)

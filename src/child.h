@@ -1,7 +1,6 @@
 #pragma once
 
 #include <csignal>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,72 +13,56 @@ struct child_args {
 
 class ChildProcBase {
 public:
-  /**
-     Parse command and fork a child process.
-
-     \param cmd Command to run
-   */
+  // Parse command and fork a child process.
+  //
+  // \param cmd Command to run
   ChildProcBase() = default;
   virtual ~ChildProcBase() = default;
 
-  /**
-     let child run (execve).
-
-     \param pause If set the child will be paused(stopped) just
-     after `execve`. To resume the child `resume` will have to
-     be called.
-  */
+  // let child run (execve).
+  //
+  // \param pause If set the child will be paused(stopped) just
+  // after `execve`. To resume the child `resume` will have to
+  // be called.
   virtual void run(bool pause = false) = 0;
 
-  /**
-     Ask child to terminate
-
-     \param force Forcefully kill the child (SIGKILL)
-  */
+  // Ask child to terminate
+  //
+  // \param force Forcefully kill the child (SIGKILL)
   virtual void terminate(bool force = false) = 0;
 
-  /**
-     Whether the child process is still alive or not
-  */
+  // Whether the child process is still alive or not
   virtual bool is_alive() = 0;
 
-  /**
-     return the child pid
-  */
+  // return the child pid
   pid_t pid()
   {
     return child_pid_;
   };
 
-  /**
-     Get child exit code, if any. This should only be called when the child has
-     finished (i.e. when is_alive() returns false)
-
-     \return The exit code of the child or -1 if the child hasn't been
-  terminated (by a signal)
-
-  */
+  // Get child exit code, if any. This should only be called when the child has
+  // finished (i.e. when is_alive() returns false)
+  //
+  // \return The exit code of the child or -1 if the child hasn't been
+  // terminated (by a signal)
+  //
   int exit_code()
   {
     return exit_code_;
   };
 
-  /**
-     Get termination signal, if any. This should only be called when the child
-     has finished (i.e. when is_alive() returns false)
-
-     \return A signal ID or -1 if the child hasn't been terminated (by a signal)
-  */
+  // Get termination signal, if any. This should only be called when the child
+  // has finished (i.e. when is_alive() returns false)
+  //
+  // \return A signal ID or -1 if the child hasn't been terminated (by a signal)
   int term_signal()
   {
     return term_signal_;
   };
 
-  /**
-     Resume a paused child. Only valid when run() has been called with
-     pause=true
-   */
-  virtual void resume(void) = 0;
+  // Resume a paused child. Only valid when run() has been called with
+  // pause=true
+  virtual void resume() = 0;
 
 protected:
   pid_t child_pid_ = -1;
@@ -89,18 +72,16 @@ protected:
 
 class ChildProc : public ChildProcBase {
 public:
-  /**
-    Parse command and fork a child process. The child is run with the same
-    permissions and environment variables as bpftrace.
-
-    \param the command to run, with up to 255 optional arguments. If the
-  executables path isn't fully specified it the current PATH will be searched.
-  If more than one binary with the same name is found in the PATH an exception
-  is raised.
-
-  */
+  // Parse command and fork a child process. The child is run with the same
+  // permissions and environment variables as bpftrace.
+  //
+  // \param the command to run, with up to 255 optional arguments. If the
+  //   executables path isn't fully specified it the current PATH will be
+  //   searched. If more than one binary with the same name is found in the PATH
+  //   an exception is raised.
+  //
   ChildProc(std::string cmd);
-  ~ChildProc();
+  ~ChildProc() override;
 
   // Disallow copying as the internal state will get out of sync which will
   // cause issues.
@@ -112,7 +93,7 @@ public:
   void run(bool pause = false) override;
   void terminate(bool force = false) override;
   bool is_alive() override;
-  void resume(void) override;
+  void resume() override;
 
 private:
   enum class State {

@@ -1,17 +1,15 @@
 #pragma once
 
-#include "types.h"
-
 #include <linux/bpf.h>
+#include <llvm/IR/DIBuilder.h>
+
+#include "types.h"
 
 namespace libbpf {
 #include "libbpf/bpf.h"
 } // namespace libbpf
 
-#include <llvm/IR/DIBuilder.h>
-
-namespace bpftrace {
-namespace ast {
+namespace bpftrace::ast {
 
 using namespace llvm;
 
@@ -19,11 +17,11 @@ class DIBuilderBPF : public DIBuilder {
 public:
   DIBuilderBPF(Module &module);
 
-  void createFunctionDebugInfo(Function &func,
+  void createFunctionDebugInfo(llvm::Function &func,
                                const SizedType &ret_type,
                                const Struct &args,
                                bool is_declaration = false);
-  void createProbeDebugInfo(Function &probe_func);
+  void createProbeDebugInfo(llvm::Function &probe_func);
 
   DIType *getInt8Ty();
   DIType *getInt16Ty();
@@ -70,5 +68,4 @@ private:
   std::unordered_map<std::string, DIType *> structs_;
 };
 
-} // namespace ast
-} // namespace bpftrace
+} // namespace bpftrace::ast

@@ -1,17 +1,29 @@
-#include "utils.h"
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "filesystem.h"
+#include "util/bpf_names.h"
+#include "util/cgroup.h"
+#include "util/format.h"
+#include "util/io.h"
+#include "util/kernel.h"
+#include "util/math.h"
+#include "util/paths.h"
+#include "util/similar.h"
+#include "util/symbols.h"
+#include "util/system.h"
+#include "util/wildcard.h"
+#include "gmock/gmock-matchers.h"
+#include "gtest/gtest.h"
 
 namespace bpftrace::test::utils {
+
+using namespace bpftrace::util;
 
 TEST(utils, split_string)
 {
@@ -150,13 +162,13 @@ static std::string get_working_path()
     throw std::runtime_error(
         "getting current working directory for tests failed");
   }
-  return std::string(cwd_path);
+  return cwd_path;
 }
 
 TEST(utils, resolve_binary_path)
 {
   std::string path = "/tmp/bpftrace-test-utils-XXXXXX";
-  if (::mkdtemp(&path[0]) == nullptr) {
+  if (::mkdtemp(path.data()) == nullptr) {
     throw std::runtime_error("creating temporary path for tests failed");
   }
 
@@ -184,14 +196,14 @@ TEST(utils, resolve_binary_path)
   EXPECT_EQ(resolve_binary_path(path + "/executable*"), paths_all_executables);
   EXPECT_EQ(resolve_binary_path(path + "/*executable*"), paths_all_executables);
 
-  EXPECT_GT(std_filesystem::remove_all(path), 0);
+  EXPECT_GT(std::filesystem::remove_all(path), 0);
 }
 
 TEST(utils, abs_path)
 {
   std::string path = "/tmp/bpftrace-test-utils-XXXXXX";
   std::string rel_file = "bpftrace-test-utils-abs-path";
-  if (::mkdtemp(&path[0]) == nullptr) {
+  if (::mkdtemp(path.data()) == nullptr) {
     throw std::runtime_error("creating temporary path for tests failed");
   }
 
@@ -212,19 +224,23 @@ TEST(utils, abs_path)
   EXPECT_EQ(abs_path(std::string("/proc/1/root/usr/local/bin/usdt_test.so")),
             std::string("/proc/1/root/usr/local/bin/usdt_test.so"));
 
-  EXPECT_TRUE(std_filesystem::remove(rel_file));
-  EXPECT_GT(std_filesystem::remove_all(path), 0);
+  EXPECT_TRUE(std::filesystem::remove(rel_file));
+  EXPECT_GT(std::filesystem::remove_all(path), 0);
 }
 
 TEST(utils, get_cgroup_hierarchy_roots)
 {
   auto roots = get_cgroup_hierarchy_roots();
 
-  // Check that each entry is a proper cgroup filesystem
-  for (auto root : roots) {
-    EXPECT_TRUE(root.first == "cgroup" || root.first == "cgroup2");
-    std_filesystem::path root_path(root.second);
-    EXPECT_TRUE(std_filesystem::exists(root_path / "cgroup.procs"));
+  // Check that each entry is a proper cgroup filesystem. The first set are
+  // cgroupv1 results, and the second set are cgroupv2 results.
+  for (auto root : roots[0]) {
+    std::filesystem::path root_path(root);
+    EXPECT_TRUE(std::filesystem::exists(root_path / "cgroup.procs"));
+  }
+  for (auto root : roots[1]) {
+    std::filesystem::path root_path(root);
+    EXPECT_TRUE(std::filesystem::exists(root_path / "cgroup.procs"));
   }
 }
 
@@ -232,18 +248,18 @@ TEST(utils, get_cgroup_path_in_hierarchy)
 {
   std::string tmpdir = "/tmp/bpftrace-test-utils-XXXXXX";
 
-  if (::mkdtemp(&tmpdir[0]) == nullptr) {
+  if (::mkdtemp(tmpdir.data()) == nullptr) {
     throw std::runtime_error("creating temporary path for tests failed");
   }
 
-  const std_filesystem::path path(tmpdir);
-  const std_filesystem::path file_1 = path / "file1";
-  const std_filesystem::path subdir = path / "subdir";
-  const std_filesystem::path file_2 = subdir / "file2";
+  const std::filesystem::path path(tmpdir);
+  const std::filesystem::path file_1 = path / "file1";
+  const std::filesystem::path subdir = path / "subdir";
+  const std::filesystem::path file_2 = subdir / "file2";
 
   // Make a few files in the directory to imitate cgroup files and get their
   // inodes
-  if (!std_filesystem::create_directory(subdir)) {
+  if (!std::filesystem::create_directory(subdir)) {
     throw std::runtime_error("creating subdirectory for tests failed");
   }
   static_cast<std::ofstream &&>(std::ofstream(file_1) << "File 1 content")
@@ -263,7 +279,7 @@ TEST(utils, get_cgroup_path_in_hierarchy)
               "/subdir/file2");
   }
 
-  EXPECT_GT(std_filesystem::remove_all(tmpdir), 0);
+  EXPECT_GT(std::filesystem::remove_all(tmpdir), 0);
 }
 
 TEST(utils, parse_kconfig)
@@ -323,19 +339,19 @@ static void with_env(const std::string &key,
 TEST(utils, find_in_path)
 {
   std::string tmpdir = "/tmp/bpftrace-test-utils-XXXXXX";
-  ASSERT_TRUE(::mkdtemp(&tmpdir[0]));
+  ASSERT_TRUE(::mkdtemp(tmpdir.data()));
 
   // Create some directories
-  const std_filesystem::path path(tmpdir);
-  const std_filesystem::path usr_bin = path / "usr" / "bin";
-  const std_filesystem::path usr_local_bin = path / "usr" / "local" / "bin";
-  ASSERT_TRUE(std_filesystem::create_directories(usr_bin));
-  ASSERT_TRUE(std_filesystem::create_directories(usr_local_bin));
+  const std::filesystem::path path(tmpdir);
+  const std::filesystem::path usr_bin = path / "usr" / "bin";
+  const std::filesystem::path usr_local_bin = path / "usr" / "local" / "bin";
+  ASSERT_TRUE(std::filesystem::create_directories(usr_bin));
+  ASSERT_TRUE(std::filesystem::create_directories(usr_local_bin));
 
   // Create some dummy binaries
-  const std_filesystem::path usr_bin_echo = usr_bin / "echo";
-  const std_filesystem::path usr_local_bin_echo = usr_local_bin / "echo";
-  const std_filesystem::path usr_bin_cat = usr_bin / "cat";
+  const std::filesystem::path usr_bin_echo = usr_bin / "echo";
+  const std::filesystem::path usr_local_bin_echo = usr_local_bin / "echo";
+  const std::filesystem::path usr_bin_cat = usr_bin / "cat";
   {
     std::ofstream(usr_bin_echo) << "zz";
     std::ofstream(usr_local_bin_echo) << "zz";
@@ -376,7 +392,7 @@ TEST(utils, find_in_path)
   });
 
   // Cleanup
-  EXPECT_TRUE(std_filesystem::remove_all(path));
+  EXPECT_TRUE(std::filesystem::remove_all(path));
 }
 
 // These tests are a bit hacky and rely on repository structure.
@@ -392,7 +408,7 @@ TEST(utils, find_near_self)
   // NOLINTBEGIN(bugprone-unchecked-optional-access)
   ASSERT_TRUE(runtime_tests.has_value());
   EXPECT_TRUE(runtime_tests->filename() == "runtime-tests.sh");
-  EXPECT_TRUE(std_filesystem::exists(*runtime_tests));
+  EXPECT_TRUE(std::filesystem::exists(*runtime_tests));
   // NOLINTEND(bugprone-unchecked-optional-access)
 
   EXPECT_FALSE(find_near_self("SHOULD_NOT_EXIST").has_value());
@@ -401,12 +417,10 @@ TEST(utils, find_near_self)
 TEST(utils, get_pids_for_program)
 {
   auto pids = get_pids_for_program("/proc/self/exe");
-
-  ASSERT_EQ(pids.size(), 1);
-  ASSERT_EQ(pids[0], getpid());
+  EXPECT_THAT(pids, testing::Contains(getpid()));
 
   pids = get_pids_for_program("/doesnotexist");
-  ASSERT_EQ(pids.size(), 0);
+  EXPECT_EQ(pids.size(), 0);
 }
 
 TEST(utils, round_up_to_next_power_of_two)
@@ -421,6 +435,65 @@ TEST(utils, round_up_to_next_power_of_two)
   ASSERT_EQ(round_up_to_next_power_of_two(max_power_of_two - 1),
             max_power_of_two);
   ASSERT_EQ(round_up_to_next_power_of_two(max_power_of_two), max_power_of_two);
+}
+
+TEST(utils, cat_file_success)
+{
+  std::string test_content = "Hello, cat_file test!\nThis is line 2.\n";
+  char filename[] = "/tmp/bpftrace-test-cat-file-XXXXXX";
+  int fd = mkstemp(filename);
+  ASSERT_NE(fd, -1) << "Failed to create temporary file";
+  ASSERT_EQ(write(fd, test_content.c_str(), test_content.length()),
+            static_cast<ssize_t>(test_content.length()));
+  close(fd);
+
+  // Test cat_file with the temporary file
+  std::stringstream out;
+  cat_file(filename, 1024, out);
+
+  // Verify output matches the file content
+  EXPECT_EQ(test_content, out.str());
+
+  // Cleanup
+  unlink(filename);
+}
+
+TEST(utils, cat_file_nonexistent)
+{
+  // Path to a file that shouldn't exist
+  std::string nonexistent_file = "/tmp/bpftrace-nonexistent-file-test-XXXXXX";
+  int fd = mkstemp(const_cast<char *>(nonexistent_file.c_str()));
+  close(fd);
+  unlink(nonexistent_file.c_str()); // Ensure file doesn't exist
+
+  testing::internal::CaptureStderr();
+
+  // Test cat_file with nonexistent file
+  std::stringstream out;
+  cat_file(nonexistent_file.c_str(), 1024, out);
+
+  // Get captured stderr
+  std::string stderr_output = testing::internal::GetCapturedStderr();
+
+  // Verify no output was produced
+  EXPECT_TRUE(out.str().empty())
+      << "cat_file should not output anything for nonexistent files";
+
+  // Verify error message was logged
+  EXPECT_THAT(stderr_output, testing::HasSubstr("failed to open file"))
+      << "Error message should indicate file opening failure";
+}
+
+TEST(utils, similar)
+{
+  // This is not well-defined, and therefore we cannot include whitebox tests
+  // that go into much detail. These tests provide a generic `very different`
+  // versus `quite similar` sanity baseline.
+  EXPECT_FALSE(is_similar("foo", "bar"));
+  EXPECT_FALSE(is_similar("foo", "baz"));
+  EXPECT_TRUE(is_similar("foo", "foofoo"));
+  EXPECT_TRUE(is_similar("fo", "foo"));
+  EXPECT_TRUE(is_similar("foobar", "fobar"));
 }
 
 } // namespace bpftrace::test::utils

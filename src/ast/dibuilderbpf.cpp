@@ -1,11 +1,14 @@
 #include "dibuilderbpf.h"
 
+#include <string_view>
+
+#include <llvm/IR/Function.h>
+
 #include "libbpf/bpf.h"
 #include "log.h"
 #include "struct.h"
-#include "utils.h"
-
-#include <llvm/IR/Function.h>
+#include "types.h"
+#include "util/bpf_names.h"
 
 namespace bpftrace::ast {
 
@@ -14,7 +17,7 @@ DIBuilderBPF::DIBuilderBPF(Module &module) : DIBuilder(module)
   file = createFile("bpftrace.bpf.o", ".");
 }
 
-void DIBuilderBPF::createFunctionDebugInfo(Function &func,
+void DIBuilderBPF::createFunctionDebugInfo(llvm::Function &func,
                                            const SizedType &ret_type,
                                            const Struct &args,
                                            bool is_declaration)
@@ -23,17 +26,18 @@ void DIBuilderBPF::createFunctionDebugInfo(Function &func,
   SmallVector<Metadata *> types;
   types.reserve(args.fields.size() + 1);
   types.push_back(GetType(ret_type, false));
-  for (auto &arg : args.fields)
+  for (const auto &arg : args.fields)
     types.push_back(GetType(arg.type, false));
 
   DISubroutineType *ditype = createSubroutineType(getOrCreateTypeArray(types));
 
-  std::string sanitised_name = sanitise_bpf_program_name(func.getName().str());
+  std::string sanitised_name = util::sanitise_bpf_program_name(
+      func.getName().str());
 
   DISubprogram::DISPFlags flags = DISubprogram::SPFlagZero;
   if (!is_declaration)
     flags |= DISubprogram::SPFlagDefinition;
-  if (func.isLocalLinkage(func.getLinkage()))
+  if (llvm::Function::isLocalLinkage(func.getLinkage()))
     flags |= DISubprogram::DISPFlags::SPFlagLocalToUnit;
 
   DISubprogram *subprog = createFunction(file,
@@ -45,6 +49,29 @@ void DIBuilderBPF::createFunctionDebugInfo(Function &func,
                                          0,
                                          DINode::FlagPrototyped,
                                          flags);
+#if LLVM_VERSION_MAJOR < 17
+  // There's a bug in LLVM <17 in DIBuilder::createFunction when called for a
+  // function declaration. It creates an empty temporary MDTuple for
+  // RetainedNodes inside DISubprogram which is, in addition, never freed.
+  //
+  // We generate function declaration debug info for kfuncs so this causes
+  // two issues when kfuncs are used on LLVM <17:
+  //
+  // 1. The generated LLVM IR is invalid and its verification will fail.
+  // 2. There is a memory leak introduced by the above createFunction call.
+  //
+  // To fix both problems, delete the temporary MDTuple here.
+  //
+  // Note that the issue was fixed in LLVM 17 by
+  //
+  //  https://github.com/llvm/llvm-project/commit/ed506dd6cecd9653cf9202bfe195891a33482852
+  //
+  // which removes the creation of the temporary MDTuple.
+  //
+  if (is_declaration) {
+    llvm::MDNode::deleteTemporary(subprog->getRetainedNodes().get());
+  }
+#endif
 
   for (size_t i = 0; i < args.fields.size(); i++) {
     createParameterVariable(subprog,
@@ -59,7 +86,7 @@ void DIBuilderBPF::createFunctionDebugInfo(Function &func,
   func.setSubprogram(subprog);
 }
 
-void DIBuilderBPF::createProbeDebugInfo(Function &probe_func)
+void DIBuilderBPF::createProbeDebugInfo(llvm::Function &probe_func)
 {
   // BPF probe function has:
   // - int return type
@@ -189,7 +216,7 @@ DIType *DIBuilderBPF::CreateMapStructType(const SizedType &stype)
 
 DIType *DIBuilderBPF::CreateByteArrayType(uint64_t num_bytes)
 {
-  auto subrange = getOrCreateSubrange(0, num_bytes);
+  auto *subrange = getOrCreateSubrange(0, num_bytes);
   return createArrayType(
       num_bytes * 8, 0, getInt8Ty(), getOrCreateArray({ subrange }));
 }
@@ -213,11 +240,11 @@ DIType *DIBuilderBPF::GetType(const SizedType &stype, bool emit_codegen_types)
 {
   if (!emit_codegen_types && stype.IsRecordTy()) {
     std::string name = stype.GetName();
-    static constexpr std::string struct_prefix = "struct ";
-    static constexpr std::string union_prefix = "union ";
-    if (name.find(struct_prefix) == 0)
+    static constexpr std::string_view struct_prefix = "struct ";
+    static constexpr std::string_view union_prefix = "union ";
+    if (name.starts_with(struct_prefix))
       name = name.substr(struct_prefix.length());
-    else if (name.find(union_prefix) == 0)
+    else if (name.starts_with(union_prefix))
       name = name.substr(union_prefix.length());
 
     return createStructType(file,
@@ -231,14 +258,14 @@ DIType *DIBuilderBPF::GetType(const SizedType &stype, bool emit_codegen_types)
                             getOrCreateArray({}));
   }
 
-  if (stype.IsByteArray() || stype.IsRecordTy()) {
-    auto subrange = getOrCreateSubrange(0, stype.GetSize());
+  if (stype.IsByteArray() || stype.IsRecordTy() || stype.IsStack()) {
+    auto *subrange = getOrCreateSubrange(0, stype.GetSize());
     return createArrayType(
         stype.GetSize() * 8, 0, getInt8Ty(), getOrCreateArray({ subrange }));
   }
 
   if (stype.IsArrayTy()) {
-    auto subrange = getOrCreateSubrange(0, stype.GetNumElements());
+    auto *subrange = getOrCreateSubrange(0, stype.GetNumElements());
     return createArrayType(stype.GetSize() * 8,
                            0,
                            GetType(*stype.GetElementTy()),
@@ -280,14 +307,16 @@ DIType *DIBuilderBPF::GetMapKeyType(const SizedType &key_type,
                                     const SizedType &value_type,
                                     libbpf::bpf_map_type map_type)
 {
-  // No-key maps use '0' as the key.
-  // - BPF requires 4-byte keys for array maps
-  // - bpftrace uses 8 bytes for the implicit '0' key in hash maps
-  if (key_type.IsNoneTy())
-    return (map_type == libbpf::BPF_MAP_TYPE_PERCPU_ARRAY ||
-            map_type == libbpf::BPF_MAP_TYPE_ARRAY)
-               ? getInt32Ty()
-               : getInt64Ty();
+  // BPF requires 4-byte keys for array maps.
+  if (map_type == libbpf::BPF_MAP_TYPE_PERCPU_ARRAY ||
+      map_type == libbpf::BPF_MAP_TYPE_ARRAY) {
+    assert(key_type.IsIntTy());
+    return getInt32Ty();
+  }
+  if (map_type == libbpf::BPF_MAP_TYPE_RINGBUF) {
+    assert(key_type.IsNoneTy());
+    return getInt64Ty();
+  }
 
   // Some map types need an extra 8-byte key.
   if (value_type.IsHistTy() || value_type.IsLhistTy()) {
@@ -302,8 +331,8 @@ DIType *DIBuilderBPF::GetMapFieldInt(int value)
 {
   // Integer fields of map entry are represented by 64-bit pointers to an array
   // of int, in which dimensionality of the array encodes the specified value.
-  auto subrange = getOrCreateSubrange(0, value);
-  auto array = createArrayType(
+  auto *subrange = getOrCreateSubrange(0, value);
+  auto *array = createArrayType(
       32 * value, 0, getIntTy(), getOrCreateArray({ subrange }));
   return createPointerType(array, 64);
 }

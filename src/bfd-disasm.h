@@ -6,14 +6,14 @@ namespace bpftrace {
 
 class BfdDisasm : public IDisasm {
 public:
-  BfdDisasm(std::string &path);
-  ~BfdDisasm();
+  explicit BfdDisasm(std::string &path);
+  ~BfdDisasm() override;
 
-  AlignState is_aligned(uint64_t offset, uint64_t pc);
+  AlignState is_aligned(uint64_t offset, uint64_t pc) override;
 
 private:
   int fd_ = -1;
-  uint64_t size_;
+  uint64_t size_{ 0 };
 };
 
 } // namespace bpftrace

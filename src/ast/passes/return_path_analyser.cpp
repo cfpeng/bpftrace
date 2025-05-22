@@ -1,20 +1,29 @@
-#include "return_path_analyser.h"
-#include "log.h"
+#include <algorithm>
+
+#include "ast/passes/return_path_analyser.h"
+#include "ast/visitor.h"
 
 namespace bpftrace::ast {
 
-ReturnPathAnalyser::ReturnPathAnalyser(Node *root, std::ostream &out)
-    : root_(root), out_(out)
-{
-}
+namespace {
+
+class ReturnPathAnalyser : public Visitor<ReturnPathAnalyser, bool> {
+public:
+  // visit methods return true iff all return paths of the analyzed code
+  // (represented by the given node) return a value.
+  using Visitor<ReturnPathAnalyser, bool>::visit;
+  bool visit(Program &prog);
+  bool visit(Subprog &subprog);
+  bool visit(Jump &jump);
+  bool visit(If &if_node);
+};
+
+} // namespace
 
 bool ReturnPathAnalyser::visit(Program &prog)
 {
-  for (Subprog *subprog : prog.functions) {
-    if (!visit(*subprog))
-      return false;
-  }
-  return true;
+  return std::ranges::all_of(prog.functions,
+                             [this](auto *subprog) { return visit(*subprog); });
 }
 
 bool ReturnPathAnalyser::visit(Subprog &subprog)
@@ -22,11 +31,11 @@ bool ReturnPathAnalyser::visit(Subprog &subprog)
   if (subprog.return_type.IsVoidTy())
     return true;
 
-  for (Statement *stmt : subprog.stmts) {
-    if (Visit(*stmt))
+  for (auto &stmt : subprog.stmts) {
+    if (visit(stmt))
       return true;
   }
-  LOG(ERROR, subprog.loc, err_) << "Not all code paths returned a value";
+  subprog.addError() << "Not all code paths returned a value";
   return false;
 }
 
@@ -38,8 +47,8 @@ bool ReturnPathAnalyser::visit(Jump &jump)
 bool ReturnPathAnalyser::visit(If &if_node)
 {
   bool result = false;
-  for (Statement *stmt : if_node.if_block.stmts) {
-    if (Visit(*stmt))
+  for (auto &stmt : if_node.if_block->stmts) {
+    if (visit(stmt))
       result = true;
   }
   if (!result) {
@@ -47,41 +56,20 @@ bool ReturnPathAnalyser::visit(If &if_node)
     return false;
   }
 
-  for (Statement *stmt : if_node.else_block.stmts) {
-    if (Visit(*stmt)) {
-      // both blocks have a return
-      return true;
-    }
-  }
-  // else block has no return (or there is no else block)
-  return false;
-}
-
-bool ReturnPathAnalyser::default_visitor(__attribute__((unused)) Node &node)
-{
-  // not a return instruction
-  return false;
-}
-
-int ReturnPathAnalyser::analyse()
-{
-  int result = Visit(*root_) ? 0 : 1;
-  if (result)
-    out_ << err_.str();
-  return result;
+  // True if both blocks have a return.
+  // False if else block has no return (or there is no else block).
+  return std::ranges::any_of(if_node.else_block->stmts,
+                             [this](auto &stmt) { return visit(stmt); });
 }
 
 Pass CreateReturnPathPass()
 {
-  auto fn = [](Node &n, __attribute__((unused)) PassContext &ctx) {
-    auto return_path = ReturnPathAnalyser(&n);
-    int err = return_path.analyse();
-    if (err)
-      return PassResult::Error("ReturnPath");
-    return PassResult::Success();
+  auto fn = [](ASTContext &ast) {
+    ReturnPathAnalyser return_path;
+    return_path.visit(ast.root);
   };
 
-  return Pass("ReturnPath", fn);
+  return Pass::create("ReturnPath", fn);
 }
 
 } // namespace bpftrace::ast

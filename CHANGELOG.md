@@ -9,6 +9,140 @@ and this project adheres to
 ## Unreleased
 
 #### Breaking Changes
+- Drop majority of DWARF support. Only uprobe argument parsing remains.
+  - [#3921](https://github.com/bpftrace/bpftrace/pull/3921)
+  - [#3950](https://github.com/bpftrace/bpftrace/pull/3950)
+- Removed config option 'symbol_source' - it no longer has any effect
+  - [#3925](https://github.com/bpftrace/bpftrace/pull/3925)
+- Rawtracepoints now require kernel BTF
+  - [#3944](https://github.com/bpftrace/bpftrace/pull/3944)
+- Ustack and kstack symbols are automatically enhanced with debug info if available
+  - [#3999](https://github.com/bpftrace/bpftrace/pull/3999)
+#### Added
+- Add ncpus builtin to get the number of CPUs.
+  - [#4105](https://github.com/bpftrace/bpftrace/pull/4105)
+- Use blazesym for user space address symbolization
+  - [#3884](https://github.com/bpftrace/bpftrace/pull/3884)
+- Add simple block expressions
+  - [#3780](https://github.com/bpftrace/bpftrace/pull/3780)
+- Add map declaration syntax (behind an "unstable" config flag)
+  - [#3863](https://github.com/bpftrace/bpftrace/pull/3863)
+- Add license config to specify BPF license
+  - [#3905](https://github.com/bpftrace/bpftrace/pull/3905)
+- Rawtracepoints can now use `args` builtin and list params
+  - [#3918](https://github.com/bpftrace/bpftrace/pull/3918)
+- Add ability to specify rawtracepoint modules
+  - [#3944](https://github.com/bpftrace/bpftrace/pull/3944)
+- Add 'show_debug_info' config for blazesym
+  - [#3999](https://github.com/bpftrace/bpftrace/pull/3999)
+- Add hygienic macros (behind an "unstable" config flag)
+  - [#4037](https://github.com/bpftrace/bpftrace/pull/4037)
+- Add warning when unset or empty positional parameters are used
+  - [#4095](https://github.com/bpftrace/bpftrace/pull/4095)
+- Support accessing up to 255 USDT probe args
+  - [#4118](https://github.com/bpftrace/bpftrace/pull/4118)
+#### Changed
+- `-p` CLI flag now applies to all probes (except BEGIN/END)
+  - [#3800](https://github.com/bpftrace/bpftrace/pull/3800)
+- Introduce automatic session probes
+  - [#3772](https://github.com/bpftrace/bpftrace/pull/3772)
+- Positional params can be used in any part of a probe string
+  - [#3956](https://github.com/bpftrace/bpftrace/pull/3956)
+- Add signed type checking for map assignments
+  - [#4132](https://github.com/bpftrace/bpftrace/pull/4132)
+#### Deprecated
+#### Removed
+#### Fixed
+- Fix build failures due to missing location.hh
+  - [#3987](https://github.com/bpftrace/bpftrace/pull/3987)
+- Fix 32-bit build failures due to missing cast
+  - [#4006](https://github.com/bpftrace/bpftrace/pull/4006)
+- Don't crash if kernel isn't built with PID namespaces
+  - [#3976](https://github.com/bpftrace/bpftrace/pull/3976)
+- Allow sized_type idents to be used for field access
+  - [#4064](https://github.com/bpftrace/bpftrace/pull/4064)
+- Fix per-cpu map update warning
+  - [#4047](https://github.com/bpftrace/bpftrace/pull/4074)
+- Fix probe firing order for fexit and software
+  - [#4113](https://github.com/bpftrace/bpftrace/pull/4113)
+- Fix type mismatch error for map assignments
+  - [#4130](https://github.com/bpftrace/bpftrace/pull/4130)
+- Parse BTF for implicit kernel modules in kprobe/kretprobe
+  - [#4137](https://github.com/bpftrace/bpftrace/pull/4137)
+- Fix execution watchpoints
+  - [#4139](https://github.com/bpftrace/bpftrace/pull/4139)
+#### Security
+#### Docs
+#### Tools
+- Fix biosnoop.bt to print comm from block_io_start probe
+  - [#4013](https://github.com/bpftrace/bpftrace/pull/4013)
+
+## [0.23.0] 2025-03-25
+
+#### Breaking Changes
+- Remove '-kk' command line opt, surface some BPF errors by default, and make '-k' surface probe read errors
+  - [#3784](https://github.com/bpftrace/bpftrace/pull/3784)
+#### Added
+- `offsetof()` now supports sub fields e.g. `offsetof(struct Foo, bar.a.b);`
+  - [#3761](https://github.com/bpftrace/bpftrace/pull/3761)
+- Pointers may now be used in if conditions, tenary conditions and as operands in logical AND and OR expressions
+  - [#3656](https://github.com/bpftrace/bpftrace/pull/3656)
+- `len` now also accepts `ustack` and `kstack` as arguments
+  - [#3769](https://github.com/bpftrace/bpftrace/pull/3769)
+- `blazesym` will be used for address symbolication if found during build
+  - [#3760](https://github.com/bpftrace/bpftrace/pull/3760)
+  - [#3787](https://github.com/bpftrace/bpftrace/pull/3787)
+- Published aarch64 appimage builds from master
+  - [#3795](https://github.com/bpftrace/bpftrace/pull/3795)
+- Add ability to cast int to an enum
+  - [#3812](https://github.com/bpftrace/bpftrace/pull/3812)
+- Added warning when strcontains() is used on strings that are too big and may cause verifier issues
+  - [#3811](https://github.com/bpftrace/bpftrace/pull/3811)
+- Add support for LLVM 20
+  - [#3841](https://github.com/bpftrace/bpftrace/pull/3841)
+#### Changed
+- `probe` builtin is now represented as a string type
+  - [#3638](https://github.com/bpftrace/bpftrace/pull/3638)
+- Change bpftrace help flag output from stderr to stdout
+  - [#3678](https://github.com/bpftrace/bpftrace/pull/3678)
+- Change max_strlen default from 64 to 1024
+  - [#3713](https://github.com/bpftrace/bpftrace/pull/3713)
+- Add feature check for castable map reads
+  - [#3752](https://github.com/bpftrace/bpftrace/pull/3752)
+- Increase default values for max_bpf_progs and max_probes
+  - [#3808](https://github.com/bpftrace/bpftrace/pull/3808)
+- Allow use of variables before they are assigned
+  - [#3832](https://github.com/bpftrace/bpftrace/pull/3832)
+#### Deprecated
+#### Removed
+- Drop support for LLVM 14 and 15
+  - [#3825](https://github.com/bpftrace/bpftrace/pull/3825)
+#### Fixed
+- Fix json output for none type
+  - [#3692](https://github.com/bpftrace/bpftrace/pull/3692)
+- Fix bug where strftime() %f specifier could be off by up to 1s
+  - [#3704](https://github.com/bpftrace/bpftrace/pull/3704)
+- Fix `pid`, `tid` and `ustack` when running bpftrace in containers with PID namespacing
+  - [#3428](https://github.com/bpftrace/bpftrace/pull/3428)
+- Do not generate functions for empty attach points
+  - [#3715](https://github.com/bpftrace/bpftrace/pull/3715)
+- Fix ternary expression to accept all types
+  - [#3765](https://github.com/bpftrace/bpftrace/pull/3765)
+- Fix feature detection for tracing program types
+  - [#3805](https://github.com/bpftrace/bpftrace/pull/3805)
+- Fix strcontains() correctness bug where matches could be lost if both strings are non-literal
+  - [#3811](https://github.com/bpftrace/bpftrace/pull/3811)
+- Fix str() bug where optional size parameter did not count towards NUL terminator
+  - [#3849](https://github.com/bpftrace/bpftrace/pull/3849)
+#### Security
+#### Docs
+#### Tools
+- Fix dcsnoop.bt on newer kernels
+  - [#3715](https://github.com/bpftrace/bpftrace/pull/3715)
+
+## [0.22.0] 2025-01-07
+
+#### Breaking Changes
 - Return `uint32` instead of `uint64` for `pid` and `tid` builtins
   - [#3441](https://github.com/bpftrace/bpftrace/pull/3441)
   - [Migration guide](docs/migration_guide.md#pid-and-tid-builtins-return-uint32)
@@ -22,6 +156,10 @@ and this project adheres to
   - [#3522](https://github.com/bpftrace/bpftrace/pull/3522)
   - [Migration guide](docs/migration_guide.md#default-sigusr1-handler-removed)
 #### Added
+- Add env var to colorize bpftrace log output
+  - [#3710](https://github.com/bpftrace/bpftrace/pull/3710)
+- Bump max supported LLVM version to 19
+  - [#3433](https://github.com/bpftrace/bpftrace/pull/3433)
 - Add `--dry-run` CLI option
   - [#3203](https://github.com/bpftrace/bpftrace/pull/3203)
 - Enable avg map reads in kernel space (implicit casting)
@@ -63,12 +201,12 @@ and this project adheres to
   - [#3203](https://github.com/bpftrace/bpftrace/pull/3203)
 - Remove length limitations for the `buf` builtin function
   - [#3249](https://github.com/bpftrace/bpftrace/pull/3249)
-- Faster map access for keyless maps by using BPF_MAP_TYPE_ARRAY
-  - [#3300](https://github.com/bpftrace/bpftrace/pull/3300)
 - Change `delete` API to accept a map and key as separate args
   - [#3472](https://github.com/bpftrace/bpftrace/pull/3472)
 - Symbolize enums when used in maps
   - [#3539](https://github.com/bpftrace/bpftrace/pull/3539)
+- Supported LLVM version for static builds changed to LLVM 18
+  - [#3631](https://github.com/bpftrace/bpftrace/pull/3631)
 #### Deprecated
 #### Removed
 - Remove the `-dd` CLI option
@@ -116,6 +254,8 @@ and this project adheres to
   - [#3565](https://github.com/bpftrace/bpftrace/pull/3565)
 - Fix crash when using castable per-cpu map types as map keys
   - [#3594](https://github.com/bpftrace/bpftrace/pull/3594)
+- Fix loop values with per-cpu aggregations
+  - [#3664](https://github.com/bpftrace/bpftrace/pull/3664)
 #### Security
 #### Docs
 - Remove mention of unsupported character literals
@@ -123,6 +263,8 @@ and this project adheres to
 #### Tools
 - Fix bashreadline tool probe for dynamically linked readline
   - [#3564](https://github.com/bpftrace/bpftrace/pull/3564)
+- Switch all bio* tools to tracepoints
+  - [#3622](https://github.com/bpftrace/bpftrace/pull/3622)
 
 ## [0.21.0] 2024-06-21
 

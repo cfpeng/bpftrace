@@ -13,11 +13,8 @@ static void test_stack_or_scratch_buffer(const std::string &input,
                                          uint64_t on_stack_limit)
 {
   auto bpftrace = get_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
-  auto configs = ConfigSetter(bpftrace->config_, ConfigSource::script);
-  configs.set(ConfigKeyInt::on_stack_limit, on_stack_limit);
-  configs.set(ConfigKeyInt::max_strlen, MAX_STRLEN);
-
+  bpftrace->config_->on_stack_limit = on_stack_limit;
+  bpftrace->config_->max_strlen = MAX_STRLEN;
   bpftrace->safe_mode_ = true;
 
   test(*bpftrace, input, name);
@@ -142,6 +139,20 @@ TEST(codegen, call_map_key_stack)
 {
   test_stack_or_scratch_buffer("kprobe:f { @x[1] = count(); @y = hist(10); "
                                "has_key(@x, 1); delete(@x, 1); }",
+                               NAME,
+                               LARGE_ON_STACK_LIMIT);
+}
+
+TEST(codegen, probe_str_scratch_buf)
+{
+  test_stack_or_scratch_buffer("tracepoint:sched:sched_one { @x = probe }",
+                               NAME,
+                               SMALL_ON_STACK_LIMIT);
+}
+
+TEST(codegen, probe_str_stack)
+{
+  test_stack_or_scratch_buffer("tracepoint:sched:sched_one { @x = probe }",
                                NAME,
                                LARGE_ON_STACK_LIMIT);
 }

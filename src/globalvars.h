@@ -1,19 +1,41 @@
 #pragma once
 
-#include <set>
-#include <string>
-
-#include "bpftrace.h"
-#include "types.h"
-
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "types.h"
 
 namespace bpftrace {
+
+class BPFtrace;
+class Config;
+class RequiredResources;
+
 namespace globalvars {
 
+enum class GlobalVar {
+  // Number of online CPUs at runtime, used for metric aggregation for functions
+  // like sum and avg
+  NUM_CPUS,
+  // Max CPU ID returned by bpf_get_smp_processor_id, used for simulating
+  // per-CPU maps in read-write global variables
+  MAX_CPU_ID,
+  // Scratch buffers used to avoid BPF stack allocation limits
+  FMT_STRINGS_BUFFER,
+  TUPLE_BUFFER,
+  GET_STR_BUFFER,
+  READ_MAP_VALUE_BUFFER,
+  WRITE_MAP_VALUE_BUFFER,
+  VARIABLE_BUFFER,
+  MAP_KEY_BUFFER,
+};
+
 std::string to_string(GlobalVar global_var);
-GlobalVar from_string(std::string_view name);
+std::optional<GlobalVar> from_string(std::string_view name);
 
 constexpr std::string_view RO_SECTION_NAME = ".rodata";
 constexpr std::string_view FMT_STRINGS_BUFFER_SECTION_NAME =
@@ -34,31 +56,46 @@ struct GlobalVarConfig {
 };
 
 const std::unordered_map<GlobalVar, GlobalVarConfig> GLOBAL_VAR_CONFIGS = {
-  { GlobalVar::NUM_CPUS, { "num_cpus", std::string(RO_SECTION_NAME), true } },
+  { GlobalVar::NUM_CPUS,
+    { .name = "num_cpus",
+      .section = std::string(RO_SECTION_NAME),
+      .read_only = true } },
   { GlobalVar::MAX_CPU_ID,
-    { "max_cpu_id", std::string(RO_SECTION_NAME), true } },
+    { .name = "max_cpu_id",
+      .section = std::string(RO_SECTION_NAME),
+      .read_only = true } },
   { GlobalVar::FMT_STRINGS_BUFFER,
-    { "fmt_str_buf", std::string(FMT_STRINGS_BUFFER_SECTION_NAME), false } },
+    { .name = "fmt_str_buf",
+      .section = std::string(FMT_STRINGS_BUFFER_SECTION_NAME),
+      .read_only = false } },
   { GlobalVar::TUPLE_BUFFER,
-    { "tuple_buf", std::string(TUPLE_BUFFER_SECTION_NAME), false } },
+    { .name = "tuple_buf",
+      .section = std::string(TUPLE_BUFFER_SECTION_NAME),
+      .read_only = false } },
   { GlobalVar::GET_STR_BUFFER,
-    { "get_str_buf", std::string(GET_STR_BUFFER_SECTION_NAME), false } },
+    { .name = "get_str_buf",
+      .section = std::string(GET_STR_BUFFER_SECTION_NAME),
+      .read_only = false } },
   { GlobalVar::READ_MAP_VALUE_BUFFER,
-    { "read_map_val_buf",
-      std::string(READ_MAP_VALUE_BUFFER_SECTION_NAME),
-      false } },
+    { .name = "read_map_val_buf",
+      .section = std::string(READ_MAP_VALUE_BUFFER_SECTION_NAME),
+      .read_only = false } },
   { GlobalVar::WRITE_MAP_VALUE_BUFFER,
-    { "write_map_val_buf",
-      std::string(WRITE_MAP_VALUE_BUFFER_SECTION_NAME),
-      false } },
+    { .name = "write_map_val_buf",
+      .section = std::string(WRITE_MAP_VALUE_BUFFER_SECTION_NAME),
+      .read_only = false } },
   { GlobalVar::VARIABLE_BUFFER,
-    { "var_buf", std::string(VARIABLE_BUFFER_SECTION_NAME), false } },
+    { .name = "var_buf",
+      .section = std::string(VARIABLE_BUFFER_SECTION_NAME),
+      .read_only = false } },
   { GlobalVar::MAP_KEY_BUFFER,
-    { "map_key_buf", std::string(MAP_KEY_BUFFER_SECTION_NAME), false } },
+    { .name = "map_key_buf",
+      .section = std::string(MAP_KEY_BUFFER_SECTION_NAME),
+      .read_only = false } },
 };
 
 void update_global_vars(
-    const struct bpf_object *obj,
+    const struct bpf_object *bpf_object,
     const std::unordered_map<std::string, struct bpf_map *> &global_vars_map,
     const BPFtrace &bpftrace);
 

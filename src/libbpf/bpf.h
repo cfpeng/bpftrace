@@ -136,6 +136,15 @@ enum bpf_attach_type {
 	BPF_TCX_INGRESS,
 	BPF_TCX_EGRESS,
 	BPF_TRACE_UPROBE_MULTI,
+	BPF_CGROUP_UNIX_CONNECT,
+	BPF_CGROUP_UNIX_SENDMSG,
+	BPF_CGROUP_UNIX_RECVMSG,
+	BPF_CGROUP_UNIX_GETPEERNAME,
+	BPF_CGROUP_UNIX_GETSOCKNAME,
+	BPF_NETKIT_PRIMARY,
+	BPF_NETKIT_PEER,
+	BPF_TRACE_KPROBE_SESSION,
+	BPF_TRACE_UPROBE_SESSION,
 };
 
 #ifdef __BPF_FUNC_MAPPER
@@ -356,9 +365,8 @@ enum bpf_attach_type {
 	FN(cgrp_storage_delete),
 
 
-/* integer value in 'imm' field of BPF_CALL instruction selects which helper
- * function eBPF program intends to call
- */
+// integer value in 'imm' field of BPF_CALL instruction selects which helper
+// function eBPF program intends to call
 #define __BPF_ENUM_FN(x) BPF_FUNC_ ## x
 enum bpf_func_id {
 	__BPF_FUNC_MAPPER(__BPF_ENUM_FN)

@@ -1,13 +1,11 @@
 #pragma once
 
-#include <cstdint>
 #include <unordered_set>
 
-#include "ast/visitors.h"
+#include "ast/visitor.h"
 #include "config.h"
 
-namespace bpftrace {
-namespace ast {
+namespace bpftrace::ast {
 
 struct CodegenResources {
   bool needs_elapsed_map = false;
@@ -20,19 +18,18 @@ struct CodegenResources {
 // This pass collects specific information codegen later needs. All this
 // could be done in codegen pass itself, but splitting out some "prerun"
 // logic makes things easier to understand and maintain.
-class CodegenResourceAnalyser : public Visitor {
+class CodegenResourceAnalyser : public Visitor<CodegenResourceAnalyser> {
 public:
-  CodegenResourceAnalyser(Node *root, const ::bpftrace::Config &config);
-  CodegenResources analyse();
+  CodegenResourceAnalyser(const ::bpftrace::Config &config);
+  CodegenResources analyse(Program &program);
+
+  using Visitor<CodegenResourceAnalyser>::visit;
+  void visit(Builtin &builtin);
+  void visit(Call &call);
 
 private:
-  void visit(Builtin &map) override;
-  void visit(Call &call) override;
-
   const ::bpftrace::Config &config_;
   CodegenResources resources_;
-  Node *root_;
 };
 
-} // namespace ast
-} // namespace bpftrace
+} // namespace bpftrace::ast

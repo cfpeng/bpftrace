@@ -1,6 +1,9 @@
 name: Distros
 
-on: [push]
+on:
+  push:
+    branches: [ master, release/* ]
+  workflow_dispatch:
 
 # Cancel previous run if a new one is started
 concurrency:

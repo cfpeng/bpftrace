@@ -1,12 +1,12 @@
 #pragma once
 
-#include <iomanip>
 #include <iostream>
 #include <map>
 #include <vector>
 
 #include "bpfmap.h"
-#include "location.hh"
+#include "clang_parser.h"
+#include "required_resources.h"
 #include "types.h"
 
 namespace bpftrace {
@@ -39,14 +39,20 @@ std::ostream &operator<<(std::ostream &out, MessageType type);
 // virtual methods.
 class Output {
 public:
-  explicit Output(std::ostream &out = std::cout, std::ostream &err = std::cerr)
-      : out_(out), err_(err)
+  explicit Output(CDefinitions &c_definitions,
+                  std::ostream &out = std::cout,
+                  std::ostream &err = std::cerr)
+      : c_definitions_(c_definitions), out_(out), err_(err)
   {
   }
   Output(const Output &) = delete;
   Output &operator=(const Output &) = delete;
   virtual ~Output() = default;
 
+  virtual const CDefinitions &c_definitions() const
+  {
+    return c_definitions_;
+  }
   virtual std::ostream &outputstream() const
   {
     return out_;
@@ -90,11 +96,10 @@ public:
                        bool nl = true) const = 0;
   virtual void lost_events(uint64_t lost) const = 0;
   virtual void attached_probes(uint64_t num_probes) const = 0;
-  virtual void helper_error(int func_id,
-                            int retcode,
-                            const location &loc) const = 0;
+  virtual void helper_error(int retcode, const HelperErrorInfo &info) const = 0;
 
 protected:
+  CDefinitions &c_definitions_;
   std::ostream &out_;
   std::ostream &err_;
   void hist_prepare(const std::vector<uint64_t> &values,
@@ -198,9 +203,10 @@ protected:
 
 class TextOutput : public Output {
 public:
-  explicit TextOutput(std::ostream &out = std::cout,
+  explicit TextOutput(CDefinitions &c_definitions,
+                      std::ostream &out = std::cout,
                       std::ostream &err = std::cerr)
-      : Output(out, err)
+      : Output(c_definitions, out, err)
   {
   }
 
@@ -226,18 +232,16 @@ public:
       uint32_t div,
       const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
           &values_by_key) const override;
-  virtual void value(BPFtrace &bpftrace,
-                     const SizedType &ty,
-                     std::vector<uint8_t> &value) const override;
+  void value(BPFtrace &bpftrace,
+             const SizedType &ty,
+             std::vector<uint8_t> &value) const override;
 
   void message(MessageType type,
                const std::string &msg,
                bool nl = true) const override;
   void lost_events(uint64_t lost) const override;
   void attached_probes(uint64_t num_probes) const override;
-  void helper_error(int func_id,
-                    int retcode,
-                    const location &loc) const override;
+  void helper_error(int retcode, const HelperErrorInfo &info) const override;
 
 protected:
   std::string value_to_str(BPFtrace &bpftrace,
@@ -246,15 +250,15 @@ protected:
                            bool is_per_cpu,
                            uint32_t div,
                            bool is_map_key = false) const override;
-  static std::string hist_index_label(uint32_t index, uint32_t bits);
+  static std::string hist_index_label(uint32_t index, uint32_t k);
   static std::string lhist_index_label(int number, int step);
-  virtual std::string hist_to_str(const std::vector<uint64_t> &values,
-                                  uint32_t div,
-                                  uint32_t k) const override;
-  virtual std::string lhist_to_str(const std::vector<uint64_t> &values,
-                                   int min,
-                                   int max,
-                                   int step) const override;
+  std::string hist_to_str(const std::vector<uint64_t> &values,
+                          uint32_t div,
+                          uint32_t k) const override;
+  std::string lhist_to_str(const std::vector<uint64_t> &values,
+                           int min,
+                           int max,
+                           int step) const override;
 
   std::string map_key_to_str(BPFtrace &bpftrace,
                              const BpfMap &map,
@@ -273,9 +277,10 @@ protected:
 
 class JsonOutput : public Output {
 public:
-  explicit JsonOutput(std::ostream &out = std::cout,
+  explicit JsonOutput(CDefinitions &c_definitions,
+                      std::ostream &out = std::cout,
                       std::ostream &err = std::cerr)
-      : Output(out, err)
+      : Output(c_definitions, out, err)
   {
   }
 
@@ -301,9 +306,9 @@ public:
       uint32_t div,
       const std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
           &values_by_key) const override;
-  virtual void value(BPFtrace &bpftrace,
-                     const SizedType &ty,
-                     std::vector<uint8_t> &value) const override;
+  void value(BPFtrace &bpftrace,
+             const SizedType &ty,
+             std::vector<uint8_t> &value) const override;
 
   void message(MessageType type,
                const std::string &msg,
@@ -313,9 +318,7 @@ public:
                uint64_t value) const;
   void lost_events(uint64_t lost) const override;
   void attached_probes(uint64_t num_probes) const override;
-  void helper_error(int func_id,
-                    int retcode,
-                    const location &loc) const override;
+  void helper_error(int retcode, const HelperErrorInfo &info) const override;
 
 private:
   std::string json_escape(const std::string &str) const;

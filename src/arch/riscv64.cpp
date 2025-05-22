@@ -1,14 +1,12 @@
-#include "arch.h"
-#include "utils.h"
-
 #include <algorithm>
 #include <array>
+
+#include "arch.h"
 
 // SP points to the first argument that is passed on the stack
 #define ARG0_STACK 0
 
-namespace bpftrace {
-namespace arch {
+namespace bpftrace::arch {
 
 // clang-format off
 static std::array<std::string, 32> registers = {
@@ -102,10 +100,9 @@ std::string name()
   return std::string("riscv64");
 }
 
-std::vector<std::string> invalid_watchpoint_modes()
+const std::unordered_set<std::string> &watchpoint_modes()
 {
-  throw FatalUserException(
-      "Watchpoints are not supported on this architecture");
+  return {}; // Not supported.
 }
 
 int get_kernel_ptr_width()
@@ -113,5 +110,4 @@ int get_kernel_ptr_width()
   return 64;
 }
 
-} // namespace arch
-} // namespace bpftrace
+} // namespace bpftrace::arch

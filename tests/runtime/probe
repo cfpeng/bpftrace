@@ -68,6 +68,19 @@ REQUIRES_FEATURE fentry
 REQUIRES_FEATURE btf
 AFTER ./testprogs/fentry_args 1111 2222
 
+NAME fentry_warn_missing_probes
+PROG fentry:vfs_read,fentry:nonsense { exit(); }
+EXPECT WARNING: No BTF found for nonsense, skipping.
+
+NAME fentry_ignore_missing_probes
+PROG config = { missing_probes = "ignore" } fentry:vfs_read,fentry:nonsense { exit(); }
+EXPECT_NONE WARNING: No BTF found for nonsense, skipping.
+
+NAME fentry_error_missing_probes
+PROG config = { missing_probes = "error" } fentry:vfs_read,fentry:nonsense { exit(); }
+EXPECT ERROR: No BTF found for nonsense
+WILL_FAIL
+
 # Sanity check for kfunc/kretfunc alias
 NAME kfunc
 PROG kfunc:vfs_read { printf("SUCCESS %d\n", pid); exit(); }
@@ -93,8 +106,8 @@ AFTER ./testprogs/syscall read
 
 NAME kprobe_order
 RUN {{BPFTRACE}} runtime/scripts/kprobe_order.bt
-EXPECT first second
-AFTER /bin/bash -c "./testprogs/syscall nanosleep 1000"; /bin/bash -c "./testprogs/syscall nanosleep 1000"
+EXPECT_REGEX (first)+ second
+AFTER /bin/bash -c "./testprogs/syscall nanosleep 1001";
 
 NAME kprobe_offset
 PROG kprobe:vfs_read+0 { printf("SUCCESS %d\n", pid); exit(); }
@@ -107,9 +120,9 @@ EXPECT_REGEX SUCCESS [0-9][0-9]*
 AFTER ./testprogs/syscall read
 
 NAME kprobe_wildcard_multi
-RUN {{BPFTRACE}} --unsafe -e 'kprobe:ksys_* { printf("progs: "); system("/usr/sbin/bpftool prog | grep kprobe | grep ksys_ | wc -l"); exit(); }'
+RUN {{BPFTRACE}} --unsafe -e 'kprobe:ksys_* { printf("progs: "); system("bpftool prog | grep kprobe | grep ksys_ | wc -l"); exit(); }'
 EXPECT progs: 1
-REQUIRES /usr/sbin/bpftool
+REQUIRES bpftool
 REQUIRES_FEATURE kprobe_multi
 
 NAME kprobe_module
@@ -148,51 +161,49 @@ EXPECT ERROR: Error attaching probe: kprobe:vmlinux:nonsense
 WILL_FAIL
 
 NAME kprobe_multi_wildcard
-RUN {{BPFTRACE}} --unsafe -e 'kprobe:ksys_* { printf("link: "); system("/usr/sbin/bpftool link | grep kprobe_multi | wc -l"); exit(); }'
+RUN {{BPFTRACE}} --unsafe -e 'kprobe:ksys_* { printf("link: "); system("bpftool link | grep kprobe_multi | wc -l"); exit(); }'
 EXPECT link: 1
-REQUIRES /usr/sbin/bpftool
+REQUIRES bpftool
 REQUIRES_FEATURE kprobe_multi
 
 NAME uprobe_multi_wildcard
-RUN {{BPFTRACE}} --unsafe -e 'uprobe:./testprogs/uprobe_test:uprobeFunction* { printf("link: "); system("/usr/sbin/bpftool link | grep -E \"uprobe_multi|type 12\" | wc -l"); exit(); }'
+RUN {{BPFTRACE}} --unsafe -e 'uprobe:./testprogs/uprobe_test:uprobeFunction* { printf("link: "); system("bpftool link | grep -E \"uprobe_multi|type 12\" | wc -l"); exit(); }'
 EXPECT link: 1
-REQUIRES /usr/sbin/bpftool
+REQUIRES bpftool
 REQUIRES_FEATURE uprobe_multi
 AFTER ./testprogs/uprobe_test
 
 NAME kprobe_wildcard probe builtin
-RUN {{BPFTRACE}} --unsafe -e 'kprobe:ksys_* { @ = probe; printf("progs: "); system("/usr/sbin/bpftool prog | grep kprobe | grep ksys_ | wc -l"); exit(); }'
+RUN {{BPFTRACE}} --unsafe -e 'kprobe:ksys_* { @ = probe; printf("progs: "); system("bpftool prog | grep kprobe | grep ksys_ | wc -l"); exit(); }'
 EXPECT_REGEX progs: [1-9][0-9]+
-REQUIRES /usr/sbin/bpftool
+REQUIRES bpftool
 
-# Note: this test may fail if you've installed a new kernel but not rebooted
-# yet. Reason is b/c bpftrace will look for a vmlinux based on the running kernel's
-# version.
-NAME kprobe_offset_fail_size
-PROG kprobe:vfs_read+1000000 { printf("SUCCESS %d\n", pid); exit(); }
-EXPECT_REGEX Offset outside the function bounds \('vfs_read' size is*
-WILL_FAIL
-# See https://github.com/bpftrace/bpftrace/pull/956
-SKIP_IF_ENV_HAS CI=true
+NAME kprobe_multi_mixed_attachpoint
+PROG kprobe:vfs_read,kprobe:nonsense* { printf("SUCCESS\n"); exit(); }
+EXPECT SUCCESS
+REQUIRES_FEATURE kprobe_multi
+AFTER ./testprogs/syscall read
 
 NAME kprobe_offset_module
-RUN {{BPFTRACE}} -e 'kprobe:nft_trans_alloc_gfp+0x5 { printf("hit\n"); exit(); }'
-AFTER /usr/sbin/nft add table bpftrace
+RUN {{BPFTRACE}} -e 'kprobe:nf_tables_newtable+0x4 { printf("hit\n"); exit(); }'
+AFTER nft add table bpftrace
 EXPECT hit
 ARCH x86_64
 REQUIRES lsmod | grep '^nf_tables'
-REQUIRES /usr/sbin/nft --help
-CLEANUP /usr/sbin/nft delete table bpftrace
+REQUIRES nft --help
+# Proxy for testing if running virtualized. The offset is specific to our pre-built kernels.
+REQUIRES test -d /mnt/vmtest
+CLEANUP nft delete table bpftrace
 
-# Local entry point to nft_trans_alloc_gfp is located at offset of 8 bytes in ppc64 and aarch64.
+# Local entry point to nf_tables_newtable is located at offset of 8 bytes in ppc64 and aarch64.
 NAME kprobe_offset_module
-RUN {{BPFTRACE}} -e 'kprobe:nft_trans_alloc_gfp+0x8 { printf("hit\n"); exit(); }'
-AFTER /usr/sbin/nft add table bpftrace
+RUN {{BPFTRACE}} -e 'kprobe:nf_tables_newtable+0x8 { printf("hit\n"); exit(); }'
+AFTER nft add table bpftrace
 EXPECT hit
 ARCH ppc64|ppc64le|aarch64
 REQUIRES lsmod | grep '^nf_tables'
-REQUIRES /usr/sbin/nft --help
-CLEANUP /usr/sbin/nft delete table bpftrace
+REQUIRES nft --help
+CLEANUP nft delete table bpftrace
 
 NAME kprobe_offset_module_error
 RUN {{BPFTRACE}} -e 'kprobe:nft_trans_alloc_gfp+0x1 { printf("hit\n"); exit(); }'
@@ -204,7 +215,7 @@ WILL_FAIL
 NAME kprobe_offset_module_error
 RUN {{BPFTRACE}} -e 'kprobe:nft_trans_alloc_gfp+0x1 { printf("hit\n"); exit(); }'
 EXPECT cannot attach kprobe, Invalid argument
-ARCH aarch64
+ARCH aarch64|ppc64le|ppc64
 REQUIRES lsmod | grep '^nf_tables'
 WILL_FAIL
 
@@ -233,8 +244,8 @@ AFTER ./testprogs/syscall read
 
 NAME kretprobe_order
 RUN {{BPFTRACE}} runtime/scripts/kretprobe_order.bt
-EXPECT first second
-AFTER /bin/bash -c "./testprogs/syscall nanosleep 1000"; /bin/bash -c "./testprogs/syscall nanosleep 1000"
+EXPECT_REGEX (first)+ second
+AFTER /bin/bash -c "./testprogs/syscall nanosleep 1000";
 
 NAME kretprobe_wildcard
 PROG kretprobe:vmlinux:vfs_rea* { printf("SUCCESS %d\n", pid); exit(); }
@@ -242,30 +253,46 @@ EXPECT_REGEX SUCCESS [0-9][0-9]*
 AFTER ./testprogs/syscall read
 
 NAME kretprobe_wildcard_multi
-RUN {{BPFTRACE}} --unsafe -e 'kretprobe:ksys_* { system("/usr/sbin/bpftool prog | grep kprobe | grep ksys_ | wc -l"); exit(); }'
+RUN {{BPFTRACE}} --unsafe -e 'kretprobe:ksys_* { system("bpftool prog | grep kprobe | grep ksys_ | wc -l"); exit(); }'
 EXPECT 1
-REQUIRES /usr/sbin/bpftool
+REQUIRES bpftool
 REQUIRES_FEATURE kprobe_multi
 
 NAME kretprobe_wildcard_multi_link
-RUN {{BPFTRACE}} --unsafe -e 'kretprobe:ksys_* { printf("link: "); system("/usr/sbin/bpftool link | grep kprobe_multi | wc -l"); exit(); }'
+RUN {{BPFTRACE}} --unsafe -e 'kretprobe:ksys_* { printf("link: "); system("bpftool link | grep kprobe_multi | wc -l"); exit(); }'
 EXPECT link: 1
-REQUIRES /usr/sbin/bpftool
+REQUIRES bpftool
 REQUIRES_FEATURE kprobe_multi
 
 NAME uretprobe_multi_wildcard
-RUN {{BPFTRACE}} --unsafe -e 'uretprobe:./testprogs/uprobe_test:uprobeFunction* { printf("link: "); system("/usr/sbin/bpftool link | grep -E \"uprobe_multi|type 12\" | wc -l"); exit(); }'
+RUN {{BPFTRACE}} --unsafe -e 'uretprobe:./testprogs/uprobe_test:uprobeFunction* { printf("link: "); system("bpftool link | grep -E \"uprobe_multi|type 12\" | wc -l"); exit(); }'
 EXPECT link: 1
-REQUIRES /usr/sbin/bpftool
+REQUIRES bpftool
 REQUIRES_FEATURE uprobe_multi
 AFTER ./testprogs/uprobe_test
 
 NAME uprobe_multi_wildcard_target_wildcard
-RUN {{BPFTRACE}} --unsafe -e 'uretprobe:*:uprobeFunction* { printf("link: "); system("/usr/sbin/bpftool link | grep -E \"uprobe_multi|type 12\" | wc -l"); exit(); }' -p {{BEFORE_PID}}
+RUN {{BPFTRACE}} --unsafe -e 'uretprobe:*:uprobeFunction* { printf("link: "); system("bpftool link | grep -E \"uprobe_multi|type 12\" | wc -l"); exit(); }' -p {{BEFORE_PID}}
 EXPECT link: 1
-REQUIRES /usr/sbin/bpftool
+REQUIRES bpftool
 REQUIRES_FEATURE uprobe_multi
 BEFORE ./testprogs/uprobe_test
+
+# We need to check multiple things for session probes:
+# - both entry and exit are hit
+# - there is just one BPF program created
+# - there is just one BPF link created
+# This case combines all of the above by getting the number of progs from the
+# entry probe and the number of links from the exit probe and checking for both.
+# Note that getting the number of progs/links requires to call bpftool via
+# system() call, hence we need --unsafe.
+NAME kprobe_session
+RUN {{BPFTRACE}} --unsafe -e 'kprobe:ksys_* { @entry = 1; printf("progs: "); system("bpftool prog | grep kprobe | grep ksys_ | wc -l"); } kretprobe:ksys_* { printf("links: "); system("bpftool link | grep kprobe_multi | wc -l"); if (@entry == 1) { exit() } }'
+AFTER ./testprogs/syscall read
+EXPECT progs: 1
+EXPECT links: 1
+REQUIRES bpftool
+REQUIRES_FEATURE kprobe_session
 
 NAME uprobe
 PROG uprobe:/bin/bash:echo_builtin { printf("arg0: %d\n", arg0); exit();}
@@ -300,8 +327,8 @@ REQUIRES_FEATURE libpath_resolv
 
 NAME uprobe_order
 RUN {{BPFTRACE}} runtime/scripts/uprobe_order.bt
-EXPECT first second
-AFTER /bin/bash -c "echo lala"; /bin/bash -c "echo lala"
+EXPECT_REGEX (first)+ second
+AFTER /bin/bash -c "echo lala";
 
 NAME uprobe_zero_size
 PROG uprobe:./testprogs/uprobe_test:_init { printf("arg0: %d\n", arg0); exit();}
@@ -337,8 +364,8 @@ AFTER /bin/bash -c "echo lala"
 
 NAME uretprobe_order
 RUN {{BPFTRACE}} runtime/scripts/uretprobe_order.bt
-EXPECT first second
-AFTER /bin/bash -c "echo lala"; /bin/bash -c "echo lala"
+EXPECT_REGEX (first)+ second
+AFTER /bin/bash -c "echo lala";
 
 NAME tracepoint
 PROG tracepoint:syscalls:sys_exit_nanosleep { printf("SUCCESS %d\n", gid); exit(); }
@@ -352,23 +379,22 @@ AFTER ./testprogs/syscall nanosleep 1e8
 
 NAME tracepoint_order
 RUN {{BPFTRACE}} runtime/scripts/tracepoint_order.bt
-EXPECT first second
-AFTER ./testprogs/syscall nanosleep 1e8; ./testprogs/syscall nanosleep 1e8
+EXPECT_REGEX (first)+ second
+AFTER ./testprogs/syscall nanosleep 100000001;
 
 NAME tracepoint_expansion
 RUN {{BPFTRACE}} -e 'tracepoint:syscalls:sys_*_nanosleep { printf("hit\n"); }' -c "./testprogs/syscall nanosleep 1e8"
 EXPECT hit
 
 NAME tracepoint_missing
-PROG t:syscalls:nonsense { printf("hit"); exit(); }
+PROG t:syscalls:nonsense { print("hit"); exit(); }
 EXPECT stdin:1:1-20: ERROR: tracepoint not found: syscalls:nonsense
 WILL_FAIL
 
 NAME tracepoint_multiattach_missing
-PROG t:syscalls:sys_exit_nanosleep,t:syscalls:nonsense { printf("hit"); exit(); }
+PROG t:syscalls:sys_exit_nanosleep,t:syscalls:nonsense { print("hit"); exit(); }
 EXPECT hit
 AFTER ./testprogs/syscall nanosleep 1e8
-WILL_FAIL
 
 NAME tracepoint args
 PROG tracepoint:syscalls:sys_enter_read { printf("%d\n", args.count); exit(); }
@@ -397,14 +423,31 @@ EXPECT_REGEX SUCCESS [0-9][0-9]*
 AFTER ./testprogs/syscall nanosleep 1e8
 
 NAME rawtracepoint_missing
-PROG rawtracepoint:nonsense { printf("hit"); exit(); }
-EXPECT ERROR: Probe does not exist: rawtracepoint:nonsense
+PROG rawtracepoint:nonsense { print("hit"); exit(); }
+EXPECT No probes to attach
+REQUIRES_FEATURE btf
 WILL_FAIL
 
 NAME rawtracepoint_wildcard
 PROG rawtracepoint:sys_* { printf("SUCCESS %d\n", gid); exit(); }
 EXPECT_REGEX SUCCESS [0-9][0-9]*
 AFTER ./testprogs/syscall nanosleep
+
+NAME rawtracepoint_module_wildcard
+PROG rawtracepoint:vmlinu*:sys_exit { printf("SUCCESS %d\n", gid); exit(); }
+EXPECT_REGEX SUCCESS [0-9][0-9]*
+AFTER ./testprogs/syscall nanosleep 1e8
+
+NAME rawtracepoint_module_missing
+PROG rawtracepoint:nonsense:sys_exit { printf("SUCCESS %d\n", gid); exit(); }
+EXPECT ERROR: No BTF found for nonsense:sys_exit
+REQUIRES_FEATURE btf
+WILL_FAIL
+
+# Test that we get at least two characters out
+NAME rawtracepoint args
+PROG rawtracepoint:irq_handler_entry { print(str(((struct irqaction*)args.action)->name)); exit(); }
+EXPECT_REGEX ..+
 
 NAME profile
 PROG profile:hz:599 { print("hit"); exit(); }
@@ -431,16 +474,16 @@ PROG interval:ms:1 { print(probe); exit();}
 EXPECT interval:ms:1
 
 NAME software
-PROG software:cpu-clock:1 { print("hit"); exit();}
+PROG software:cpu-clock:100000 { print("hit"); exit();}
 EXPECT hit
 
 NAME software_probe_builtin
-PROG software:cpu-clock:1 { print(probe); exit();}
-EXPECT software:cpu-clock:1
+PROG software:cpu-clock:100000 { print(probe); exit();}
+EXPECT software:cpu-clock:100000
 
 NAME software_alias_probe_builtin
-PROG software:cpu:1 { print(probe); exit();}
-EXPECT software:cpu:1
+PROG software:cpu:100000 { print(probe); exit();}
+EXPECT software:cpu:100000
 
 NAME hardware
 REQUIRES ls /sys/devices/cpu/events/cache-misses
@@ -451,6 +494,15 @@ NAME hardware_probe_builtin
 REQUIRES ls /sys/devices/cpu/events/cache-misses
 PROG hardware:cache-misses:10 { print(probe); exit();}
 EXPECT hardware:cache-misses:10
+
+NAME probe_builtin_string_compare
+PROG uprobe:testprogs/uprobe_test:uprobeFunction* { if (strcontains(probe, "uprobeFunction2")) { print(probe); exit(); } }
+AFTER ./testprogs/uprobe_test
+EXPECT uprobe:testprogs/uprobe_test:uprobeFunction2
+
+NAME probe_builtin_scratch_buf
+PROG config = { on_stack_limit = 0 } software:cpu:100000 { print(probe); exit(); }
+EXPECT software:cpu:100000
 
 NAME BEGIN
 PROG BEGIN { printf("Hello\n"); exit();}
@@ -469,10 +521,12 @@ EXPECT Hello
 TIMEOUT 2
 
 # The "probe" builtin forces bpftrace to generate one BPF function for each
-# match and so we should fail on exceeding BPFTRACE_MAX_BPF_PROGS.
+# match and so we should fail on exceeding BPFTRACE_MAX_BPF_PROGS. The error is
+# attached to the probe that went over the limit, which in this case is the
+# only probe that we specify.
 NAME bpf_programs_limit
 PROG k:* { @[probe] = count(); }
-EXPECT_REGEX ERROR: Failed to compile: Your program is trying to generate more than \d+ BPF programs, which exceeds the current limit of 512.\nYou can increase the limit through the BPFTRACE_MAX_BPF_PROGS environment variable.
+EXPECT_REGEX stdin:1:1-28: ERROR: Your program is trying to generate more than \d+ BPF programs, which exceeds the current limit of 1024\nk:\* { @\[probe\] = count\(\); }\n~~~~~~~~~~~~~~~~~~~~~~~~~~~\nHINT: You can increase the limit through the BPFTRACE_MAX_BPF_PROGS environment variable.
 WILL_FAIL
 TIMEOUT 2
 
@@ -480,3 +534,64 @@ NAME sanitise probe name
 PROG uprobe:./testprogs/uprobe_namesan:fn* { printf("ok\n"); exit(); }
 EXPECT ok
 AFTER ./testprogs/uprobe_namesan
+
+NAME pid filter software
+RUN {{BPFTRACE}} -e 'software:cpu-clock:10000000 { @[pid] = count(); if (len(@) != 1) { print("bad"); } }' -p {{BEFORE_PID}}
+EXPECT_NONE bad
+BEFORE ./testprogs/work_loop
+TIMEOUT 2
+
+NAME pid filter kprobe
+RUN {{BPFTRACE}} -e 'kprobe:do_nanosleep { @[pid] = count(); if (len(@) != 1) { print("bad"); } }' -p {{BEFORE_PID}}
+EXPECT_NONE bad
+BEFORE ./testprogs/nanosleep_loop
+BEFORE ./testprogs/nanosleep_loop
+TIMEOUT 2
+
+NAME fentry_order
+RUN {{BPFTRACE}} runtime/scripts/fentry_order.bt
+EXPECT_REGEX (first)+ second
+AFTER ./testprogs/syscall nanosleep 233;
+
+NAME rawtracepoint_order
+RUN {{BPFTRACE}} runtime/scripts/rawtracepoint_order.bt
+EXPECT_REGEX (first)+ second
+AFTER ./testprogs/syscall nanosleep 233;
+
+NAME usdt_order
+RUN {{BPFTRACE}} runtime/scripts/usdt_order.bt
+EXPECT_REGEX (first)+ second
+AFTER ./testprogs/usdt_sized_args
+
+NAME interval_order
+RUN {{BPFTRACE}} runtime/scripts/interval_runtime_order.bt
+EXPECT_REGEX (first)+ second
+
+NAME hardware_order
+REQUIRES ls /sys/devices/cpu/events/cache-misses
+RUN {{BPFTRACE}} runtime/scripts/hardware_order.bt
+EXPECT_REGEX (first)+ second
+
+NAME profile_order
+RUN {{BPFTRACE}} runtime/scripts/profile_order.bt
+EXPECT_REGEX (first)+ second
+
+NAME watchpoint_order
+RUN {{BPFTRACE}} -e 'watchpoint:increment+arg1:4:w { printf("first") } watchpoint:increment+arg1:4:w { printf(" second\n"); exit(); }' -c ./testprogs/watchpoint_func
+EXPECT_REGEX (first)+ second
+ARCH aarch64|x86_64
+REQUIRES_FEATURE signal
+
+NAME fexit_order
+RUN {{BPFTRACE}} runtime/scripts/fexit_order.bt
+EXPECT_REGEX (first)+ second
+AFTER ./testprogs/syscall nanosleep 233;
+
+NAME software_order
+RUN {{BPFTRACE}} runtime/scripts/software_order.bt
+EXPECT_REGEX (first)+ second
+
+NAME signal_order
+RUN {{BPFTRACE}} -e 'self:signal:SIGUSR1 { printf("first"); } self:signal:SIGUSR1 { printf(" second\n"); exit(); }'
+AFTER kill -s USR1 $(pidof bpftrace)
+EXPECT_REGEX (first)+ second

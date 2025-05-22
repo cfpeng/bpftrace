@@ -4,11 +4,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <fcntl.h>
+#include <filesystem>
 #include <fstream>
+#include <optional>
+
+#include <fcntl.h>
 #include <gelf.h>
 #include <libelf.h>
-#include <optional>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -18,9 +20,8 @@
 #include <cereal/types/unordered_map.hpp>
 #include <cereal/types/vector.hpp>
 
-#include "filesystem.h"
 #include "log.h"
-#include "utils.h"
+#include "util/paths.h"
 #include "version.h"
 
 #define AOT_ELF_SECTION ".btaot"
@@ -126,7 +127,7 @@ std::optional<std::vector<uint8_t>> generate_btaot_section(
 
 // Clones the shim to final destination while also injecting
 // the custom .btaot section.
-int build_binary(const std_filesystem::path &shim,
+int build_binary(const std::filesystem::path &shim,
                  const std::string &out,
                  const std::vector<uint8_t> &section)
 {
@@ -142,11 +143,11 @@ int build_binary(const std_filesystem::path &shim,
 
   // Respect user provided BPFTRACE_OBJCOPY if present
   std::string_view objcopy = "objcopy";
-  if (auto c = std::getenv("BPFTRACE_OBJCOPY"))
+  if (auto *c = std::getenv("BPFTRACE_OBJCOPY"))
     objcopy = c;
 
   // Resolve objcopy binary to full path
-  auto objcopy_full = find_in_path(objcopy);
+  auto objcopy_full = util::find_in_path(objcopy);
   if (!objcopy_full) {
     ret = 1;
     LOG(ERROR) << "Failed to find " << objcopy << " in $PATH";
@@ -172,7 +173,7 @@ int build_binary(const std_filesystem::path &shim,
   }
 
 out:
-  if (!std_filesystem::remove(AOT_SECDATA_TEMPFILE, ec) || ec) {
+  if (!std::filesystem::remove(AOT_SECDATA_TEMPFILE, ec) || ec) {
     ret = 1;
     LOG(ERROR) << "Failed to remove " << AOT_SECDATA_TEMPFILE << ": " << ec;
   }
@@ -193,9 +194,9 @@ int generate(const RequiredResources &resources,
   // For development, we want to use the locally built AOT shim instead of a
   // "real" one that could be present elsewhere in $PATH. So we give precedence
   // to shim found "next" to the running binary.
-  auto rel = std_filesystem::path("aot") / AOT_SHIM_NAME;
-  auto local = find_near_self(rel.native());
-  auto path = find_in_path(AOT_SHIM_NAME);
+  auto rel = std::filesystem::path("aot") / AOT_SHIM_NAME;
+  auto local = util::find_near_self(rel.native());
+  auto path = util::find_in_path(AOT_SHIM_NAME);
   auto shim = local ? local : path;
   if (!shim) {
     LOG(ERROR) << "Failed to locate " << AOT_SHIM_NAME
@@ -225,10 +226,10 @@ int load(BPFtrace &bpftrace, const std::string &in)
   }
 
   std::error_code ec;
-  std_filesystem::path in_path{ in };
+  std::filesystem::path in_path{ in };
   std::uintmax_t in_file_size = std::filesystem::file_size(in_path, ec);
 
-  if (in_file_size == static_cast<std::uintmax_t>(-1)) {
+  if (ec) {
     LOG(ERROR) << "Failed to stat: " << in << ": " << ec.message();
     return 1;
   }

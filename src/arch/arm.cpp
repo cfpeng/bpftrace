@@ -1,14 +1,12 @@
-#include "arch.h"
-
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <sys/utsname.h>
 #include <unordered_map>
 
-#include <sys/utsname.h>
+#include "arch.h"
 
-namespace bpftrace {
-namespace arch {
+namespace bpftrace::arch {
 
 namespace {
 
@@ -198,14 +196,16 @@ std::string name()
   return std::string(is_arm64() ? "arm64" : "arm");
 }
 
-std::vector<std::string> invalid_watchpoint_modes()
+const std::unordered_set<std::string>& watchpoint_modes()
 {
-  // See arch/arm/kernel/hw_breakpoint.c:arch_build_bp_info in kernel source
-  return std::vector<std::string>{
-    "rx",
-    "wx",
-    "rwx",
+  // See arch/arm/kernel/hw_breakpoint.c:arch_build_bp_info in kernel source.
+  static std::unordered_set<std::string> valid_modes = {
+    "r",
+    "w",
+    "x",
+    "rw",
   };
+  return valid_modes;
 }
 
 int get_kernel_ptr_width()
@@ -224,5 +224,4 @@ int get_kernel_ptr_width()
   return 64;
 }
 
-} // namespace arch
-} // namespace bpftrace
+} // namespace bpftrace::arch

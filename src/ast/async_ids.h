@@ -1,7 +1,8 @@
 #pragma once
 
-namespace bpftrace {
-namespace ast {
+#include <functional>
+
+namespace bpftrace::ast {
 
 // Add new ids here
 #define FOR_LIST_OF_ASYNC_IDS(DO)                                              \
@@ -38,11 +39,9 @@ public:
 
   FOR_LIST_OF_ASYNC_IDS(DEFINE_ACCESS_METHOD)
 
-  /*
-   * For 'create_reset_ids' return a lambda that has captured-by-value
-   * CodegenLLVM's async id state. Running the returned lambda will restore
-   * `CodegenLLVM`s async id state back to when this function was first called.
-   */
+  // For 'create_reset_ids' return a lambda that has captured-by-value
+  // CodegenLLVM's async id state. Running the returned lambda will restore
+  // `CodegenLLVM`s async id state back to when this function was first called.
   std::function<void()> create_reset_ids()
   {
     return [FOR_LIST_OF_ASYNC_IDS(LOCAL_SAVE) this] {
@@ -54,5 +53,4 @@ private:
   FOR_LIST_OF_ASYNC_IDS(DEFINE_MEMBER_VAR)
 };
 
-} // namespace ast
-} // namespace bpftrace
+} // namespace bpftrace::ast

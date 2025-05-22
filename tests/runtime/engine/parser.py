@@ -3,6 +3,7 @@
 from collections import namedtuple
 import os
 import platform
+from runner import Runner
 
 DEFAULT_TIMEOUT = 5
 
@@ -22,6 +23,7 @@ class Expect:
     self.expect = expect
     self.mode = mode
 
+# Remember to update tests/README.md if adding a new directive!
 TestStruct = namedtuple(
     'TestStruct',
     [
@@ -33,6 +35,7 @@ TestStruct = namedtuple(
         'timeout',
         'befores',
         'after',
+        'setup',
         'cleanup',
         'suite',
         'kernel_min',
@@ -114,6 +117,7 @@ class TestParser(object):
         timeout = ''
         befores = []
         after = ''
+        setup = ''
         cleanup = ''
         kernel_min = ''
         kernel_max = ''
@@ -138,7 +142,7 @@ class TestParser(object):
                 if prev_item_name == 'PROG':
                     prog += '\n' + line
                     continue
-                elif prev_item_name == 'EXPECT':
+                elif prev_item_name in ('EXPECT', 'EXPECT_REGEX'):
                     expects[-1].expect += '\n' + line
                     continue
 
@@ -173,6 +177,8 @@ class TestParser(object):
                 befores.append(line)
             elif item_name == 'AFTER':
                 after = line
+            elif item_name == 'SETUP':
+                setup = line
             elif item_name == 'CLEANUP':
                 cleanup = line
             elif item_name == 'MIN_KERNEL':
@@ -188,26 +194,7 @@ class TestParser(object):
             elif item_name == 'ARCH':
                 arch = [x.strip() for x in line.split("|")]
             elif item_name == 'REQUIRES_FEATURE':
-                features = {
-                    "loop",
-                    "btf",
-                    "fentry",
-                    "probe_read_kernel",
-                    "dpath",
-                    "uprobe_refcount",
-                    "signal",
-                    "iter",
-                    "libpath_resolv",
-                    "dwarf",
-                    "kernel_dwarf",
-                    "aot",
-                    "kprobe_multi",
-                    "uprobe_multi",
-                    "skboutput",
-                    "get_tai_ns",
-                    "get_func_ip",
-                    "jiffies64",
-                }
+                features = set(Runner.get_bpffeature().keys())
 
                 for f in line.split(" "):
                     f = f.strip()
@@ -247,6 +234,9 @@ class TestParser(object):
         if return_code is None:
             return_code = 0
 
+        if return_code != 0 and will_fail:
+            raise InvalidFieldError('WILL_FAIL and RETURN_CODE can not be used together. Suite: ' + test_suite)
+
         return TestStruct(
             name,
             run,
@@ -256,6 +246,7 @@ class TestParser(object):
             timeout,
             befores,
             after,
+            setup,
             cleanup,
             test_suite,
             kernel_min,

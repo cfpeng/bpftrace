@@ -5,21 +5,19 @@ cmake_policy(SET CMP0057 NEW)
 
 # bpftrace version number components.
 set(bpftrace_VERSION_MAJOR 0)
-set(bpftrace_VERSION_MINOR 21)
+set(bpftrace_VERSION_MINOR 23)
 set(bpftrace_VERSION_PATCH 0)
 
 include(GNUInstallDirs)
 
 set(WARNINGS_AS_ERRORS OFF CACHE BOOL "Build with -Werror")
+set(HARDENED_STDLIB OFF CACHE BOOL "Enable hardened definitions for standard library (for development use only)")
 set(STATIC_LINKING OFF CACHE BOOL "Build bpftrace as a statically linked executable")
 
 set(BUILD_ASAN OFF CACHE BOOL "Build bpftrace with -fsanitize=address")
 set(ENABLE_MAN ON CACHE BOOL "Build man pages")
 set(BUILD_TESTING ON CACHE BOOL "Build test suite")
 set(ENABLE_TEST_VALIDATE_CODEGEN ON CACHE BOOL "Run LLVM IR validation tests")
-set(BUILD_FUZZ OFF CACHE BOOL "Build bpftrace for fuzzing")
-set(USE_LIBFUZZER OFF CACHE BOOL "Use libfuzzer for fuzzing")
-set(FUZZ_TARGET "codegen" CACHE STRING "Fuzzing target")
 set(ENABLE_SYSTEMD OFF CACHE BOOL "Enable systemd integration")
 set(KERNEL_HEADERS_DIR "" CACHE PATH "Hard-code kernel headers directory")
 set(SYSTEM_INCLUDE_PATHS "auto" CACHE STRING "Hard-code system include paths (colon separated, the default value \"auto\" queries clang at runtime)")
@@ -45,6 +43,15 @@ add_compile_options("-Wunreachable-code")
 #add_compile_options("-Wformat=2")
 add_compile_options("-Wdisabled-optimization")
 
+if(HARDENED_STDLIB)
+  add_compile_definitions("-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG")
+  add_compile_definitions("-D_GLIBCXX_ASSERTIONS")
+  if("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
+    # _FORTIFY_SOURCE requires at least -O1
+    add_compile_definitions("-D_FORTIFY_SOURCE=3")
+  endif()
+endif()
+
 if (WARNINGS_AS_ERRORS)
   add_compile_options("-Werror")
 endif()
@@ -56,6 +63,7 @@ if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
 endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
+include_directories(${CMAKE_BINARY_DIR}/src)
 include_directories(${CMAKE_BINARY_DIR})
 
 # Ninja buffers output so gcc/clang think it's not an interactive session.
@@ -88,10 +96,8 @@ include_directories(SYSTEM ${LIBBCC_INCLUDE_DIRS})
 
 find_package(LibBpf REQUIRED)
 include_directories(SYSTEM ${LIBBPF_INCLUDE_DIRS})
-# TODO: update to 1.5 once [1] is released.
-# [1] https://github.com/libbpf/libbpf/commit/dd589c3b31c13164bdc61ed174fbae6fe76c8308
-if(LIBBPF_VERSION_MAJOR VERSION_LESS 1)
-  message(SEND_ERROR "bpftrace requires libbpf 1.0 or greater")
+if("${LIBBPF_VERSION_MAJOR}.${LIBBPF_VERSION_MINOR}" VERSION_LESS 1.5)
+  message(SEND_ERROR "bpftrace requires libbpf 1.5 or greater")
 endif()
 
 find_package(LibElf REQUIRED)
@@ -106,9 +112,9 @@ find_package(FLEX REQUIRED)
 # But `api.parser.class` is not supported in bison < 3.3. So we must inject
 # the %define based on the bison version here.
 if(${BISON_VERSION} VERSION_GREATER_EQUAL 3.3)
-  set(BISON_FLAGS "-Dapi.parser.class={Parser}")
+  set(BISON_FLAGS "-Dapi.parser.class={Parser} -Wcounterexamples")
 else()
-  set(BISON_FLAGS "-Dparser_class_name={Parser}")
+  set(BISON_FLAGS "-Dparser_class_name={Parser} -Wcounterexamples")
 endif()
 bison_target(bison_parser src/parser.yy ${CMAKE_BINARY_DIR}/parser.tab.cc COMPILE_FLAGS ${BISON_FLAGS} VERBOSE)
 flex_target(flex_lexer src/lexer.l ${CMAKE_BINARY_DIR}/lex.yy.cc)
@@ -124,6 +130,7 @@ set(CMAKE_REQUIRED_DEFINITIONS)
 
 find_package(LibBfd)
 find_package(LibOpcodes)
+find_package(LibDw)
 
 if(ENABLE_SKB_OUTPUT)
   find_package(LibPcap)
@@ -133,6 +140,8 @@ if(ENABLE_SYSTEMD)
   find_package(PkgConfig)
   pkg_check_modules(libsystemd REQUIRED IMPORTED_TARGET libsystemd)
 endif()
+
+find_package(LibBlazesym)
 
 if(POLICY CMP0075)
   cmake_policy(SET CMP0075 NEW)
@@ -153,7 +162,7 @@ else()
   find_package(LLVM REQUIRED)
 endif()
 
-set(MIN_LLVM_MAJOR 13)
+set(MIN_LLVM_MAJOR 16)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   # We assume bpftrace is not being packaged when CMAKE_BUILD_TYPE=Debug.
   # So allow building with any LLVM version. This is purely for developers.
@@ -161,7 +170,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   # releases.
   set(MAX_LLVM_MAJOR 999)
 else()
-  set(MAX_LLVM_MAJOR 18)
+  set(MAX_LLVM_MAJOR 20)
 endif()
 
 if((${LLVM_VERSION_MAJOR} VERSION_LESS ${MIN_LLVM_MAJOR}) OR (${LLVM_VERSION_MAJOR} VERSION_GREATER ${MAX_LLVM_MAJOR}))
@@ -176,8 +185,6 @@ add_definitions(${LLVM_DEFINITIONS})
 
 find_package(Clang REQUIRED)
 include_directories(SYSTEM ${CLANG_INCLUDE_DIRS})
-
-find_package(LLDB)
 
 # BPFtrace compile definitions
 
@@ -197,9 +204,9 @@ if(HAVE_BFD_DISASM)
   endif(LIBBFD_INIT_DISASM_INFO_FOUR_ARGS_SIGNATURE)
 endif(HAVE_BFD_DISASM)
 
-if (LLDB_FOUND)
-  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_LIBLLDB)
-endif ()
+if(LIBDW_FOUND)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_LIBDW)
+endif()
 
 if(LIBPCAP_FOUND)
   set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_LIBPCAP)
@@ -213,6 +220,10 @@ if(ENABLE_SYSTEMD)
   set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_LIBSYSTEMD)
 endif()
 
+if(LIBBLAZESYM_FOUND)
+  set(BPFTRACE_FLAGS "${BPFTRACE_FLAGS}" HAVE_BLAZESYM)
+endif()
+
 add_subdirectory(src)
 if (BUILD_TESTING)
   add_subdirectory(tests)
@@ -221,6 +232,9 @@ add_subdirectory(tools)
 if (ENABLE_MAN)
   add_subdirectory(man)
 endif(ENABLE_MAN)
+
+set(BASH_COMPLETION_PATH ${CMAKE_CURRENT_SOURCE_DIR}/scripts/bash-completion/bpftrace)
+install(FILES ${BASH_COMPLETION_PATH} DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/bash-completion/completions)
 
 if(NOT TARGET uninstall)
   configure_file(

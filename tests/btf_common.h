@@ -2,10 +2,14 @@
 
 #include <array>
 #include <cstdint>
+#include <unistd.h>
 
-#include "data/btf_data.h"
+#include "gtest/gtest.h"
 
 namespace {
+#include "data/data_source_btf.h"
+#include "data/data_source_funcs.h"
+
 constexpr std::array<uint8_t, 4> INVALID_BTF_DATA = { 0xDE, 0xAD, 0xBE, 0xEF };
 
 bool create_tmp_with_data(char *path,
@@ -38,14 +42,14 @@ protected:
   {
     // BTF data file
     char *btf_path = strdup("/tmp/btf_dataXXXXXX");
-    if (create_tmp_with_data(btf_path, btf_data, btf_data_len)) {
+    if (create_tmp_with_data(btf_path, btf_data, sizeof(btf_data))) {
       setenv("BPFTRACE_BTF", btf_path, true);
       btf_path_ = btf_path;
     }
 
     // available functions file
     char *funcs_path = strdup("/tmp/available_filter_functionsXXXXXX");
-    if (create_tmp_with_data(funcs_path, func_list, func_list_len)) {
+    if (create_tmp_with_data(funcs_path, func_list, sizeof(func_list))) {
       setenv("BPFTRACE_AVAILABLE_FUNCTIONS_TEST", funcs_path, true);
       funcs_path_ = funcs_path;
     }
@@ -56,10 +60,14 @@ protected:
     // clear the environment and remove the temp files
     unsetenv("BPFTRACE_BTF");
     unsetenv("BPFTRACE_AVAILABLE_FUNCTIONS_TEST");
-    if (btf_path_)
+    if (btf_path_) {
       std::remove(btf_path_);
-    if (funcs_path_)
+      ::free(btf_path_);
+    }
+    if (funcs_path_) {
       std::remove(funcs_path_);
+      ::free(funcs_path_);
+    }
   }
 
   char *btf_path_ = nullptr;
@@ -84,8 +92,10 @@ protected:
   {
     // clear the environment and remove the temp files
     unsetenv("BPFTRACE_BTF");
-    if (btf_path_)
+    if (btf_path_) {
       std::remove(btf_path_);
+      ::free(btf_path_);
+    }
   }
 
   char *btf_path_ = nullptr;

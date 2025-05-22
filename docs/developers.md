@@ -40,6 +40,15 @@ The distro build is documented in [INSTALL.md](../INSTALL.md#generic-build-proce
 Every contribution should (1) not break the existing tests and (2) introduce new
 tests if relevant. See existing tests for inspiration on how to write new ones. [Read more on the different kinds and how to run them](../tests/README.md).
 
+## Performance
+
+We aim to not be wasteful, but always keep in mind that performance of the BPF
+programs and runtime are the things in the critical path. Often, simplicity and
+understandability on non-critical paths is often more important than
+performance. That said, occasionally it is useful to measure the performance of
+different parts of the pipeline. You may run bpftrace using `--test benchmark`
+in order to see the performance of the various passes during compilation.
+
 ## Continuous integration
 
 CI executes the above tests in a matrix of different LLVM versions on NixOS.
@@ -85,6 +94,32 @@ list of known such tests:
 What usually helps, is restarting the CI. This is simple on your own fork but
 requires one of the maintainers for pull requests.
 
+### Virtual machine tests (vmtests)
+
+In CI we run a subset of runtime tests under a controlled kernel by taking
+advantage of nested virtualization on CI runners. For these tests, we use
+[vmtest](https://github.com/danobi/vmtest) to manage the virtual machine.
+
+The instructions in the above "Debugging CI failures" section also work
+for the vmtest-ed runtime tests. But if you want to manually try something
+quick and dirty in a CI kernel, you can do something like the following:
+
+```bash
+$ nix develop
+
+(nix:nix-shell-env) $ vmtest -k $(nix build --print-out-paths .#kernel-6_12)/bzImage -- ./build/src/bpftrace -V
+=> bzImage
+===> Booting
+===> Setting up VM
+===> Running command
+bpftrace v0.21.0-344-g3acb
+```
+
+While we'll defer to `vmtest` documentation for full details, one neat fact
+worth pointing out is that `vmtest` will map the current running userspace into
+the VM. This means you can run binaries built on your host from inside the
+guest, eg. your development build of bpftrace.
+
 ## Coding guidelines
 
 This is not about the formatting of the source code (we have `clang-format`
@@ -112,6 +147,17 @@ can be used to easily format commits, e.g. `git clang-format upstream/master`
 
 We want to avoid `fix formatting` commits. Instead every commit should be
 formatted correctly.
+
+### Comment style
+
+Strongly prefer C++-style comments for single line and block comments. C-style
+comments are still useable for nested comments within a single line, e.g. to
+leave an annotation on a specific argument or parameter. In the future, there
+may be considerations for automated documentation based on comments, but this
+is not currently done.
+
+`bpftrace` itself supports both C-style and C++-style comment blocks. There is
+currently no decision on recommended comment style, and both are used freely.
 
 ## Merging pull requests
 

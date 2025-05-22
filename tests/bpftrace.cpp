@@ -1,14 +1,19 @@
+#include <cstdint>
 #include <cstring>
 
+#include "ast/attachpoint_parser.h"
 #include "ast/passes/codegen_llvm.h"
 #include "ast/passes/field_analyser.h"
+#include "ast/passes/map_sugar.h"
+#include "ast/passes/probe_analyser.h"
 #include "ast/passes/semantic_analyser.h"
 #include "bpftrace.h"
 #include "clang_parser.h"
 #include "driver.h"
 #include "mocks.h"
-#include "tracefs.h"
-#include "gmock/gmock.h"
+#include "tracefs/tracefs.h"
+#include "gmock/gmock-matchers.h"
+#include "gmock/gmock-nice-strict.h"
 #include "gtest/gtest.h"
 
 namespace bpftrace::test::bpftrace {
@@ -16,13 +21,79 @@ namespace bpftrace::test::bpftrace {
 #include "btf_common.h"
 
 using ::testing::ContainerEq;
+using ::testing::Contains;
 using ::testing::StrictMock;
 
 static const int STRING_SIZE = 64;
 
-static const std::string kprobe_name(const std::string &attach_point,
-                                     const std::string &target,
-                                     uint64_t func_offset)
+static const std::optional<int> no_pid = std::nullopt;
+
+template <typename K, typename V>
+MapElements generate_kv_pairs(const std::vector<K> &keys,
+                              const std::vector<V> &values)
+{
+  MapElements kv_pairs;
+  for (size_t i = 0; i < keys.size() && i < values.size(); ++i) {
+    std::vector<uint8_t> key_bytes(sizeof(K));
+    std::vector<uint8_t> value_bytes(sizeof(V));
+    memcpy(key_bytes.data(), &keys[i], sizeof(K));
+    memcpy(value_bytes.data(), &values[i], sizeof(V));
+    kv_pairs.emplace_back(key_bytes, value_bytes);
+  }
+  return kv_pairs;
+}
+
+template <typename K>
+MapElements generate_kv_pairs(const std::vector<K> &keys,
+                              const std::vector<std::string> &values)
+{
+  MapElements kv_pairs;
+  for (size_t i = 0; i < keys.size() && i < values.size(); ++i) {
+    std::vector<uint8_t> key_bytes(sizeof(K));
+    memcpy(key_bytes.data(), &keys[i], sizeof(K));
+    std::vector<uint8_t> value_bytes(values[i].size() + 1);
+    std::copy(values[i].begin(), values[i].end(), value_bytes.begin());
+    value_bytes[values[i].size()] = '\0';
+    kv_pairs.emplace_back(key_bytes, value_bytes);
+  }
+  return kv_pairs;
+}
+
+template <typename K>
+MapElements generate_kv_pairs(const std::vector<K> &keys,
+                              const std::vector<std::vector<uint8_t>> &values)
+{
+  MapElements kv_pairs;
+  for (size_t i = 0; i < keys.size() && i < values.size(); ++i) {
+    std::vector<uint8_t> key_bytes(sizeof(K));
+    memcpy(key_bytes.data(), &keys[i], sizeof(K));
+    kv_pairs.emplace_back(key_bytes, values[i]);
+  }
+  return kv_pairs;
+}
+
+std::vector<uint8_t> generate_percpu_data(
+    const std::vector<std::pair<uint64_t, bool>> &values)
+{
+  std::vector<uint8_t> value;
+
+  value.resize(values.size() * (sizeof(uint64_t) * 2), 0);
+  for (size_t i = 0; i < values.size(); i++) {
+    auto is_set = static_cast<uint32_t>(values[i].second);
+    std::memcpy(value.data() + (i * (sizeof(uint64_t) * 2)),
+                &values[i].first,
+                sizeof(uint64_t));
+    std::memcpy(value.data() +
+                    (sizeof(uint64_t) + (i * (sizeof(uint64_t) * 2))),
+                &is_set,
+                sizeof(uint32_t));
+  }
+  return value;
+}
+
+static std::string kprobe_name(const std::string &attach_point,
+                               const std::string &target,
+                               uint64_t func_offset)
 {
   auto str = func_offset ? "+" + std::to_string(func_offset) : "";
   if (!target.empty()) {
@@ -35,22 +106,24 @@ static auto parse_probe(const std::string &str,
                         BPFtrace &bpftrace,
                         int usdt_num_locations = 0)
 {
-  Driver driver(bpftrace);
-  ASSERT_EQ(driver.parse_str(str), 0);
+  ast::ASTContext ast("stdin", str);
 
-  ast::FieldAnalyser fields(driver.ctx.root, bpftrace);
-  ASSERT_EQ(fields.analyse(), 0);
-
-  ClangParser clang;
-  clang.parse(driver.ctx.root, bpftrace);
-
-  ast::SemanticAnalyser semantics(driver.ctx, bpftrace);
-  ASSERT_EQ(semantics.analyse(), 0);
-
-  auto usdt_helper = get_mock_usdt_helper(usdt_num_locations);
-  std::stringstream out;
-  ast::CodegenLLVM codegen(driver.ctx.root, bpftrace, std::move(usdt_helper));
-  codegen.generate_ir();
+  // N.B. Don't use tracepoint format parser here.
+  auto usdt = get_mock_usdt_helper(usdt_num_locations);
+  auto ok = ast::PassManager()
+                .put(ast)
+                .put(bpftrace)
+                .add(CreateParsePass())
+                .add(ast::CreateParseAttachpointsPass())
+                .add(ast::CreateFieldAnalyserPass())
+                .add(CreateClangPass())
+                .add(ast::CreateMapSugarPass())
+                .add(ast::CreateSemanticPass())
+                .add(ast::CreateProbePass())
+                .add(ast::CreateLLVMInitPass())
+                .add(ast::CreateCompilePass(std::ref(*usdt)))
+                .run();
+  ASSERT_TRUE(ok && ast.diagnostics().ok());
 }
 
 void check_kprobe(Probe &p,
@@ -86,8 +159,8 @@ void check_uprobe(Probe &p,
                   uint64_t address = 0,
                   uint64_t func_offset = 0)
 {
-  bool retprobe = orig_name.find("uretprobe:") == 0 ||
-                  orig_name.find("ur:") == 0;
+  bool retprobe = orig_name.starts_with("uretprobe:") ||
+                  orig_name.starts_with("ur:");
   EXPECT_EQ(retprobe ? ProbeType::uretprobe : ProbeType::uprobe, p.type);
   EXPECT_EQ(path, p.path);
   EXPECT_EQ(attach_point, p.attach_point);
@@ -104,8 +177,8 @@ void check_uprobe_multi(Probe &p,
                         const std::string &orig_name,
                         const std::string &name)
 {
-  bool retprobe = orig_name.find("uretprobe:") == 0 ||
-                  orig_name.find("ur:") == 0;
+  bool retprobe = orig_name.starts_with("uretprobe:") ||
+                  orig_name.starts_with("ur:");
   EXPECT_EQ(retprobe ? ProbeType::uretprobe : ProbeType::uprobe, p.type);
   EXPECT_EQ(path, p.path);
   EXPECT_EQ(funcs, p.funcs);
@@ -134,16 +207,6 @@ void check_tracepoint(Probe &p,
   EXPECT_EQ(func, p.attach_point);
   EXPECT_EQ(orig_name, p.orig_name);
   EXPECT_EQ("tracepoint:" + target + ":" + func, p.name);
-}
-
-void check_rawtracepoint(Probe &p,
-                         const std::string &func,
-                         const std::string &orig_name)
-{
-  EXPECT_EQ(ProbeType::rawtracepoint, p.type);
-  EXPECT_EQ(func, p.attach_point);
-  EXPECT_EQ(orig_name, p.orig_name);
-  EXPECT_EQ("rawtracepoint:" + func, p.name);
 }
 
 void check_profile(Probe &p,
@@ -199,46 +262,46 @@ void check_special_probe(Probe &p, const std::string &orig_name)
 
 TEST(bpftrace, add_begin_probe)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("BEGIN{}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("BEGIN{}", *bpftrace);
 
-  ASSERT_EQ(0U, bpftrace.get_probes().size());
-  ASSERT_EQ(1U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_special_probes().size());
 
-  check_special_probe(bpftrace.get_special_probes()["BEGIN"], "BEGIN");
+  check_special_probe(bpftrace->get_special_probes()["BEGIN"], "BEGIN");
 }
 
 TEST(bpftrace, add_end_probe)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("END{}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("END{}", *bpftrace);
 
-  ASSERT_EQ(0U, bpftrace.get_probes().size());
-  ASSERT_EQ(1U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_special_probes().size());
 
-  check_special_probe(bpftrace.get_special_probes()["END"], "END");
+  check_special_probe(bpftrace->get_special_probes()["END"], "END");
 }
 
 TEST(bpftrace, add_probes_single)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("kprobe:sys_read {}", bpftrace);
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("kprobe:sys_read {}", *bpftrace);
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
-  check_kprobe(bpftrace.get_probes().at(0), "sys_read", "kprobe:sys_read");
+  check_kprobe(bpftrace->get_probes().at(0), "sys_read", "kprobe:sys_read");
 }
 
 TEST(bpftrace, add_probes_multiple)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("kprobe:sys_read,kprobe:sys_write{}", bpftrace);
-  ASSERT_EQ(2U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("kprobe:sys_read,kprobe:sys_write{}", *bpftrace);
+  ASSERT_EQ(2U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
   std::string probe_orig_name = "kprobe:sys_read,kprobe:sys_write";
-  check_kprobe(bpftrace.get_probes().at(0), "sys_read", probe_orig_name);
-  check_kprobe(bpftrace.get_probes().at(1), "sys_write", probe_orig_name);
+  check_kprobe(bpftrace->get_probes().at(0), "sys_read", probe_orig_name);
+  check_kprobe(bpftrace->get_probes().at(1), "sys_write", probe_orig_name);
 }
 
 TEST(bpftrace, add_probes_wildcard)
@@ -264,10 +327,9 @@ TEST(bpftrace, add_probes_wildcard)
 TEST(bpftrace, add_probes_wildcard_kprobe_multi)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
               get_symbols_from_traceable_funcs(false))
-      .Times(1);
+      .Times(2);
 
   parse_probe("kprobe:sys_read,kprobe:my_*,kprobe:sys_write{}", *bpftrace);
 
@@ -306,7 +368,7 @@ TEST(bpftrace, add_probes_wildcard_no_matches)
 TEST(bpftrace, add_probes_wildcard_no_matches_kprobe_multi)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
               get_symbols_from_traceable_funcs(false))
       .Times(1);
@@ -356,7 +418,7 @@ TEST(bpftrace, add_probes_kernel_module_wildcard)
   auto bpftrace = get_strict_mock_bpftrace();
   // We enable kprobe_multi here but it doesn't support the module:function
   // syntax so full expansion should be done anyways.
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
               get_symbols_from_traceable_funcs(true))
       .Times(1);
@@ -389,7 +451,7 @@ TEST(bpftrace, add_probes_kernel_module_function_wildcard)
   auto bpftrace = get_strict_mock_bpftrace();
   // We enable kprobe_multi here but it doesn't support the module:function
   // syntax so full expansion should be done anyways.
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
               get_symbols_from_traceable_funcs(true))
       .Times(1);
@@ -415,24 +477,24 @@ TEST(bpftrace, add_probes_kernel_module_function_wildcard)
 TEST(bpftrace, add_probes_offset)
 {
   auto offset = 10;
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("kprobe:sys_read+10{}", bpftrace);
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("kprobe:sys_read+10{}", *bpftrace);
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
   std::string probe_orig_name = "kprobe:sys_read+" + std::to_string(offset);
   check_kprobe(
-      bpftrace.get_probes().at(0), "sys_read", probe_orig_name, offset);
+      bpftrace->get_probes().at(0), "sys_read", probe_orig_name, offset);
 }
 
 TEST(bpftrace, add_probes_uprobe)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("uprobe:/bin/sh:foo {}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("uprobe:/bin/sh:foo {}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
-  check_uprobe(bpftrace.get_probes().at(0),
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
+  check_uprobe(bpftrace->get_probes().at(0),
                "/bin/sh",
                "foo",
                "uprobe:/bin/sh:foo",
@@ -444,7 +506,7 @@ TEST(bpftrace, add_probes_uprobe_wildcard)
   auto bpftrace = get_strict_mock_bpftrace();
   bpftrace->feature_ = std::make_unique<MockBPFfeature>(false);
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/sh"))
+              get_func_symbols_from_file(no_pid, "/bin/sh"))
       .Times(1);
 
   parse_probe("uprobe:/bin/sh:*open {}", *bpftrace);
@@ -468,10 +530,10 @@ TEST(bpftrace, add_probes_uprobe_wildcard)
 TEST(bpftrace, add_probes_uprobe_wildcard_uprobe_multi)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/sh"))
-      .Times(1);
+              get_func_symbols_from_file(no_pid, "/bin/sh"))
+      .Times(2);
 
   parse_probe("uprobe:/bin/sh:*open {}", *bpftrace);
 
@@ -491,7 +553,7 @@ TEST(bpftrace, add_probes_uprobe_wildcard_file)
   auto bpftrace = get_strict_mock_bpftrace();
   bpftrace->feature_ = std::make_unique<MockBPFfeature>(false);
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/*sh"))
+              get_func_symbols_from_file(no_pid, "/bin/*sh"))
       .Times(1);
 
   parse_probe("uprobe:/bin/*sh:*open {}", *bpftrace);
@@ -520,10 +582,10 @@ TEST(bpftrace, add_probes_uprobe_wildcard_file)
 TEST(bpftrace, add_probes_uprobe_wildcard_file_uprobe_multi)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/*sh"))
-      .Times(1);
+              get_func_symbols_from_file(no_pid, "/bin/*sh"))
+      .Times(2);
 
   parse_probe("uprobe:/bin/*sh:*open {}", *bpftrace);
 
@@ -548,7 +610,7 @@ TEST(bpftrace, add_probes_uprobe_wildcard_no_matches)
   auto bpftrace = get_strict_mock_bpftrace();
   bpftrace->feature_ = std::make_unique<MockBPFfeature>(false);
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/sh"))
+              get_func_symbols_from_file(no_pid, "/bin/sh"))
       .Times(1);
 
   parse_probe("uprobe:/bin/sh:foo* {}", *bpftrace);
@@ -560,9 +622,9 @@ TEST(bpftrace, add_probes_uprobe_wildcard_no_matches)
 TEST(bpftrace, add_probes_uprobe_wildcard_no_matches_multi)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/sh"))
+              get_func_symbols_from_file(no_pid, "/bin/sh"))
       .Times(1);
 
   parse_probe("uprobe:/bin/sh:foo* {}", *bpftrace);
@@ -573,12 +635,12 @@ TEST(bpftrace, add_probes_uprobe_wildcard_no_matches_multi)
 
 TEST(bpftrace, add_probes_uprobe_address)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("uprobe:/bin/sh:1024 {}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("uprobe:/bin/sh:1024 {}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
-  check_uprobe(bpftrace.get_probes().at(0),
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
+  check_uprobe(bpftrace->get_probes().at(0),
                "/bin/sh",
                "",
                "uprobe:/bin/sh:1024",
@@ -588,12 +650,12 @@ TEST(bpftrace, add_probes_uprobe_address)
 
 TEST(bpftrace, add_probes_uprobe_string_offset)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("uprobe:/bin/sh:foo+10{}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("uprobe:/bin/sh:foo+10{}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
-  check_uprobe(bpftrace.get_probes().at(0),
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
+  check_uprobe(bpftrace->get_probes().at(0),
                "/bin/sh",
                "foo",
                "uprobe:/bin/sh:foo+10",
@@ -608,7 +670,7 @@ TEST(bpftrace, add_probes_uprobe_cpp_symbol)
     auto bpftrace = get_strict_mock_bpftrace();
     bpftrace->feature_ = std::make_unique<MockBPFfeature>(false);
     EXPECT_CALL(*bpftrace->mock_probe_matcher,
-                get_func_symbols_from_file(0, "/bin/sh"))
+                get_func_symbols_from_file(no_pid, "/bin/sh"))
         .Times(1);
 
     std::string prog = provider + ":/bin/sh:cpp:cpp_mangled{}";
@@ -639,7 +701,7 @@ TEST(bpftrace, add_probes_uprobe_cpp_symbol_full)
   auto bpftrace = get_strict_mock_bpftrace();
   bpftrace->feature_ = std::make_unique<MockBPFfeature>(false);
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/sh"))
+              get_func_symbols_from_file(no_pid, "/bin/sh"))
       .Times(1);
 
   parse_probe("uprobe:/bin/sh:cpp:\"cpp_mangled(int)\"{}", *bpftrace);
@@ -658,7 +720,7 @@ TEST(bpftrace, add_probes_uprobe_cpp_symbol_wildcard)
   auto bpftrace = get_strict_mock_bpftrace();
   bpftrace->feature_ = std::make_unique<MockBPFfeature>(false);
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/sh"))
+              get_func_symbols_from_file(no_pid, "/bin/sh"))
       .Times(1);
 
   parse_probe("uprobe:/bin/sh:cpp:cpp_man*{}", *bpftrace);
@@ -692,7 +754,7 @@ TEST(bpftrace, add_probes_uprobe_no_demangling)
 {
   auto bpftrace = get_strict_mock_bpftrace();
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_func_symbols_from_file(0, "/bin/sh"))
+              get_func_symbols_from_file(no_pid, "/bin/sh"))
       .Times(0);
 
   // Without the :cpp prefix, only look for non-mangled "cpp_mangled" symbol
@@ -707,54 +769,14 @@ TEST(bpftrace, add_probes_uprobe_no_demangling)
                "uprobe:/bin/sh:cpp_mangled");
 }
 
-#ifdef HAVE_LIBLLDB
-#include "dwarf_common.h"
-
-class bpftrace_dwarf : public test_dwarf {};
-
-TEST_F(bpftrace_dwarf, add_probes_uprobe_symbol_source)
-{
-  auto uprobe = "uprobe:" + std::string(bin_) + ":func_1 {}";
-
-  {
-    BPFtrace bpftrace;
-    ConfigSetter configs{ bpftrace.config_, ConfigSource::script };
-    configs.set_symbol_source_config("dwarf");
-    parse_probe(uprobe, bpftrace);
-
-    ASSERT_EQ(bpftrace.resources.probes.size(), 1);
-    ASSERT_EQ(bpftrace.resources.special_probes.size(), 0);
-
-    auto &probe = bpftrace.resources.probes.at(0);
-    ASSERT_TRUE(probe.attach_point.empty());
-    ASSERT_NE(probe.address, 0);
-  }
-
-  {
-    BPFtrace bpftrace;
-    ConfigSetter configs{ bpftrace.config_, ConfigSource::script };
-    configs.set_symbol_source_config("symbol_table");
-    parse_probe(uprobe, bpftrace);
-
-    ASSERT_EQ(bpftrace.resources.probes.size(), 1);
-    ASSERT_EQ(bpftrace.resources.special_probes.size(), 0);
-
-    auto &probe = bpftrace.resources.probes.at(0);
-    ASSERT_FALSE(probe.attach_point.empty());
-    ASSERT_EQ(probe.address, 0);
-  }
-}
-
-#endif
-
 TEST(bpftrace, add_probes_usdt)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("usdt:/bin/sh:prov1:mytp {}", bpftrace, 1);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("usdt:/bin/sh:prov1:mytp {}", *bpftrace, 1);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
-  check_usdt(bpftrace.get_probes().at(0),
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
+  check_usdt(bpftrace->get_probes().at(0),
              "/bin/sh",
              "prov1",
              "mytp",
@@ -765,7 +787,7 @@ TEST(bpftrace, add_probes_usdt_wildcard)
 {
   auto bpftrace = get_strict_mock_bpftrace();
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_symbols_from_usdt(0, "/bin/*sh"))
+              get_symbols_from_usdt(no_pid, "/bin/*sh"))
       .Times(1);
 
   parse_probe("usdt:/bin/*sh:prov*:tp* {}", *bpftrace, 1);
@@ -787,7 +809,7 @@ TEST(bpftrace, add_probes_usdt_empty_namespace)
 {
   auto bpftrace = get_strict_mock_bpftrace();
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_symbols_from_usdt(0, "/bin/sh"))
+              get_symbols_from_usdt(no_pid, "/bin/sh"))
       .Times(1);
 
   parse_probe("usdt:/bin/sh:tp1 {}", *bpftrace, 1);
@@ -805,7 +827,7 @@ TEST(bpftrace, add_probes_usdt_empty_namespace_conflict)
 {
   auto bpftrace = get_strict_mock_bpftrace();
   EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_symbols_from_usdt(0, "/bin/sh"))
+              get_symbols_from_usdt(no_pid, "/bin/sh"))
       .Times(1);
 
   parse_probe("usdt:/bin/sh:tp {}", *bpftrace, 1);
@@ -838,15 +860,15 @@ TEST(bpftrace, add_probes_usdt_duplicate_markers)
 
 TEST(bpftrace, add_probes_tracepoint)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("tracepoint:sched:sched_switch {}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("tracepoint:sched:sched_switch {}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
   std::string probe_orig_name = "tracepoint:sched:sched_switch";
   check_tracepoint(
-      bpftrace.get_probes().at(0), "sched", "sched_switch", probe_orig_name);
+      bpftrace->get_probes().at(0), "sched", "sched_switch", probe_orig_name);
 }
 
 TEST(bpftrace, add_probes_tracepoint_wildcard)
@@ -906,64 +928,79 @@ TEST(bpftrace, add_probes_tracepoint_wildcard_no_matches)
 
 TEST(bpftrace, add_probes_profile)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("profile:ms:997 {}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("profile:ms:997 {}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
   std::string probe_orig_name = "profile:ms:997";
-  check_profile(bpftrace.get_probes().at(0), "ms", 997, probe_orig_name);
+  check_profile(bpftrace->get_probes().at(0), "ms", 997, probe_orig_name);
 }
 
 TEST(bpftrace, add_probes_interval)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("i:s:1 {}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("i:s:1 {}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
   std::string probe_orig_name = "interval:s:1";
-  check_interval(bpftrace.get_probes().at(0), "s", 1, probe_orig_name);
+  check_interval(bpftrace->get_probes().at(0), "s", 1, probe_orig_name);
 }
 
 TEST(bpftrace, add_probes_software)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("software:faults:1000 {}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("software:faults:1000 {}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
   std::string probe_orig_name = "software:faults:1000";
-  check_software(bpftrace.get_probes().at(0), "faults", 1000, probe_orig_name);
+  check_software(bpftrace->get_probes().at(0), "faults", 1000, probe_orig_name);
 }
 
 TEST(bpftrace, add_probes_hardware)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("hardware:cache-references:1000000 {}", bpftrace);
+  auto bpftrace = get_strict_mock_bpftrace();
+  parse_probe("hardware:cache-references:1000000 {}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
   std::string probe_orig_name = "hardware:cache-references:1000000";
-  check_hardware(bpftrace.get_probes().at(0),
+  check_hardware(bpftrace->get_probes().at(0),
                  "cache-references",
                  1000000,
                  probe_orig_name);
 }
 
-TEST(bpftrace, empty_attachpoints)
+TEST(bpftrace, trailing_comma)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  Driver driver(bpftrace);
+  ast::ASTContext ast("stdin", "kprobe:f1, {}");
+  Driver driver(ast);
 
   // Trailing comma is fine
-  ASSERT_EQ(driver.parse_str("kprobe:f1, {}"), 0);
-  // Empty attach point should fail
-  ASSERT_EQ(driver.parse_str("{}"), 1);
+  driver.parse_program();
+  ASSERT_TRUE(ast.diagnostics().ok());
+}
+
+TEST(bpftrace, empty_attachpoint)
+{
+  ast::ASTContext ast("stdin", "{}");
+  Driver driver(ast);
+
+  // Empty attach point should fail...
+  ast.root = driver.parse_program();
+
+  // ... ah, but it doesn't really. What fails is the attachpoint parser. The
+  // above is a valid program, it is just not a valid attachpoint.
+  StrictMock<MockBPFtrace> bpftrace;
+  ast::AttachPointParser ap_parser(ast, bpftrace, false);
+  ap_parser.parse();
+  EXPECT_FALSE(ast.diagnostics().ok());
 }
 
 std::pair<std::vector<uint8_t>, std::vector<uint8_t>> key_value_pair_int(
@@ -979,7 +1016,7 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> key_value_pair_int(
 
   for (size_t i = 0; i < key.size(); i++) {
     uint64_t k = key.at(i);
-    std::memcpy(key_data + sizeof(uint64_t) * i, &k, sizeof(k));
+    std::memcpy(key_data + (sizeof(uint64_t) * i), &k, sizeof(k));
   }
   uint64_t v = val;
   std::memcpy(val_data, &v, sizeof(v));
@@ -999,7 +1036,7 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> key_value_pair_str(
   uint8_t *val_data = pair.second.data();
 
   for (size_t i = 0; i < key.size(); i++) {
-    strncpy(reinterpret_cast<char *>(key_data) + STRING_SIZE * i,
+    strncpy(reinterpret_cast<char *>(key_data) + (STRING_SIZE * i),
             key.at(i).c_str(),
             STRING_SIZE);
   }
@@ -1033,7 +1070,7 @@ std::pair<std::vector<uint8_t>, std::vector<uint8_t>> key_value_pair_int_str(
 
 TEST(bpftrace, sort_by_key_int)
 {
-  StrictMock<MockBPFtrace> bpftrace;
+  auto bpftrace = get_strict_mock_bpftrace();
 
   SizedType key_arg = CreateUInt64();
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
@@ -1042,7 +1079,7 @@ TEST(bpftrace, sort_by_key_int)
         key_value_pair_int({ 3 }, 11),
         key_value_pair_int({ 1 }, 10),
       };
-  bpftrace.sort_by_key(key_arg, values_by_key);
+  StrictMock<MockBPFtrace>::sort_by_key(key_arg, values_by_key);
 
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
       expected_values = {
@@ -1056,10 +1093,10 @@ TEST(bpftrace, sort_by_key_int)
 
 TEST(bpftrace, sort_by_key_int_int)
 {
-  StrictMock<MockBPFtrace> bpftrace;
+  auto bpftrace = get_strict_mock_bpftrace();
 
-  SizedType key = CreateTuple(bpftrace.structs.AddTuple(
-      { CreateInt64(), CreateInt64(), CreateInt64() }));
+  SizedType key = CreateTuple(
+      Struct::CreateTuple({ CreateInt64(), CreateInt64(), CreateInt64() }));
 
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
       values_by_key = {
@@ -1067,7 +1104,7 @@ TEST(bpftrace, sort_by_key_int_int)
         key_value_pair_int({ 5, 1, 1 }, 3), key_value_pair_int({ 2, 2, 2 }, 4),
         key_value_pair_int({ 2, 3, 2 }, 5), key_value_pair_int({ 2, 1, 2 }, 6),
       };
-  bpftrace.sort_by_key(key, values_by_key);
+  StrictMock<MockBPFtrace>::sort_by_key(key, values_by_key);
 
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
       expected_values = {
@@ -1081,7 +1118,7 @@ TEST(bpftrace, sort_by_key_int_int)
 
 TEST(bpftrace, sort_by_key_str)
 {
-  StrictMock<MockBPFtrace> bpftrace;
+  auto bpftrace = get_strict_mock_bpftrace();
 
   SizedType key_arg = CreateString(STRING_SIZE);
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
@@ -1091,7 +1128,7 @@ TEST(bpftrace, sort_by_key_str)
         key_value_pair_str({ "x" }, 3),
         key_value_pair_str({ "d" }, 4),
       };
-  bpftrace.sort_by_key(key_arg, values_by_key);
+  StrictMock<MockBPFtrace>::sort_by_key(key_arg, values_by_key);
 
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
       expected_values = {
@@ -1106,12 +1143,12 @@ TEST(bpftrace, sort_by_key_str)
 
 TEST(bpftrace, sort_by_key_str_str)
 {
-  StrictMock<MockBPFtrace> bpftrace;
+  auto bpftrace = get_strict_mock_bpftrace();
 
   SizedType key = CreateTuple(
-      bpftrace.structs.AddTuple({ CreateString(STRING_SIZE),
-                                  CreateString(STRING_SIZE),
-                                  CreateString(STRING_SIZE) }));
+      Struct::CreateTuple({ CreateString(STRING_SIZE),
+                            CreateString(STRING_SIZE),
+                            CreateString(STRING_SIZE) }));
 
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
       values_by_key = {
@@ -1122,7 +1159,7 @@ TEST(bpftrace, sort_by_key_str_str)
         key_value_pair_str({ "z", "b", "p" }, 5),
         key_value_pair_str({ "a", "b", "q" }, 6),
       };
-  bpftrace.sort_by_key(key, values_by_key);
+  StrictMock<MockBPFtrace>::sort_by_key(key, values_by_key);
 
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
       expected_values = {
@@ -1139,10 +1176,10 @@ TEST(bpftrace, sort_by_key_str_str)
 
 TEST(bpftrace, sort_by_key_int_str)
 {
-  StrictMock<MockBPFtrace> bpftrace;
+  auto bpftrace = get_strict_mock_bpftrace();
 
   SizedType key = CreateTuple(
-      bpftrace.structs.AddTuple({ CreateUInt64(), CreateString(STRING_SIZE) }));
+      Struct::CreateTuple({ CreateUInt64(), CreateString(STRING_SIZE) }));
 
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
       values_by_key = {
@@ -1150,7 +1187,7 @@ TEST(bpftrace, sort_by_key_int_str)
         key_value_pair_int_str(3, "b", 3), key_value_pair_int_str(1, "a", 4),
         key_value_pair_int_str(2, "a", 5), key_value_pair_int_str(3, "a", 6),
       };
-  bpftrace.sort_by_key(key, values_by_key);
+  StrictMock<MockBPFtrace>::sort_by_key(key, values_by_key);
 
   std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
       expected_values = {
@@ -1170,10 +1207,18 @@ void check_probe(Probe &p, ProbeType type, const std::string &name)
   EXPECT_EQ(name, p.name);
 }
 
+void check_kprobe_session(Probe &p,
+                          const std::vector<std::string> &funcs,
+                          const std::string &name)
+{
+  check_kprobe_multi(p, funcs, name, name);
+  EXPECT_TRUE(p.is_session);
+}
+
 TEST_F(bpftrace_btf, add_probes_fentry)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   parse_probe("fentry:func_1,fexit:func_1 {}", *bpftrace);
 
   ASSERT_EQ(2U, bpftrace->get_probes().size());
@@ -1189,17 +1234,17 @@ TEST_F(bpftrace_btf, add_probes_fentry)
 
 TEST_F(bpftrace_btf, add_probes_kprobe)
 {
-  StrictMock<MockBPFtrace> bpftrace;
+  auto bpftrace = get_strict_mock_bpftrace();
   parse_probe("kprobe:mock_vmlinux:func_1,kretprobe:mock_vmlinux:func_1 {}",
-              bpftrace);
+              *bpftrace);
 
-  ASSERT_EQ(2U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(2U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
-  check_probe(bpftrace.get_probes().at(0),
+  check_probe(bpftrace->get_probes().at(0),
               ProbeType::kprobe,
               "kprobe:mock_vmlinux:func_1");
-  check_probe(bpftrace.get_probes().at(1),
+  check_probe(bpftrace->get_probes().at(1),
               ProbeType::kretprobe,
               "kretprobe:mock_vmlinux:func_1");
 }
@@ -1207,7 +1252,7 @@ TEST_F(bpftrace_btf, add_probes_kprobe)
 TEST_F(bpftrace_btf, add_probes_iter_task)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   parse_probe("iter:task {}", *bpftrace);
 
   ASSERT_EQ(1U, bpftrace->get_probes().size());
@@ -1219,7 +1264,7 @@ TEST_F(bpftrace_btf, add_probes_iter_task)
 TEST_F(bpftrace_btf, add_probes_iter_task_file)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   parse_probe("iter:task_file {}", *bpftrace);
 
   ASSERT_EQ(1U, bpftrace->get_probes().size());
@@ -1231,7 +1276,7 @@ TEST_F(bpftrace_btf, add_probes_iter_task_file)
 TEST_F(bpftrace_btf, add_probes_iter_task_vma)
 {
   auto bpftrace = get_strict_mock_bpftrace();
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+
   parse_probe("iter:task_vma {}", *bpftrace);
 
   ASSERT_EQ(1U, bpftrace->get_probes().size());
@@ -1240,54 +1285,626 @@ TEST_F(bpftrace_btf, add_probes_iter_task_vma)
   check_probe(bpftrace->get_probes().at(0), ProbeType::iter, "iter:task_vma");
 }
 
+TEST_F(bpftrace_btf, add_probes_wildcard_kprobe_session)
+{
+  auto bpftrace = get_strict_mock_bpftrace();
+  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
+  EXPECT_CALL(*bpftrace->mock_probe_matcher,
+              get_symbols_from_traceable_funcs(false))
+      .Times(2);
+
+  parse_probe("kprobe:my_*{} kretprobe:my_*{}", *bpftrace);
+
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
+
+  check_kprobe_session(bpftrace->get_probes().at(0),
+                       { "my_one", "my_two" },
+                       "kprobe:my_*");
+}
+
 class bpftrace_bad_btf : public test_bad_btf {};
 
 // Test that we can handle bad data and don't just crash
 TEST_F(bpftrace_bad_btf, parse_invalid_btf)
 {
   BPFtrace bpftrace;
-  bpftrace.parse_btf({});
   EXPECT_FALSE(bpftrace.has_btf_data());
 }
 
-TEST(bpftrace, add_probes_rawtracepoint)
+TEST_F(bpftrace_btf, add_probes_rawtracepoint)
 {
-  StrictMock<MockBPFtrace> bpftrace;
-  parse_probe("rawtracepoint:sched_switch {}", bpftrace);
+  auto bpftrace = get_mock_bpftrace();
+  parse_probe("rawtracepoint:event_rt {}", *bpftrace);
 
-  ASSERT_EQ(1U, bpftrace.get_probes().size());
-  ASSERT_EQ(0U, bpftrace.get_special_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
+  ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 
-  std::string probe_orig_name = "rawtracepoint:sched_switch";
-  check_rawtracepoint(bpftrace.get_probes().at(0),
-                      "sched_switch",
-                      probe_orig_name);
+  std::string probe_orig_name = "rawtracepoint:*:event_rt";
+  auto probe = bpftrace->get_probes().at(0);
+  EXPECT_EQ(ProbeType::rawtracepoint, probe.type);
+  EXPECT_EQ("event_rt", probe.attach_point);
+  EXPECT_EQ("rawtracepoint:*:event_rt", probe.orig_name);
+  EXPECT_EQ("rawtracepoint:vmlinux:event_rt", probe.name);
 }
 
-TEST(bpftrace, add_probes_rawtracepoint_wildcard)
+TEST_F(bpftrace_btf, add_probes_rawtracepoint_wildcard)
 {
-  auto bpftrace = get_strict_mock_bpftrace();
-  EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_symbols_from_file(tracefs::available_events()))
-      .Times(1);
+  auto bpftrace = get_mock_bpftrace();
+  parse_probe(("rawtracepoint:event_* {}"), *bpftrace);
 
-  parse_probe(("rawtracepoint:sched_* {}"), *bpftrace);
-
-  ASSERT_EQ(3U, bpftrace->get_probes().size());
+  ASSERT_EQ(1U, bpftrace->get_probes().size());
   ASSERT_EQ(0U, bpftrace->get_special_probes().size());
 }
 
-TEST(bpftrace, add_probes_rawtracepoint_wildcard_no_matches)
+TEST_F(bpftrace_btf, add_probes_rawtracepoint_wildcard_no_matches)
 {
-  auto bpftrace = get_strict_mock_bpftrace();
-  EXPECT_CALL(*bpftrace->mock_probe_matcher,
-              get_symbols_from_file(tracefs::available_events()))
-      .Times(1);
-
+  auto bpftrace = get_mock_bpftrace();
   parse_probe("rawtracepoint:typo_* {}", *bpftrace);
 
   ASSERT_EQ(0U, bpftrace->get_probes().size());
   ASSERT_EQ(0U, bpftrace->get_special_probes().size());
+}
+
+TEST(bpftrace, resolve_timestamp)
+{
+  static const auto bootmode = static_cast<uint32_t>(TimestampMode::boot);
+  auto bpftrace = get_strict_mock_bpftrace();
+
+  // Basic sanity check
+  bpftrace->boottime_ = { .tv_sec = 3, .tv_nsec = 0 };
+  bpftrace->resources.strftime_args.emplace_back("%s.%f");
+  EXPECT_EQ(bpftrace->resolve_timestamp(bootmode, 0, 1000), "3.000001");
+
+  // Check that boottime nsecs close to 1s doesn't trigger floating-point error.
+  //
+  // Due to the peculiarities of floating-point, not _any_ set of numbers
+  // trigger the bug here. These values were discovered in the wild.
+  bpftrace->boottime_ = { .tv_sec = 1736725826, .tv_nsec = 999999985 };
+  bpftrace->resources.strftime_args.emplace_back("%s");
+  EXPECT_EQ(bpftrace->resolve_timestamp(bootmode, 1, 0), "1736725826");
+
+  // Now check that we handle rollover to a new second correctly
+  bpftrace->resources.strftime_args.emplace_back("%s.%f");
+  EXPECT_EQ(bpftrace->resolve_timestamp(bootmode, 2, 15), "1736725827.000000");
+}
+
+static std::set<std::string> list_modules(std::string_view ap)
+{
+  ast::ASTContext ast("stdin", ap.data());
+  auto bpftrace = get_mock_bpftrace();
+
+  auto ok = ast::PassManager()
+                .put(ast)
+                .put(static_cast<BPFtrace &>(*bpftrace))
+                .add(CreateParsePass())
+                .add(ast::CreateParseAttachpointsPass())
+                .run();
+  EXPECT_TRUE(ok && ast.diagnostics().ok());
+
+  return bpftrace->list_modules(ast);
+}
+
+// Test modules are extracted when module is not explicit in attachpoint
+TEST(bpftrace, list_modules_kprobe_implicit)
+{
+  auto modules = list_modules("k:queued_spin_lock_slowpath{},kr:func_in_mod{}");
+  EXPECT_EQ(modules.size(), 3);
+  EXPECT_THAT(modules, Contains("vmlinux"));
+  EXPECT_THAT(modules, Contains("kernel_mod"));
+  EXPECT_THAT(modules, Contains("other_kernel_mod"));
+}
+
+// Inverse of above
+TEST(bpftrace, list_modules_kprobe_explicit)
+{
+  auto modules = list_modules(
+      "k:vmlinux:queued_spin_lock_slowpath{},kr:kernel_mod:func_in_mod{}");
+  EXPECT_EQ(modules.size(), 2);
+  EXPECT_THAT(modules, Contains("vmlinux"));
+  EXPECT_THAT(modules, Contains("kernel_mod"));
+}
+
+// Implicit fentry/fexit is not tested b/c the mocks are currently wired
+// up in a somewhat rigid way. The mocked data source uses "vmlinux" module
+// but another mock forces "mock_vmlinux" module. Anyone reading this comment
+// is welcome to try it out again (in case it's been fixed in interim) or do
+// a proper fix.
+
+TEST_F(bpftrace_btf, list_modules_fentry_explicit)
+{
+  auto modules = list_modules("fentry:vmlinux:func_1{},fexit:vmlinux:func_2{}");
+  EXPECT_EQ(modules.size(), 1);
+  EXPECT_THAT(modules, Contains("vmlinux"));
+}
+
+TEST_F(bpftrace_btf, list_modules_rawtracepoint_implicit)
+{
+  auto modules = list_modules("rawtracepoint:event_rt{}");
+  EXPECT_EQ(modules.size(), 1);
+  EXPECT_THAT(modules, Contains("vmlinux"));
+}
+
+TEST_F(bpftrace_btf, list_modules_rawtracepoint_explicit)
+{
+  auto modules = list_modules("rawtracepoint:vmlinux:event_rt{}");
+  EXPECT_EQ(modules.size(), 1);
+  EXPECT_THAT(modules, Contains("vmlinux"));
+}
+
+TEST(bpftrace, print_basic_map)
+{
+  struct TestCase {
+    std::string name;
+    uint32_t top;
+    uint32_t div;
+    std::string expected_output;
+  };
+
+  auto keys = std::vector<uint64_t>{ 1, 3, 5, 7, 9 };
+  auto values = std::vector<uint64_t>{ 5, 10, 4, 11, 7 };
+  auto returned_kvs = generate_kv_pairs(keys, values);
+  auto map_info = MapInfo{
+    .key_type = CreateInt64(),
+    .value_type = CreateInt64(),
+    .detail = std::monostate{},
+  };
+
+  std::vector<TestCase> test_cases = {
+    { .name = "basic_map_1",
+      .top = 3,
+      .div = 0,
+      .expected_output = R"(basic_map_1[9]: 7
+basic_map_1[3]: 10
+basic_map_1[7]: 11
+)" },
+    { .name = "basic_map_2",
+      .top = 0,
+      .div = 0,
+
+      .expected_output = R"(basic_map_2[5]: 4
+basic_map_2[1]: 5
+basic_map_2[9]: 7
+basic_map_2[3]: 10
+basic_map_2[7]: 11
+)" },
+    { .name = "basic_map_3",
+      .top = 0,
+      .div = 2,
+      .expected_output = R"(basic_map_3[5]: 2
+basic_map_3[1]: 2
+basic_map_3[9]: 3
+basic_map_3[3]: 5
+basic_map_3[7]: 5
+)" },
+    { .name = "basic_map_4",
+      .top = 3,
+      .div = 2,
+      .expected_output = R"(basic_map_4[9]: 3
+basic_map_4[3]: 5
+basic_map_4[7]: 5
+)" },
+  };
+
+  for (const auto &tc : test_cases) {
+    CDefinitions no_c_defs;
+    std::stringstream out;
+    TextOutput output(no_c_defs, out);
+    auto bpftrace = get_mock_bpftrace();
+    auto mock_map = std::make_unique<MockBpfMap>(libbpf::BPF_MAP_TYPE_HASH,
+                                                 tc.name);
+    EXPECT_CALL(*mock_map, collect_elements(testing::_))
+        .WillOnce(testing::Return(returned_kvs));
+
+    bpftrace->resources.maps_info[tc.name] = map_info;
+    bpftrace->print_map(output, *mock_map, tc.top, tc.div);
+    EXPECT_EQ(out.str(), tc.expected_output);
+  }
+}
+
+TEST(bpftrace, print_max_map)
+{
+  struct TestCase {
+    std::string name;
+    uint32_t top;
+    uint32_t div;
+    std::string expected_output;
+  };
+
+  auto keys = std::vector<uint64_t>{ 1, 2, 3 };
+  auto values = std::vector<std::vector<uint8_t>>{
+    generate_percpu_data({ { 5, true }, { 8, true }, { 3, true } }),
+    generate_percpu_data({ { 15, false }, { 0, false }, { 12, true } }),
+    generate_percpu_data({ { 100, false }, { 80, false }, { 20, true } }),
+  };
+
+  auto returned_kvs = generate_kv_pairs(keys, values);
+
+  auto map_info = MapInfo{ .key_type = CreateInt64(),
+                           .value_type = CreateMax(false),
+                           .detail = std::monostate{} };
+
+  std::vector<TestCase> test_cases = {
+    { .name = "max_map_1",
+      .top = 0,
+      .div = 0,
+      .expected_output = R"(max_map_1[1]: 8
+max_map_1[2]: 12
+max_map_1[3]: 20
+)" },
+    { .name = "max_map_2",
+      .top = 2,
+      .div = 0,
+      .expected_output = R"(max_map_2[2]: 12
+max_map_2[3]: 20
+)" },
+    { .name = "max_map_3",
+      .top = 0,
+      .div = 2,
+      .expected_output = R"(max_map_3[1]: 4
+max_map_3[2]: 6
+max_map_3[3]: 10
+)" },
+    { .name = "max_map_4",
+      .top = 2,
+      .div = 2,
+      .expected_output = R"(max_map_4[2]: 6
+max_map_4[3]: 10
+)" },
+  };
+
+  for (const auto &tc : test_cases) {
+    CDefinitions no_c_defs;
+    std::stringstream out;
+    TextOutput output(no_c_defs, out);
+    auto bpftrace = get_mock_bpftrace();
+
+    bpftrace->ncpus_ = 3;
+    auto mock_map = std::make_unique<MockBpfMap>(
+        libbpf::BPF_MAP_TYPE_PERCPU_HASH, tc.name);
+    EXPECT_CALL(*mock_map, collect_elements(testing::_))
+        .WillOnce(testing::Return(returned_kvs));
+
+    bpftrace->resources.maps_info[tc.name] = map_info;
+    bpftrace->print_map(output, *mock_map, tc.top, tc.div);
+    EXPECT_EQ(out.str(), tc.expected_output);
+  }
+}
+
+TEST(bpftrace, print_avg_map)
+{
+  struct TestCase {
+    std::string name;
+    uint32_t top;
+    uint32_t div;
+    std::string expected_output;
+  };
+
+  auto keys = std::vector<uint64_t>{ 1, 2, 3 };
+  auto values = std::vector<std::vector<uint8_t>>{
+    generate_percpu_data({ { 5, true }, { 8, true }, { 3, true } }),
+    generate_percpu_data({ { 16, true }, { 0, false }, { 12, true } }),
+    generate_percpu_data({ { 100, false }, { 80, false }, { 20, true } }),
+  };
+
+  auto returned_kvs = generate_kv_pairs(keys, values);
+
+  auto map_info = MapInfo{ .key_type = CreateInt64(),
+                           .value_type = CreateAvg(false),
+                           .detail = std::monostate{} };
+
+  std::vector<TestCase> test_cases = {
+    { .name = "avg_map_1",
+      .top = 0,
+      .div = 0,
+      .expected_output = R"(avg_map_1[1]: 5
+avg_map_1[2]: 14
+avg_map_1[3]: 200
+
+)" },
+    { .name = "avg_map_2",
+      .top = 2,
+      .div = 0,
+      .expected_output = R"(avg_map_2[2]: 14
+avg_map_2[3]: 200
+
+)" },
+    { .name = "avg_map_3",
+      .top = 0,
+      .div = 2,
+      .expected_output = R"(avg_map_3[1]: 2
+avg_map_3[2]: 7
+avg_map_3[3]: 100
+
+)" },
+    { .name = "avg_map_4",
+      .top = 2,
+      .div = 2,
+      .expected_output = R"(avg_map_4[2]: 7
+avg_map_4[3]: 100
+
+)" },
+  };
+
+  for (const auto &tc : test_cases) {
+    CDefinitions no_c_defs;
+    std::stringstream out;
+    TextOutput output(no_c_defs, out);
+    auto bpftrace = get_mock_bpftrace();
+
+    bpftrace->ncpus_ = 3;
+    auto mock_map = std::make_unique<MockBpfMap>(
+        libbpf::BPF_MAP_TYPE_PERCPU_HASH, tc.name);
+    EXPECT_CALL(*mock_map, collect_elements(testing::_))
+        .WillOnce(testing::Return(returned_kvs));
+
+    bpftrace->resources.maps_info[tc.name] = map_info;
+    bpftrace->print_map(output, *mock_map, tc.top, tc.div);
+
+    EXPECT_EQ(out.str(), tc.expected_output);
+  }
+}
+
+TEST(bpftrace, print_map_sort_by_key)
+{
+  struct TestCase {
+    std::string name;
+    uint32_t top;
+    uint32_t div;
+    std::string expected_output;
+  };
+
+  std::vector<uint64_t> keys{ 3, 1, 2 };
+  std::vector<std::string> values{ "hello", "world", "bpftrace" };
+  auto returned_kvs = generate_kv_pairs(keys, values);
+
+  auto map_info = MapInfo{ .key_type = CreateInt64(),
+                           .value_type = CreateString(32),
+                           .detail = std::monostate{} };
+
+  std::vector<TestCase> test_cases = {
+    { .name = "string_map_1",
+      .top = 0,
+      .div = 0,
+      .expected_output = R"(string_map_1[1]: world
+string_map_1[2]: bpftrace
+string_map_1[3]: hello
+)" },
+    { .name = "string_map_2",
+      .top = 2,
+      .div = 0,
+      .expected_output = R"(string_map_2[2]: bpftrace
+string_map_2[3]: hello
+)" },
+    { .name = "string_map_3",
+      .top = 0,
+      .div = 2,
+      .expected_output = R"(string_map_3[1]: world
+string_map_3[2]: bpftrace
+string_map_3[3]: hello
+)" },
+    { .name = "string_map_4",
+      .top = 2,
+      .div = 2,
+      .expected_output = R"(string_map_4[2]: bpftrace
+string_map_4[3]: hello
+)" },
+  };
+
+  for (const auto &tc : test_cases) {
+    CDefinitions no_c_defs;
+    std::stringstream out;
+    TextOutput output(no_c_defs, out);
+    auto bpftrace = get_mock_bpftrace();
+
+    auto mock_map = std::make_unique<MockBpfMap>(libbpf::BPF_MAP_TYPE_HASH,
+                                                 tc.name);
+    EXPECT_CALL(*mock_map, collect_elements(testing::_))
+        .WillOnce(testing::Return(returned_kvs));
+
+    bpftrace->resources.maps_info[tc.name] = map_info;
+    bpftrace->print_map(output, *mock_map, tc.top, tc.div);
+
+    EXPECT_EQ(out.str(), tc.expected_output);
+  }
+}
+
+TEST(bpftrace, print_lhist_map)
+{
+  struct TestCase {
+    std::string name;
+    uint32_t top;
+    uint32_t div;
+    std::string expected_output;
+  };
+
+  HistogramMap values_by_key = {
+    { { 0 }, { 0, 10, 20, 30, 40, 50, 0 } },
+    { { 1 }, { 0, 2, 2, 2, 2, 2, 0 } },
+  };
+
+  auto map_info = MapInfo{
+    .key_type = CreateInt64(),
+    .value_type = CreateLhist(),
+    .detail = LinearHistogramArgs{ .min = 0, .max = 5 * 1024, .step = 1024 },
+    .id = {},
+    .is_scalar = true
+  };
+
+  std::vector<TestCase> test_cases = {
+    // Test case 1: print all buckets
+    { .name = "lhist_map_1",
+      .top = 0,
+      .div = 0,
+      .expected_output = R"(lhist_map_1:
+[0, 1K)                2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1K, 2K)               2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[2K, 3K)               2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[3K, 4K)               2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[4K, 5K)               2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+lhist_map_1:
+[0, 1K)               10 |@@@@@@@@@@                                          |
+[1K, 2K)              20 |@@@@@@@@@@@@@@@@@@@@                                |
+[2K, 3K)              30 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                     |
+[3K, 4K)              40 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[4K, 5K)              50 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+)" },
+    // Test case 2: print top 1 bucket
+    { .name = "lhist_map_2",
+      .top = 1,
+      .div = 0,
+      .expected_output = R"(lhist_map_2:
+[0, 1K)               10 |@@@@@@@@@@                                          |
+[1K, 2K)              20 |@@@@@@@@@@@@@@@@@@@@                                |
+[2K, 3K)              30 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                     |
+[3K, 4K)              40 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[4K, 5K)              50 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+)" },
+    // Test case 3: print all buckets with div = 2
+    // Note: div parameter has no effect on linear histograms.
+    // Therefore, this `expected_output` is the same as `lhist_map_1`.
+    { .name = "lhist_map_3",
+      .top = 0,
+      .div = 2,
+      .expected_output = R"(lhist_map_3:
+[0, 1K)                2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1K, 2K)               2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[2K, 3K)               2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[3K, 4K)               2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[4K, 5K)               2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+lhist_map_3:
+[0, 1K)               10 |@@@@@@@@@@                                          |
+[1K, 2K)              20 |@@@@@@@@@@@@@@@@@@@@                                |
+[2K, 3K)              30 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                     |
+[3K, 4K)              40 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[4K, 5K)              50 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+)" },
+  };
+
+  for (const auto &tc : test_cases) {
+    CDefinitions no_c_defs;
+    std::stringstream out;
+    TextOutput output(no_c_defs, out);
+    auto bpftrace = get_mock_bpftrace();
+
+    auto mock_map = std::make_unique<MockBpfMap>(libbpf::BPF_MAP_TYPE_HASH,
+                                                 tc.name);
+    EXPECT_CALL(*mock_map, collect_histogram_data(testing::_, testing::_))
+        .WillOnce(testing::Return(values_by_key));
+
+    bpftrace->resources.maps_info[tc.name] = map_info;
+    bpftrace->print_map(output, *mock_map, tc.top, tc.div);
+
+    EXPECT_EQ(out.str(), tc.expected_output);
+  }
+}
+
+TEST(bpftrace, print_hist_map)
+{
+  struct TestCase {
+    std::string name;
+    uint32_t top;
+    uint32_t div;
+    std::string expected_output;
+  };
+
+  HistogramMap values_by_key = {
+    { { 0 }, { 0, 10, 20, 30, 40, 50, 0 } },
+    { { 1 }, { 0, 2, 2, 2, 2, 2, 0 } },
+  };
+
+  auto map_info = MapInfo{ .key_type = CreateInt64(),
+                           .value_type = CreateHist(),
+                           .detail = HistogramArgs{ .bits = 10 },
+                           .id = {},
+                           .is_scalar = true };
+
+  std::vector<TestCase> test_cases = {
+    // Test case 1: print all buckets
+    { .name = "hist_map_1",
+      .top = 0,
+      .div = 0,
+      .expected_output = R"(hist_map_1:
+[0]                    2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1]                    2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[2]                    2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[3]                    2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[4]                    2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+hist_map_1:
+[0]                   10 |@@@@@@@@@@                                          |
+[1]                   20 |@@@@@@@@@@@@@@@@@@@@                                |
+[2]                   30 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                     |
+[3]                   40 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[4]                   50 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+)" },
+    // Test case 2: print top 1 bucket
+    { .name = "hist_map_2",
+      .top = 1,
+      .div = 0,
+      .expected_output = R"(hist_map_2:
+[0]                   10 |@@@@@@@@@@                                          |
+[1]                   20 |@@@@@@@@@@@@@@@@@@@@                                |
+[2]                   30 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                     |
+[3]                   40 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[4]                   50 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+)" },
+    // Test case 3: print all buckets with div = 2
+    { .name = "hist_map_3",
+      .top = 0,
+      .div = 2,
+      .expected_output = R"(hist_map_3:
+[0]                    1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[1]                    1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[2]                    1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[3]                    1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[4]                    1 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+hist_map_3:
+[0]                    5 |@@@@@@@@@@                                          |
+[1]                   10 |@@@@@@@@@@@@@@@@@@@@                                |
+[2]                   15 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                     |
+[3]                   20 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[4]                   25 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+)" },
+    // Test case 4: print top 1 bucket with div = 2
+    { .name = "hist_map_4",
+      .top = 1,
+      .div = 2,
+      .expected_output = R"(hist_map_4:
+[0]                    5 |@@@@@@@@@@                                          |
+[1]                   10 |@@@@@@@@@@@@@@@@@@@@                                |
+[2]                   15 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                     |
+[3]                   20 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
+[4]                   25 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+
+)" },
+  };
+
+  for (const auto &tc : test_cases) {
+    CDefinitions no_c_defs;
+    std::stringstream out;
+    TextOutput output(no_c_defs, out);
+    auto bpftrace = get_mock_bpftrace();
+
+    auto mock_map = std::make_unique<MockBpfMap>(libbpf::BPF_MAP_TYPE_HASH,
+                                                 tc.name);
+    EXPECT_CALL(*mock_map, collect_histogram_data(testing::_, testing::_))
+        .WillOnce(testing::Return(values_by_key));
+
+    bpftrace->resources.maps_info[tc.name] = map_info;
+    bpftrace->print_map(output, *mock_map, tc.top, tc.div);
+
+    EXPECT_EQ(out.str(), tc.expected_output);
+  }
 }
 
 } // namespace bpftrace::test::bpftrace

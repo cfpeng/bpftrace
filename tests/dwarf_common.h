@@ -7,24 +7,21 @@
 #include <fstream>
 #include <stdexcept>
 
-#include "data/dwarf_data.h"
+namespace {
+#include "data/data_source_dwarf.h"
+} // namespace
 
 class test_dwarf : public ::testing::Test {
 protected:
   static void SetUpTestSuite()
   {
     std::ofstream file(bin_, std::ios::trunc | std::ios::binary);
-    file.write(reinterpret_cast<const char *>(dwarf_data), dwarf_data_len);
+    file.write(reinterpret_cast<const char *>(dwarf_data), sizeof(dwarf_data));
     file.close();
-
-    if (!file)
-      throw std::runtime_error("Failed to create dwarf data file");
+    ASSERT_TRUE(file);
 
     // Give executable permissions to everyone
-    int err = chmod(bin_, 0755);
-    if (err)
-      throw std::runtime_error("Failed to chmod dwarf data file: " +
-                               std::to_string(err));
+    ASSERT_EQ(::chmod(bin_, 0755), 0);
   }
 
   static void TearDownTestSuite()
@@ -33,5 +30,4 @@ protected:
   }
 
   static constexpr const char *bin_ = "/tmp/bpftrace-test-dwarf-data";
-  static constexpr const char *cxx_bin_ = dwarf_data_cxx_path;
 };

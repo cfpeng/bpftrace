@@ -1,19 +1,45 @@
 #pragma once
 
-#include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 
 #include <bpf/libbpf.h>
-#include <linux/bpf.h>
+
+#include "map_info.h"
 
 namespace libbpf {
 #include "libbpf/bpf.h"
 } // namespace libbpf
 
-#include "container/cstring_view.h"
-
 namespace bpftrace {
+
+class BpfMapError : public ErrorInfo<BpfMapError> {
+public:
+  static char ID;
+  std::string name_;
+  std::string op_;
+  int errno_;
+
+  BpfMapError(std::string name_, std::string op_, int errno_)
+      : name_(std::move(name_)), op_(std::move(op_)), errno_(errno_)
+  {
+  }
+
+  void log(llvm::raw_ostream &OS) const override
+  {
+    OS << "BPF map operation " << op_ << " failed: " << std::strerror(-errno_)
+       << " [map = " << name_ << "]";
+  }
+};
+
+using KeyType = std::vector<uint8_t>;
+using KeyVec = std::vector<KeyType>;
+using ValueType = std::vector<uint8_t>;
+using MapElements = std::vector<std::pair<KeyType, ValueType>>;
+using BucketUnit = uint64_t;
+using BucketType = std::vector<BucketUnit>;
+using HistogramMap = std::map<KeyType, BucketType>;
 
 class BpfMap {
 public:
@@ -28,12 +54,12 @@ public:
   }
 
   BpfMap(libbpf::bpf_map_type type,
-         cstring_view name,
+         std::string name,
          uint32_t key_size,
          uint32_t value_size,
          uint32_t max_entries)
       : type_(type),
-        name_(name),
+        name_(std::move(name)),
         key_size_(key_size),
         value_size_(value_size),
         max_entries_(max_entries)
@@ -42,29 +68,33 @@ public:
 
   int fd() const;
   libbpf::bpf_map_type type() const;
-  cstring_view bpf_name() const;
+  const std::string &bpf_name() const;
   std::string name() const;
-  uint32_t key_size() const;
-  uint32_t value_size() const;
   uint32_t max_entries() const;
 
   bool is_stack_map() const;
   bool is_per_cpu_type() const;
-  bool is_clearable() const;
   bool is_printable() const;
+
+  KeyVec collect_keys() const;
+  virtual Result<MapElements> collect_elements(int nvalues) const;
+  virtual Result<HistogramMap> collect_histogram_data(const MapInfo &map_info,
+                                                      int nvalues) const;
+  Result<> zero_out(int nvalues) const;
+  Result<> clear(int nvalues) const;
+  Result<> update_elem(const void *key, const void *value) const;
+  Result<> lookup_elem(const void *key, void *value) const;
 
 private:
   struct bpf_map *bpf_map_;
   libbpf::bpf_map_type type_;
-  cstring_view name_;
+  std::string name_;
   uint32_t key_size_;
   uint32_t value_size_;
   uint32_t max_entries_;
 };
 
-/**
-   Internal map types
-*/
+// Internal map types
 enum class MapType {
   // Also update to_string
   PerfEvent,
@@ -90,7 +120,7 @@ inline std::string bpf_map_name(std::string_view bpftrace_map_name)
 inline std::string bpftrace_map_name(std::string_view bpf_map_name)
 {
   auto name = std::string{ bpf_map_name };
-  if (name.compare(0, 3, "AT_") == 0)
+  if (name.starts_with("AT_"))
     name = "@" + name.substr(3);
   return name;
 }
@@ -100,5 +130,14 @@ inline bool is_bpf_map_clearable(libbpf::bpf_map_type map_type)
   return map_type != libbpf::BPF_MAP_TYPE_ARRAY &&
          map_type != libbpf::BPF_MAP_TYPE_PERCPU_ARRAY;
 }
+
+libbpf::bpf_map_type get_bpf_map_type(const SizedType &val_type, bool scalar);
+std::optional<libbpf::bpf_map_type> get_bpf_map_type(const std::string &name);
+std::string get_bpf_map_type_str(libbpf::bpf_map_type map_type);
+void add_bpf_map_types_hint(std::stringstream &hint);
+bool is_array_map(const SizedType &val_type, bool scalar);
+bool bpf_map_types_compatible(const SizedType &val_type,
+                              bool scalar,
+                              libbpf::bpf_map_type kind);
 
 } // namespace bpftrace

@@ -1,309 +1,31 @@
-#include "ast/ast.h"
-
 #include <algorithm>
+#include <utility>
 
-#include "ast/visitors.h"
+#include "ast/ast.h"
+#include "ast/context.h"
 #include "log.h"
+#include "util/format.h"
 
 namespace bpftrace::ast {
 
-#define MAKE_ACCEPT(Ty)                                                        \
-  void Ty::accept(VisitorBase &v)                                              \
-  {                                                                            \
-    v.visit(*this);                                                            \
-  };
-
-MAKE_ACCEPT(Integer)
-MAKE_ACCEPT(String)
-MAKE_ACCEPT(StackMode)
-MAKE_ACCEPT(Builtin)
-MAKE_ACCEPT(Identifier)
-MAKE_ACCEPT(PositionalParameter)
-MAKE_ACCEPT(Call)
-MAKE_ACCEPT(Sizeof)
-MAKE_ACCEPT(Offsetof)
-MAKE_ACCEPT(Map)
-MAKE_ACCEPT(Variable)
-MAKE_ACCEPT(Binop)
-MAKE_ACCEPT(Unop)
-MAKE_ACCEPT(Ternary)
-MAKE_ACCEPT(FieldAccess)
-MAKE_ACCEPT(ArrayAccess)
-MAKE_ACCEPT(Cast)
-MAKE_ACCEPT(Tuple)
-MAKE_ACCEPT(ExprStatement)
-MAKE_ACCEPT(AssignMapStatement)
-MAKE_ACCEPT(AssignVarStatement)
-MAKE_ACCEPT(AssignConfigVarStatement)
-MAKE_ACCEPT(VarDeclStatement)
-MAKE_ACCEPT(Predicate)
-MAKE_ACCEPT(AttachPoint)
-MAKE_ACCEPT(If)
-MAKE_ACCEPT(Unroll)
-MAKE_ACCEPT(While)
-MAKE_ACCEPT(For)
-MAKE_ACCEPT(Config)
-MAKE_ACCEPT(Block)
-MAKE_ACCEPT(Jump)
-MAKE_ACCEPT(Probe)
-MAKE_ACCEPT(SubprogArg)
-MAKE_ACCEPT(Subprog)
-MAKE_ACCEPT(Program)
-
-#undef MAKE_ACCEPT
-
-Integer::Integer(int64_t n, location loc, bool is_negative)
-    : Expression(loc), n(n), is_negative(is_negative)
+Diagnostic &Node::addError() const
 {
-  is_literal = true;
+  return state_.diagnostics_->addError(loc);
 }
 
-String::String(const std::string &str, location loc) : Expression(loc), str(str)
+Diagnostic &Node::addWarning() const
 {
-  is_literal = true;
+  return state_.diagnostics_->addWarning(loc);
 }
 
-StackMode::StackMode(const std::string &mode, location loc)
-    : Expression(loc), mode(mode)
+const SizedType &Expression::type() const
 {
-  is_literal = true;
+  return std::visit(
+      [](const auto *expr) -> const SizedType & { return expr->type(); },
+      value);
 }
 
-Builtin::Builtin(const std::string &ident, location loc)
-    : Expression(loc), ident(is_deprecated(ident))
-{
-}
-
-Identifier::Identifier(const std::string &ident, location loc)
-    : Expression(loc), ident(ident)
-{
-}
-
-PositionalParameter::PositionalParameter(PositionalParameterType ptype,
-                                         long n,
-                                         location loc)
-    : Expression(loc), ptype(ptype), n(n)
-{
-  is_literal = true;
-}
-
-Call::Call(const std::string &func, location loc)
-    : Expression(loc), func(is_deprecated(func))
-{
-}
-
-Call::Call(const std::string &func, ExpressionList &&vargs, location loc)
-    : Expression(loc), func(is_deprecated(func)), vargs(std::move(vargs))
-{
-}
-
-Sizeof::Sizeof(SizedType type, location loc) : Expression(loc), argtype(type)
-{
-}
-
-Sizeof::Sizeof(Expression *expr, location loc) : Expression(loc), expr(expr)
-{
-}
-
-Offsetof::Offsetof(SizedType record, std::string &field, location loc)
-    : Expression(loc), record(record), field(field)
-{
-}
-
-Offsetof::Offsetof(Expression *expr, std::string &field, location loc)
-    : Expression(loc), expr(expr), field(field)
-{
-}
-
-Map::Map(const std::string &ident, location loc) : Expression(loc), ident(ident)
-{
-  is_map = true;
-}
-
-Map::Map(const std::string &ident, Expression &expr, location loc)
-    : Expression(loc), ident(ident), key_expr(&expr)
-{
-  is_map = true;
-  key_expr->key_for_map = this;
-}
-
-Variable::Variable(const std::string &ident, location loc)
-    : Expression(loc), ident(ident)
-{
-  is_variable = true;
-}
-
-Binop::Binop(Expression *left, Operator op, Expression *right, location loc)
-    : Expression(loc), left(left), right(right), op(op)
-{
-}
-
-Unop::Unop(Operator op, Expression *expr, location loc)
-    : Expression(loc), expr(expr), op(op), is_post_op(false)
-{
-}
-
-Unop::Unop(Operator op, Expression *expr, bool is_post_op, location loc)
-    : Expression(loc), expr(expr), op(op), is_post_op(is_post_op)
-{
-}
-
-Ternary::Ternary(Expression *cond,
-                 Expression *left,
-                 Expression *right,
-                 location loc)
-    : Expression(loc), cond(cond), left(left), right(right)
-{
-}
-
-FieldAccess::FieldAccess(Expression *expr,
-                         const std::string &field,
-                         location loc)
-    : Expression(loc), expr(expr), field(field)
-{
-}
-
-FieldAccess::FieldAccess(Expression *expr, ssize_t index, location loc)
-    : Expression(loc), expr(expr), index(index)
-{
-}
-
-ArrayAccess::ArrayAccess(Expression *expr, Expression *indexpr, location loc)
-    : Expression(loc), expr(expr), indexpr(indexpr)
-{
-}
-
-Cast::Cast(SizedType cast_type, Expression *expr, location loc)
-    : Expression(loc), expr(expr)
-{
-  type = cast_type;
-}
-
-Tuple::Tuple(ExpressionList &&elems, location loc)
-    : Expression(loc), elems(std::move(elems))
-{
-}
-
-ExprStatement::ExprStatement(Expression *expr, location loc)
-    : Statement(loc), expr(expr)
-{
-}
-
-AssignMapStatement::AssignMapStatement(Map *map, Expression *expr, location loc)
-    : Statement(loc), map(map), expr(expr)
-{
-  expr->map = map;
-};
-
-AssignVarStatement::AssignVarStatement(Variable *var,
-                                       Expression *expr,
-                                       location loc)
-    : Statement(loc), var(var), expr(expr)
-{
-  expr->var = var;
-}
-
-AssignVarStatement::AssignVarStatement(VarDeclStatement *var_decl_stmt,
-                                       Expression *expr,
-                                       location loc)
-    : Statement(loc),
-      var_decl_stmt(var_decl_stmt),
-      var(var_decl_stmt->var),
-      expr(expr)
-{
-  expr->var = var;
-}
-
-AssignConfigVarStatement::AssignConfigVarStatement(
-    const std::string &config_var,
-    Expression *expr,
-    location loc)
-    : Statement(loc), config_var(config_var), expr(expr)
-{
-}
-
-VarDeclStatement::VarDeclStatement(Variable *var, SizedType type, location loc)
-    : Statement(loc), var(var), set_type(true)
-{
-  var->type = std::move(type);
-}
-
-VarDeclStatement::VarDeclStatement(Variable *var, location loc)
-    : Statement(loc), var(var)
-{
-  var->type = CreateNone();
-}
-
-Predicate::Predicate(Expression *expr, location loc) : Node(loc), expr(expr)
-{
-}
-
-AttachPoint::AttachPoint(const std::string &raw_input, location loc)
-    : Node(loc), raw_input(raw_input)
-{
-}
-
-Block::Block(StatementList &&stmts) : stmts(std::move(stmts))
-{
-}
-
-If::If(Expression *cond, StatementList &&stmts)
-    : cond(cond), if_block(Block(std::move(stmts))), else_block(Block({}))
-{
-}
-
-If::If(Expression *cond, StatementList &&stmts, StatementList &&else_stmts)
-    : cond(cond),
-      if_block(Block(std::move(stmts))),
-      else_block(Block(std::move(else_stmts)))
-{
-}
-
-Unroll::Unroll(Expression *expr, StatementList &&stmts, location loc)
-    : Statement(loc), expr(expr), block(std::move(stmts))
-{
-}
-
-Probe::Probe(AttachPointList &&attach_points,
-             Predicate *pred,
-             StatementList &&stmts)
-    : attach_points(std::move(attach_points)),
-      pred(pred),
-      block(std::move(stmts))
-{
-}
-
-SubprogArg::SubprogArg(std::string name, SizedType type)
-    : type(std::move(type)), name_(std::move(name))
-{
-}
-
-std::string SubprogArg::name() const
-{
-  return name_;
-}
-
-Subprog::Subprog(std::string name,
-                 SizedType return_type,
-                 SubprogArgList &&args,
-                 StatementList &&stmts)
-    : args(std::move(args)),
-      return_type(std::move(return_type)),
-      stmts(std::move(stmts)),
-      name_(std::move(name))
-{
-}
-
-Program::Program(const std::string &c_definitions,
-                 Config *config,
-                 SubprogList &&functions,
-                 ProbeList &&probes)
-    : c_definitions(c_definitions),
-      config(config),
-      functions(std::move(functions)),
-      probes(std::move(probes))
-{
-}
+static constexpr std::string_view ENUM = "enum ";
 
 std::string opstr(const Jump &jump)
 {
@@ -393,43 +115,63 @@ std::string opstr(const Unop &unop)
   return {}; // unreached
 }
 
-AttachPoint AttachPoint::create_expansion_copy(const std::string &match) const
+AttachPoint &AttachPoint::create_expansion_copy(ASTContext &ctx,
+                                                const std::string &match) const
 {
-  AttachPoint ap = *this; // copy here
+  // Create a new node with the same raw tracepoint. We initialize all the
+  // information about the attach point, and then override/reset values
+  // depending on the specific probe type.
+  auto &ap = *ctx.make_node<AttachPoint>(raw_input,
+                                         ignore_invalid,
+                                         Location(loc));
+  ap.index_ = index_;
+  ap.provider = provider;
+  ap.target = target;
+  ap.lang = lang;
+  ap.ns = ns;
+  ap.func = func;
+  ap.pin = pin;
+  ap.usdt = usdt;
+  ap.freq = freq;
+  ap.len = len;
+  ap.mode = mode;
+  ap.async = async;
+  ap.expansion = expansion;
+  ap.address = address;
+  ap.func_offset = func_offset;
+
   switch (probetype(ap.provider)) {
     case ProbeType::kprobe:
     case ProbeType::kretprobe:
       ap.func = match;
       if (match.find(":") != std::string::npos)
-        ap.target = erase_prefix(ap.func);
+        ap.target = util::erase_prefix(ap.func);
       break;
     case ProbeType::uprobe:
     case ProbeType::uretprobe:
     case ProbeType::fentry:
     case ProbeType::fexit:
     case ProbeType::tracepoint:
-      // Tracepoint, uprobe, and fentry/fexit probes specify both a target
-      // (category for tracepoints, binary for uprobes, and kernel module
-      // for fentry/fexit and a function name.
+    case ProbeType::rawtracepoint:
+      // Tracepoint, raw tracepoint, uprobe, and fentry/fexit probes specify
+      // both a target (category for tracepoints, binary for uprobes, and
+      // kernel module for fentry/fexit and a function name.
       ap.func = match;
-      ap.target = erase_prefix(ap.func);
+      ap.target = util::erase_prefix(ap.func);
       break;
     case ProbeType::usdt:
       // USDT probes specify a target binary path, a provider, and a function
       // name.
       ap.func = match;
-      ap.target = erase_prefix(ap.func);
-      ap.ns = erase_prefix(ap.func);
+      ap.target = util::erase_prefix(ap.func);
+      ap.ns = util::erase_prefix(ap.func);
       break;
     case ProbeType::watchpoint:
     case ProbeType::asyncwatchpoint:
       // Watchpoint probes come with target prefix. Strip the target to get the
       // function
       ap.func = match;
-      erase_prefix(ap.func);
-      break;
-    case ProbeType::rawtracepoint:
-      ap.func = match;
+      util::erase_prefix(ap.func);
       break;
     case ProbeType::software:
     case ProbeType::hardware:
@@ -448,13 +190,13 @@ AttachPoint AttachPoint::create_expansion_copy(const std::string &match) const
 std::string AttachPoint::name() const
 {
   std::string n = provider;
-  if (target != "")
+  if (!target.empty())
     n += ":" + target;
-  if (lang != "")
+  if (!lang.empty())
     n += ":" + lang;
-  if (ns != "")
+  if (!ns.empty())
     n += ":" + ns;
-  if (func != "") {
+  if (!func.empty()) {
     n += ":" + func;
     if (func_offset != 0)
       n += "+" + std::to_string(func_offset);
@@ -465,7 +207,7 @@ std::string AttachPoint::name() const
     n += ":" + std::to_string(freq);
   if (len != 0)
     n += ":" + std::to_string(len);
-  if (mode.size())
+  if (!mode.empty())
     n += ":" + mode;
   return n;
 }
@@ -483,11 +225,11 @@ void AttachPoint::set_index(int index)
 std::string Probe::name() const
 {
   std::vector<std::string> ap_names;
-  std::transform(attach_points.begin(),
-                 attach_points.end(),
-                 std::back_inserter(ap_names),
-                 [](const AttachPoint *ap) { return ap->name(); });
-  return str_join(ap_names, ",");
+  std::ranges::transform(attach_points,
+
+                         std::back_inserter(ap_names),
+                         [](const AttachPoint *ap) { return ap->name(); });
+  return util::str_join(ap_names, ",");
 }
 
 std::string Probe::args_typename() const
@@ -505,26 +247,34 @@ void Probe::set_index(int index)
   index_ = index;
 }
 
-std::string Subprog::name() const
-{
-  return name_;
-}
-
 bool Probe::has_ap_of_probetype(ProbeType probe_type)
 {
-  for (auto *ap : attach_points) {
-    if (probetype(ap->provider) == probe_type)
-      return true;
-  }
-  return false;
+  return std::ranges::any_of(attach_points, [probe_type](auto *ap) {
+    return probetype(ap->provider) == probe_type;
+  });
 }
 
 SizedType ident_to_record(const std::string &ident, int pointer_level)
 {
-  SizedType result = CreateRecord(ident, std::weak_ptr<Struct>());
+  SizedType result = CreateRecord(ident);
   for (int i = 0; i < pointer_level; i++)
     result = CreatePointer(result);
   return result;
+}
+
+SizedType ident_to_sized_type(const std::string &ident)
+{
+  if (ident.starts_with(ENUM)) {
+    auto enum_name = ident.substr(ENUM.size());
+    // This is an automatic promotion to a uint64
+    // even though it's possible that highest variant value of that enum
+    // fits into a smaller int. This will also affect casts from a smaller
+    // int and cause an ERROR: Integer size mismatch.
+    // This could potentially be revisited or the cast relaxed
+    // if we check the variant values during semantic analysis.
+    return CreateEnum(64, enum_name);
+  }
+  return ident_to_record(ident);
 }
 
 } // namespace bpftrace::ast

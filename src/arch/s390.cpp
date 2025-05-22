@@ -1,18 +1,15 @@
-#include "arch.h"
-#include "utils.h"
-
-#include <algorithm>
 #include <array>
 #include <set>
 #include <vector>
+
+#include "arch.h"
 
 #define ARG_REGISTERS 5
 // For s390x, r2-r6 registers are used as function arguments, then the extra
 // arguments can be found starting at sp+160
 #define ARG0_STACK 160
 
-namespace bpftrace {
-namespace arch {
+namespace bpftrace::arch {
 
 // clang-format off
 static std::vector<std::set<std::string>> registers = {
@@ -92,10 +89,9 @@ std::string name()
   return std::string("s390x");
 }
 
-std::vector<std::string> invalid_watchpoint_modes()
+const std::unordered_set<std::string> &watchpoint_modes()
 {
-  throw FatalUserException(
-      "Watchpoints are not supported on this architecture");
+  return {}; // Not supported.
 }
 
 int get_kernel_ptr_width()
@@ -103,5 +99,4 @@ int get_kernel_ptr_width()
   return 64;
 }
 
-} // namespace arch
-} // namespace bpftrace
+} // namespace bpftrace::arch

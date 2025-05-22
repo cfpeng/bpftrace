@@ -1,11 +1,15 @@
-#include "output.h"
+#include <algorithm>
+#include <bpf/libbpf.h>
+#include <iomanip>
+#include <string>
 
 #include "ast/async_event_types.h"
 #include "bpftrace.h"
 #include "log.h"
-#include "utils.h"
-
-#include <bpf/libbpf.h>
+#include "output.h"
+#include "required_resources.h"
+#include "util/format.h"
+#include "util/stats.h"
 
 namespace libbpf {
 #define __BPF_NAME_FN(x) #x
@@ -24,7 +28,7 @@ bool is_quoted_type(const SizedType &ty)
     case Type::inet:
     case Type::kstack_t:
     case Type::ksym_t:
-    case Type::probe:
+    case Type::none:
     case Type::strerror_t:
     case Type::string:
     case Type::timestamp:
@@ -41,9 +45,7 @@ bool is_quoted_type(const SizedType &ty)
     case Type::mac_address:
     case Type::max_t:
     case Type::min_t:
-    case Type::none:
     case Type::pointer:
-    case Type::reference:
     case Type::record:
     case Type::stack_mode:
     case Type::stats_t:
@@ -113,7 +115,8 @@ std::ostream &operator<<(std::ostream &out, MessageType type)
 
 std::string TextOutput::hist_index_label(uint32_t index, uint32_t k)
 {
-  const uint32_t n = (1 << k), interval = index & (n - 1);
+  const uint32_t n = (1 << k);
+  const uint32_t interval = index & (n - 1);
   assert(index >= n);
   uint32_t power = (index >> k) - 1;
   // Choose the suffix for the largest power of 2^10
@@ -167,8 +170,7 @@ void Output::hist_prepare(const std::vector<uint64_t> &values,
         min_index = i;
       max_index = i;
     }
-    if (v > max_value)
-      max_value = v;
+    max_value = std::max(v, max_value);
   }
 }
 
@@ -190,8 +192,7 @@ void Output::lhist_prepare(const std::vector<uint64_t> &values,
     int v = values.at(i);
     if (v != 0)
       max_index = i;
-    if (v > max_value)
-      max_value = v;
+    max_value = std::max(v, max_value);
   }
 
   if (max_index == -1)
@@ -219,7 +220,9 @@ std::string Output::get_helper_error_msg(int func_id, int retcode) const
 {
   std::string msg;
   if (func_id == libbpf::BPF_FUNC_map_update_elem && retcode == -E2BIG) {
-    msg = "Map full; can't update element. Try increasing max_map_keys config";
+    msg = "Map full; can't update element. Try increasing max_map_keys config "
+          "or manually setting the max entries in a map declaration e.g. `let "
+          "@a = hash(5000)`";
   } else if (func_id == libbpf::BPF_FUNC_map_delete_elem &&
              retcode == -ENOENT) {
     msg = "Can't delete map element because it does not exist.";
@@ -244,8 +247,8 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
   uint32_t nvalues = is_per_cpu ? bpftrace.ncpus_ : 1;
   switch (type.GetTy()) {
     case Type::kstack_t: {
-      return bpftrace.get_stack(read_data<uint64_t>(value.data()),
-                                read_data<uint32_t>(value.data() + 8),
+      return bpftrace.get_stack(util::read_data<uint64_t>(value.data()),
+                                util::read_data<uint64_t>(value.data() + 8),
                                 -1,
                                 -1,
                                 false,
@@ -253,29 +256,30 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
                                 8);
     }
     case Type::ustack_t: {
-      return bpftrace.get_stack(read_data<int64_t>(value.data()),
-                                read_data<uint32_t>(value.data() + 8),
-                                read_data<int32_t>(value.data() + 12),
-                                read_data<int32_t>(value.data() + 16),
+      return bpftrace.get_stack(util::read_data<uint64_t>(value.data()),
+                                util::read_data<uint64_t>(value.data() + 8),
+                                util::read_data<int32_t>(value.data() + 16),
+                                util::read_data<int32_t>(value.data() + 20),
                                 true,
                                 type.stack_type,
                                 8);
     }
     case Type::ksym_t: {
-      return bpftrace.resolve_ksym(read_data<uint64_t>(value.data()));
+      return bpftrace.resolve_ksym(util::read_data<uint64_t>(value.data()));
     }
     case Type::usym_t: {
-      return bpftrace.resolve_usym(read_data<uint64_t>(value.data()),
-                                   read_data<uint32_t>(value.data() + 8),
-                                   read_data<uint32_t>(value.data() + 12));
+      return bpftrace.resolve_usym(util::read_data<uint64_t>(value.data()),
+                                   util::read_data<uint32_t>(value.data() + 8),
+                                   util::read_data<uint32_t>(value.data() +
+                                                             12));
     }
     case Type::inet: {
-      return bpftrace.resolve_inet(read_data<uint64_t>(value.data()),
+      return bpftrace.resolve_inet(util::read_data<uint64_t>(value.data()),
                                    static_cast<const uint8_t *>(value.data() +
                                                                 8));
     }
     case Type::username: {
-      return bpftrace.resolve_uid(read_data<uint64_t>(value.data()));
+      return bpftrace.resolve_uid(util::read_data<uint64_t>(value.data()));
     }
     case Type::buffer: {
       return bpftrace.resolve_buf(
@@ -283,8 +287,8 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
           reinterpret_cast<const AsyncEvent::Buf *>(value.data())->length);
     }
     case Type::string: {
-      auto p = reinterpret_cast<const char *>(value.data());
-      return std::string(p, strnlen(p, type.GetSize()));
+      const auto *p = reinterpret_cast<const char *>(value.data());
+      return { p, strnlen(p, type.GetSize()) };
     }
     case Type::array: {
       size_t elem_size = type.GetElementTy()->GetSize();
@@ -326,19 +330,17 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
       return tuple_to_str(elems, false);
     }
     case Type::count_t: {
-      return std::to_string(reduce_value<uint64_t>(value, nvalues) / div);
+      return std::to_string(util::reduce_value<uint64_t>(value, nvalues) / div);
     }
     case Type::avg_t: {
-      /*
-       * on this code path, avg is calculated in the kernel while
-       * printing the entire map is handled in a different function
-       * which shouldn't call this
-       */
+      // on this code path, avg is calculated in the kernel while
+      // printing the entire map is handled in a different function
+      // which shouldn't call this
       assert(!is_per_cpu);
       if (type.IsSigned()) {
-        return std::to_string(read_data<int64_t>(value.data()) / div);
+        return std::to_string(util::read_data<int64_t>(value.data()) / div);
       }
-      return std::to_string(read_data<uint64_t>(value.data()) / div);
+      return std::to_string(util::read_data<uint64_t>(value.data()) / div);
     }
     case Type::integer: {
       auto sign = type.IsSigned();
@@ -346,24 +348,24 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
           // clang-format off
           case 64:
             if (sign)
-              return std::to_string(reduce_value<int64_t>(value, nvalues) / static_cast<int64_t>(div));
-            return std::to_string(reduce_value<uint64_t>(value, nvalues) / div);
+              return std::to_string(util::reduce_value<int64_t>(value, nvalues) / static_cast<int64_t>(div));
+            return std::to_string(util::reduce_value<uint64_t>(value, nvalues) / div);
           case 32:
             if (sign)
               return std::to_string(
-                  reduce_value<int32_t>(value, nvalues) / static_cast<int32_t>(div));
-            return std::to_string(reduce_value<uint32_t>(value, nvalues) / div);
+                  util::reduce_value<int32_t>(value, nvalues) / static_cast<int32_t>(div));
+            return std::to_string(util::reduce_value<uint32_t>(value, nvalues) / div);
           case 16:
             if (sign)
               return std::to_string(
-                  reduce_value<int16_t>(value, nvalues) / static_cast<int16_t>(div));
-            return std::to_string(reduce_value<uint16_t>(value, nvalues) / div);
+                  util::reduce_value<int16_t>(value, nvalues) / static_cast<int16_t>(div));
+            return std::to_string(util::reduce_value<uint16_t>(value, nvalues) / div);
           case 8:
             if (sign)
               return std::to_string(
-                  reduce_value<int8_t>(value, nvalues) / static_cast<int8_t>(div));
-            return std::to_string(reduce_value<uint8_t>(value, nvalues) / div);
-          // clang-format on
+                  util::reduce_value<int8_t>(value, nvalues) / static_cast<int8_t>(div));
+            return std::to_string(util::reduce_value<uint8_t>(value, nvalues) / div);
+            // clang-format on
         default:
           LOG(BUG) << "value_to_str: Invalid int bitwidth: "
                    << type.GetIntBitWidth() << "provided";
@@ -372,27 +374,27 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
     }
     case Type::sum_t: {
       if (type.IsSigned())
-        return std::to_string(reduce_value<int64_t>(value, nvalues) / div);
+        return std::to_string(util::reduce_value<int64_t>(value, nvalues) /
+                              div);
 
-      return std::to_string(reduce_value<uint64_t>(value, nvalues) / div);
+      return std::to_string(util::reduce_value<uint64_t>(value, nvalues) / div);
     }
     case Type::max_t:
     case Type::min_t: {
       if (is_per_cpu) {
         if (type.IsSigned()) {
           return std::to_string(
-              min_max_value<int64_t>(value, nvalues, type.IsMaxTy()) / div);
+              util::min_max_value<int64_t>(value, nvalues, type.IsMaxTy()) /
+              div);
         }
         return std::to_string(
-            min_max_value<uint64_t>(value, nvalues, type.IsMaxTy()) / div);
+            util::min_max_value<uint64_t>(value, nvalues, type.IsMaxTy()) /
+            div);
       }
       if (type.IsSigned()) {
-        return std::to_string(read_data<int64_t>(value.data()) / div);
+        return std::to_string(util::read_data<int64_t>(value.data()) / div);
       }
-      return std::to_string(read_data<uint64_t>(value.data()) / div);
-    }
-    case Type::probe: {
-      return bpftrace.resolve_probe(read_data<uint64_t>(value.data()));
+      return std::to_string(util::read_data<uint64_t>(value.data()) / div);
     }
     case Type::timestamp: {
       return bpftrace.resolve_timestamp(
@@ -412,7 +414,7 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
               ->cgroup_id);
     }
     case Type::strerror_t: {
-      return strerror(read_data<uint64_t>(value.data()));
+      return strerror(util::read_data<uint64_t>(value.data()));
     }
     case Type::none: {
       return "";
@@ -422,7 +424,6 @@ std::string Output::value_to_str(BPFtrace &bpftrace,
     case Type::lhist_t:
     case Type::stack_mode:
     case Type::pointer:
-    case Type::reference:
     case Type::stats_t:
     case Type::timestamp_mode: {
       LOG(BUG) << "Invalid value type: " << type;
@@ -445,7 +446,6 @@ std::string Output::map_key_str(BPFtrace &bpftrace,
     case Type::usym_t:
     case Type::inet:
     case Type::username:
-    case Type::probe:
     case Type::string:
     case Type::buffer:
     case Type::pointer:
@@ -474,7 +474,6 @@ std::string Output::map_key_str(BPFtrace &bpftrace,
     case Type::hist_t:
     case Type::lhist_t:
     case Type::none:
-    case Type::reference:
     case Type::stack_mode:
     case Type::stats_t:
     case Type::timestamp_mode:
@@ -486,12 +485,12 @@ std::string Output::map_key_str(BPFtrace &bpftrace,
 
 std::string Output::array_to_str(const std::vector<std::string> &elems) const
 {
-  return "[" + str_join(elems, ",") + "]";
+  return "[" + util::str_join(elems, ",") + "]";
 }
 
 std::string Output::struct_to_str(const std::vector<std::string> &elems) const
 {
-  return "{ " + str_join(elems, ", ") + " }";
+  return "{ " + util::str_join(elems, ", ") + " }";
 }
 
 void Output::map_contents(
@@ -507,7 +506,7 @@ void Output::map_contents(
   const auto &map_type = bpftrace.resources.maps_info.at(map.name()).value_type;
 
   bool first = true;
-  for (auto &pair : values_by_key) {
+  for (const auto &pair : values_by_key) {
     auto key = pair.first;
     auto value = pair.second;
 
@@ -541,9 +540,9 @@ void Output::map_hist_contents(
   const auto &map_info = bpftrace.resources.maps_info.at(map.name());
   const auto &map_type = map_info.value_type;
   bool first = true;
-  for (auto &key_count : total_counts_by_key) {
-    auto &key = key_count.first;
-    auto &value = values_by_key.at(key);
+  for (const auto &key_count : total_counts_by_key) {
+    const auto &key = key_count.first;
+    const auto &value = values_by_key.at(key);
 
     if (top && values_by_key.size() > top && i++ < (values_by_key.size() - top))
       continue;
@@ -556,10 +555,16 @@ void Output::map_hist_contents(
     auto key_str = map_key_to_str(bpftrace, map, key);
     std::string val_str;
     if (map_type.IsHistTy()) {
-      val_str = hist_to_str(value, div, *map_info.hist_bits_arg);
+      if (!std::holds_alternative<HistogramArgs>(map_info.detail))
+        LOG(BUG) << "call to hist with missing \"bits\" argument";
+      val_str = hist_to_str(value,
+                            div,
+                            std::get<HistogramArgs>(map_info.detail).bits);
     } else {
-      auto &args = map_info.lhist_args;
-      val_str = lhist_to_str(value, args->min, args->max, args->step);
+      if (!std::holds_alternative<LinearHistogramArgs>(map_info.detail))
+        LOG(BUG) << "call to lhist with missing arguments";
+      const auto &args = std::get<LinearHistogramArgs>(map_info.detail);
+      val_str = lhist_to_str(value, args.min, args.max, args.step);
     }
     map_key_val(map_type, key_str, val_str);
   }
@@ -578,7 +583,7 @@ void Output::map_stats_contents(
   size_t total = values_by_key.size();
   bool first = true;
 
-  for (auto &[key, value] : values_by_key) {
+  for (const auto &[key, value] : values_by_key) {
     if (top && map_type.IsAvgTy()) {
       if (total > top && i++ < (total - top))
         continue;
@@ -596,12 +601,12 @@ void Output::map_stats_contents(
     std::string avg_str;
 
     if (map_type.IsSigned()) {
-      auto stats = stats_value<int64_t>(value, bpftrace.ncpus_);
+      auto stats = util::stats_value<int64_t>(value, bpftrace.ncpus_);
       avg_str = std::to_string(stats.avg / div);
       total_str = std::to_string(stats.total);
       count_str = std::to_string(stats.count);
     } else {
-      auto stats = stats_value<uint64_t>(value, bpftrace.ncpus_);
+      auto stats = util::stats_value<uint64_t>(value, bpftrace.ncpus_);
       avg_str = std::to_string(stats.avg / div);
       total_str = std::to_string(stats.total);
       count_str = std::to_string(stats.count);
@@ -710,8 +715,8 @@ std::string TextOutput::lhist_to_str(const std::vector<uint64_t> &values,
     } else if (i == (buckets + 1)) {
       header << "[" << lhist_index_label(max, step) << ", ...)";
     } else {
-      header << "[" << lhist_index_label((i - 1) * step + min, step);
-      header << ", " << lhist_index_label(i * step + min, step) << ")";
+      header << "[" << lhist_index_label(((i - 1) * step) + min, step);
+      header << ", " << lhist_index_label((i * step) + min, step) << ")";
     }
 
     std::string bar(bar_width, '@');
@@ -764,31 +769,30 @@ std::string TextOutput::value_to_str(BPFtrace &bpftrace,
                                      bool is_map_key) const
 {
   switch (type.GetTy()) {
-    case Type::pointer:
-    case Type::reference: {
+    case Type::pointer: {
       std::ostringstream res;
-      res << "0x" << std::hex << read_data<uint64_t>(value.data());
+      res << "0x" << std::hex << util::read_data<uint64_t>(value.data());
       return res.str();
     }
     case Type::integer: {
       if (type.IsEnumTy() && div == 1) {
         assert(!is_per_cpu);
 
-        auto data = value.data();
-        auto enum_name = type.GetName();
+        const auto *data = value.data();
+        const auto &enum_name = type.GetName();
         uint64_t enum_val;
         switch (type.GetIntBitWidth()) {
           case 64:
-            enum_val = read_data<uint64_t>(data);
+            enum_val = util::read_data<uint64_t>(data);
             break;
           case 32:
-            enum_val = read_data<uint32_t>(data);
+            enum_val = util::read_data<uint32_t>(data);
             break;
           case 16:
-            enum_val = read_data<uint16_t>(data);
+            enum_val = util::read_data<uint16_t>(data);
             break;
           case 8:
-            enum_val = read_data<uint8_t>(data);
+            enum_val = util::read_data<uint8_t>(data);
             break;
           default:
             LOG(BUG) << "value_to_str: Invalid int bitwidth: "
@@ -796,9 +800,9 @@ std::string TextOutput::value_to_str(BPFtrace &bpftrace,
             return {};
         }
 
-        if (bpftrace.enum_defs_.contains(enum_name) &&
-            bpftrace.enum_defs_[enum_name].contains(enum_val)) {
-          return bpftrace.enum_defs_[enum_name][enum_val];
+        if (c_definitions_.enum_defs.contains(enum_name) &&
+            c_definitions_.enum_defs[enum_name].contains(enum_val)) {
+          return c_definitions_.enum_defs[enum_name][enum_val];
         } else {
           // Fall back to something comprehensible in case user somehow
           // tricked the type system into accepting an invalid enum.
@@ -836,14 +840,15 @@ void TextOutput::attached_probes(uint64_t num_probes) const
     out_ << "Attaching " << num_probes << " probes..." << std::endl;
 }
 
-void TextOutput::helper_error(int func_id,
-                              int retcode,
-                              const location &loc) const
+void TextOutput::helper_error(int retcode, const HelperErrorInfo &info) const
 {
-  LOG(WARNING, loc, out_) << get_helper_error_msg(func_id, retcode)
-                          << "\nAdditional Info - helper: "
-                          << libbpf::bpf_func_name[func_id]
-                          << ", retcode: " << retcode;
+  LOG(WARNING,
+      std::string(info.source_location),
+      std::vector(info.source_context),
+      out_)
+      << get_helper_error_msg(info.func_id, retcode)
+      << "\nAdditional Info - helper: " << libbpf::bpf_func_name[info.func_id]
+      << ", retcode: " << retcode;
 }
 
 std::string TextOutput::field_to_str(const std::string &name,
@@ -856,17 +861,18 @@ std::string TextOutput::tuple_to_str(const std::vector<std::string> &elems,
                                      bool is_map_key) const
 {
   if (!is_map_key) {
-    return "(" + str_join(elems, ", ") + ")";
+    return "(" + util::str_join(elems, ", ") + ")";
   }
-  return str_join(elems, ", ");
+  return util::str_join(elems, ", ");
 }
 
 std::string TextOutput::map_key_to_str(BPFtrace &bpftrace,
                                        const BpfMap &map,
                                        const std::vector<uint8_t> &key) const
 {
-  const auto &key_type = bpftrace.resources.maps_info.at(map.name()).key_type;
-  if (key_type.IsNoneTy())
+  const auto &map_info = bpftrace.resources.maps_info.at(map.name());
+  const auto &key_type = map_info.key_type;
+  if (map_info.is_scalar)
     return map.name();
 
   return map.name() + "[" + map_key_str(bpftrace, key_type, key) + "]";
@@ -876,9 +882,11 @@ void TextOutput::map_key_val(const SizedType &map_type,
                              const std::string &key,
                              const std::string &val) const
 {
-  out_ << key + ": ";
+  out_ << key;
   if (map_type.IsHistTy() || map_type.IsLhistTy())
-    out_ << "\n";
+    out_ << ":\n";
+  else
+    out_ << ": ";
   out_ << val;
 }
 
@@ -895,7 +903,7 @@ std::string TextOutput::key_value_pairs_to_str(
   std::vector<std::string> elems;
   for (auto &e : keyvals)
     elems.push_back(e.first + " " + e.second);
-  return str_join(elems, ", ");
+  return util::str_join(elems, ", ");
 }
 
 std::string JsonOutput::json_escape(const std::string &str) const
@@ -947,16 +955,16 @@ void JsonOutput::map(
   if (values_by_key.empty())
     return;
 
-  const auto &map_key = bpftrace.resources.maps_info.at(map.name()).key_type;
+  const auto &map_info = bpftrace.resources.maps_info.at(map.name());
 
   out_ << R"({"type": ")" << MessageType::map << R"(", "data": {)";
   out_ << "\"" << json_escape(map.name()) << "\": ";
-  if (!map_key.IsNoneTy()) // check if this map has keys
+  if (!map_info.is_scalar)
     out_ << "{";
 
   map_contents(bpftrace, map, top, div, values_by_key);
 
-  if (!map_key.IsNoneTy())
+  if (!map_info.is_scalar)
     out_ << "}";
   out_ << "}}" << std::endl;
 }
@@ -988,11 +996,12 @@ std::string JsonOutput::hist_to_str(const std::vector<uint64_t> &values,
       res << "\"min\": " << i - 1 << ", \"max\": " << i - 1 << ", ";
     } else {
       const uint32_t n = 1 << k;
-      uint32_t power = ((i - 1) >> k) - 1, bucket = (i - 1) & (n - 1);
+      uint32_t power = ((i - 1) >> k) - 1;
+      uint32_t bucket = (i - 1) & (n - 1);
       const long low = (1ULL << power) * (n + bucket);
       power = (i >> k) - 1;
       bucket = i & (n - 1);
-      const long high = (1ULL << power) * (n + bucket) - 1;
+      const long high = ((1ULL << power) * (n + bucket)) - 1;
       res << "\"min\": " << low << ", \"max\": " << high << ", ";
     }
     res << "\"count\": " << values.at(i) / div;
@@ -1033,8 +1042,8 @@ std::string JsonOutput::lhist_to_str(const std::vector<uint64_t> &values,
     } else if (i == (buckets + 1)) {
       res << "\"min\": " << max << ", ";
     } else {
-      long low = (i - 1) * step + min;
-      long high = i * step + min - 1;
+      long low = ((i - 1) * step) + min;
+      long high = (i * step) + min - 1;
       res << "\"min\": " << low << ", \"max\": " << high << ", ";
     }
     res << "\"count\": " << values.at(i);
@@ -1057,17 +1066,17 @@ void JsonOutput::map_hist(
   if (total_counts_by_key.empty())
     return;
 
-  const auto &map_key = bpftrace.resources.maps_info.at(map.name()).key_type;
+  const auto &map_info = bpftrace.resources.maps_info.at(map.name());
 
   out_ << R"({"type": ")" << MessageType::hist << R"(", "data": {)";
   out_ << "\"" << json_escape(map.name()) << "\": ";
-  if (!map_key.IsNoneTy()) // check if this map has keys
+  if (!map_info.is_scalar)
     out_ << "{";
 
   map_hist_contents(
       bpftrace, map, top, div, values_by_key, total_counts_by_key);
 
-  if (!map_key.IsNoneTy())
+  if (!map_info.is_scalar)
     out_ << "}";
   out_ << "}}" << std::endl;
 }
@@ -1083,16 +1092,16 @@ void JsonOutput::map_stats(
   if (values_by_key.empty())
     return;
 
-  const auto &map_key = bpftrace.resources.maps_info.at(map.name()).key_type;
+  const auto &map_info = bpftrace.resources.maps_info.at(map.name());
 
   out_ << R"({"type": ")" << MessageType::stats << R"(", "data": {)";
   out_ << "\"" << json_escape(map.name()) << "\": ";
-  if (!map_key.IsNoneTy()) // check if this map has keys
+  if (!map_info.is_scalar)
     out_ << "{";
 
   map_stats_contents(bpftrace, map, top, div, values_by_key);
 
-  if (!map_key.IsNoneTy())
+  if (!map_info.is_scalar)
     out_ << "}";
   out_ << "}}" << std::endl;
 }
@@ -1118,9 +1127,8 @@ void JsonOutput::message(MessageType type,
                          const std::string &field,
                          uint64_t value) const
 {
-  out_ << R"({"type": ")" << type << R"(", "data": )"
-       << "{\"" << field << "\": " << value << "}"
-       << "}" << std::endl;
+  out_ << R"({"type": ")" << type << R"(", "data": )" << "{\"" << field
+       << "\": " << value << "}" << "}" << std::endl;
 }
 
 void JsonOutput::lost_events(uint64_t lost) const
@@ -1133,15 +1141,13 @@ void JsonOutput::attached_probes(uint64_t num_probes) const
   message(MessageType::attached_probes, "probes", num_probes);
 }
 
-void JsonOutput::helper_error(int func_id,
-                              int retcode,
-                              const location &loc) const
+void JsonOutput::helper_error(int retcode, const HelperErrorInfo &info) const
 {
   out_ << R"({"type": "helper_error", "msg": ")"
-       << get_helper_error_msg(func_id, retcode) << R"(", "helper": ")"
-       << libbpf::bpf_func_name[func_id] << R"(", "retcode": )" << retcode
-       << ", \"line\": " << loc.begin.line << ", \"col\": " << loc.begin.column
-       << "}" << std::endl;
+       << get_helper_error_msg(info.func_id, retcode) << R"(", "helper": ")"
+       << libbpf::bpf_func_name[info.func_id] << R"(", "retcode": )" << retcode
+       << R"(, "filename": ")" << info.filename << R"(", "line": )" << info.line
+       << R"(, "col": )" << info.column << "}" << std::endl;
 }
 
 std::string JsonOutput::field_to_str(const std::string &name,
@@ -1154,9 +1160,9 @@ std::string JsonOutput::tuple_to_str(const std::vector<std::string> &elems,
                                      bool is_map_key) const
 {
   if (!is_map_key) {
-    return "[" + str_join(elems, ",") + "]";
+    return "[" + util::str_join(elems, ",") + "]";
   }
-  return str_join(elems, ",");
+  return util::str_join(elems, ",");
 }
 
 std::string JsonOutput::value_to_str(BPFtrace &bpftrace,
@@ -1170,8 +1176,7 @@ std::string JsonOutput::value_to_str(BPFtrace &bpftrace,
 
   switch (type.GetTy()) {
     case Type::pointer:
-    case Type::reference:
-      str = std::to_string(read_data<uint64_t>(value.data()));
+      str = std::to_string(util::read_data<uint64_t>(value.data()));
       break;
     default:
       str = Output::value_to_str(
@@ -1193,11 +1198,12 @@ std::string JsonOutput::map_key_to_str(BPFtrace &bpftrace,
                                        const BpfMap &map,
                                        const std::vector<uint8_t> &key) const
 {
-  const auto &key_type = bpftrace.resources.maps_info.at(map.name()).key_type;
-  if (key_type.IsNoneTy()) {
+  const auto &map_info = bpftrace.resources.maps_info.at(map.name());
+  if (map_info.is_scalar)
     return "";
-  }
-  return "\"" + json_escape(map_key_str(bpftrace, key_type, key)) + "\"";
+
+  return "\"" + json_escape(map_key_str(bpftrace, map_info.key_type, key)) +
+         "\"";
 }
 
 void JsonOutput::map_key_val(const SizedType &map_type __attribute__((unused)),
@@ -1219,7 +1225,7 @@ std::string JsonOutput::key_value_pairs_to_str(
   std::vector<std::string> elems;
   for (auto &e : keyvals)
     elems.push_back("\"" + e.first + "\": " + e.second);
-  return "{" + str_join(elems, ", ") + "}";
+  return "{" + util::str_join(elems, ", ") + "}";
 }
 
 } // namespace bpftrace

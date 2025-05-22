@@ -30,6 +30,10 @@ NAME cpu
 PROG i:ms:1 { printf("SUCCESS %lu\n", cpu); exit(); }
 EXPECT_REGEX SUCCESS [0-9]+
 
+NAME ncpus
+PROG BEGIN { printf("%ld\n", ncpus); exit(); }
+EXPECT_REGEX ^[1-9][0-9]*$
+
 NAME comm
 PROG BEGIN { printf("SUCCESS %s\n", comm); exit(); }
 EXPECT SUCCESS bpftrace
@@ -174,8 +178,8 @@ EXPECT_REGEX ^size=
 REQUIRES_FEATURE btf
 
 NAME offsetof
-PROG struct Foo { int x; long l; char c; } BEGIN { printf("%ld\n", offsetof(struct Foo, x)); exit(); }
-EXPECT_REGEX ^0$
+PROG struct Foo { int x; struct Bar { int x; } bar; } BEGIN { printf("%ld %ld\n", offsetof(struct Foo, x), offsetof(struct Foo, bar.x)); exit(); }
+EXPECT_REGEX ^0 4$
 
 NAME print args in fentry
 PROG fentry:vfs_open { print(args); exit(); }
@@ -199,24 +203,28 @@ NAME args in uprobe print
 PROG uprobe:./testprogs/uprobe_test:uprobeFunction1 { print(args); exit(); }
 EXPECT_REGEX { .n = 0x[0-9a-f]+, .c = 120 }
 REQUIRES_FEATURE dwarf
+TIMEOUT 5
 BEFORE ./testprogs/uprobe_test
 
 NAME args in uprobe store in map
 PROG uprobe:./testprogs/uprobe_test:uprobeFunction1 { @ = args; exit(); }
 EXPECT_REGEX @: { .n = 0x[0-9a-f]+, .c = 120 }
 REQUIRES_FEATURE dwarf
+TIMEOUT 5
 BEFORE ./testprogs/uprobe_test
 
 NAME args in uprobe store in map and access field
 PROG uprobe:./testprogs/uprobe_test:uprobeFunction1 { @ = args; print(@.c); exit(); }
 EXPECT 120
 REQUIRES_FEATURE dwarf
+TIMEOUT 5
 BEFORE ./testprogs/uprobe_test
 
 NAME args in uprobe as a map key
 PROG uprobe:./testprogs/uprobe_test:uprobeFunction1 { @[args] = 1; exit(); }
 EXPECT_REGEX @[{ .n = 0x[0-9a-f]+, .c = 120 }]: 1
 REQUIRES_FEATURE dwarf
+TIMEOUT 5
 BEFORE ./testprogs/uprobe_test
 
 NAME jiffies
@@ -226,9 +234,9 @@ REQUIRES_FEATURE jiffies64
 MIN_KERNEL 5.9
 
 NAME ustack builtin with stack_mode config
-RUN {{BPFTRACE}} -e 'config = { stack_mode=raw } uprobe:./testprogs/uprobe_test:uprobeFunction1 { @c[ustack] = 1; exit(); }' -p {{BEFORE_PID}}
+RUN {{BPFTRACE}} -e 'config = { stack_mode=raw } uprobe:./testprogs/uprobe_test:uprobeFunction1 { @c[ustack] = 1; exit(); }'
 EXPECT_REGEX ^@c\[\n[0-9a-f]+$
-BEFORE ./testprogs/uprobe_test
+AFTER ./testprogs/uprobe_test
 
 NAME kstack builtin with stack_mode config
 RUN {{BPFTRACE}} -e 'config = { stack_mode=raw } k:do_nanosleep { @c[kstack] = 1; exit(); }'

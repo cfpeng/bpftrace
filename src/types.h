@@ -1,24 +1,23 @@
 #pragma once
 
+#include <algorithm>
 #include <cassert>
+#include <cereal/access.hpp>
+#include <cereal/types/variant.hpp>
 #include <map>
 #include <memory>
-#include <optional>
 #include <ostream>
-#include <sstream>
 #include <string>
 #include <sys/types.h>
 #include <unistd.h>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
-#include <cereal/access.hpp>
+#include "config_parser.h"
+#include "util/result.h"
 
 namespace bpftrace {
-
-const int MAX_STACK_SIZE = 1024;
-const int DEFAULT_STACK_SIZE = 127;
-const int COMM_SIZE = 16;
 
 enum class Type : uint8_t {
   // clang-format off
@@ -26,7 +25,6 @@ enum class Type : uint8_t {
   voidtype,
   integer, // int is a protected keyword
   pointer,
-  reference,
   record, // struct/union, as struct is a protected keyword
   hist_t,
   lhist_t,
@@ -41,7 +39,6 @@ enum class Type : uint8_t {
   string,
   ksym_t,
   usym_t,
-  probe,
   username,
   inet,
   stack_mode,
@@ -85,8 +82,36 @@ const std::map<StackMode, std::string> STACK_MODE_NAME_MAP = {
   { StackMode::raw, "raw" },
 };
 
+template <>
+struct ConfigParser<StackMode> {
+  Result<OK> parse(const std::string &key,
+                   StackMode *target,
+                   const std::string &s)
+  {
+    // Scan to through and match against a valid name.
+    for (const auto &[mode, name] : STACK_MODE_NAME_MAP) {
+      if (s == name) {
+        *target = mode;
+        return OK();
+      }
+    }
+    return make_error<ParseError>(key,
+                                  "Invalid value for stack_mode: valid "
+                                  "values are bpftrace, raw and perf.");
+  }
+  Result<OK> parse(const std::string &key,
+                   [[maybe_unused]] StackMode *target,
+                   [[maybe_unused]] uint64_t v)
+  {
+    return make_error<ParseError>(key,
+                                  "Invalid value for stack_mode: valid "
+                                  "values are bpftrace, raw and perf.");
+  }
+};
+
 struct StackType {
-  uint16_t limit = DEFAULT_STACK_SIZE;
+  // N.B. the limit of 127 defines the default stack size.
+  uint16_t limit = 127;
   StackMode mode = StackMode::bpftrace;
 
   bool operator==(const StackType &obj) const
@@ -152,15 +177,18 @@ private:
   std::shared_ptr<SizedType> element_type_; // for "container" and pointer
                                             // (like) types
   std::string name_; // name of this type, for named types like struct and enum
-  std::weak_ptr<Struct> inner_struct_; // inner struct for records and tuples
-                                       // the actual Struct object is owned by
-                                       // StructManager
+  std::variant<std::shared_ptr<Struct>, std::weak_ptr<Struct>>
+      inner_struct_; // inner struct for records and tuples: if a shared_ptr, it
+                     // is an anonymous type, if it is a weak_ptr, then it is
+                     // owned by the `StructManager`.
   AddrSpace as_ = AddrSpace::none;
   bool is_signed_ = false;
-  bool ctx_ = false;                                   // Is bpf program context
-  std::unordered_set<std::string> btf_type_tags_ = {}; // Only populated for
-                                                       // Type::pointer
+  bool ctx_ = false;                              // Is bpf program context
+  std::unordered_set<std::string> btf_type_tags_; // Only populated for
+                                                  // Type::pointer
   size_t num_elements_ = 0; // Only populated for array types
+
+  std::shared_ptr<Struct> inner_struct() const;
 
   friend class cereal::access;
   template <typename Archive>
@@ -183,24 +211,18 @@ private:
   }
 
 public:
-  /**
-     Tuple/struct accessors
-  */
+  // Tuple/struct accessors
   std::vector<Field> &GetFields() const;
   bool HasField(const std::string &name) const;
   const Field &GetField(const std::string &name) const;
   Field &GetField(ssize_t n) const;
   ssize_t GetFieldCount() const;
-  std::weak_ptr<const Struct> GetStruct() const;
+  std::shared_ptr<const Struct> GetStruct() const;
 
-  /**
-     Required alignment for this type when used inside a tuple
-   */
+  // Required alignment for this type when used inside a tuple
   ssize_t GetInTupleAlignment() const;
 
-  /**
-     Dump the underlying structure for debug purposes
-  */
+  // Dump the underlying structure for debug purposes
   void DumpStructure(std::ostream &os);
 
   AddrSpace GetAS() const
@@ -248,7 +270,7 @@ public:
   bool IsSameSizeRecursive(const SizedType &t) const;
   bool FitsInto(const SizedType &t) const;
 
-  bool IsPrintableTy()
+  bool IsPrintableTy() const
   {
     return type_ != Type::none && type_ != Type::stack_mode &&
            type_ != Type::timestamp_mode &&
@@ -260,7 +282,7 @@ public:
     is_signed_ = is_signed;
   }
 
-  bool IsSigned(void) const;
+  bool IsSigned() const;
 
   size_t GetSize() const
   {
@@ -279,8 +301,7 @@ public:
   {
     assert(IsIntTy());
     // Truncate integers too large to fit in BPF registers (64-bits).
-    if (bits > 64)
-      bits = 64;
+    bits = std::min<size_t>(bits, 64);
     // Zero sized integers are not usually valid. However, during semantic
     // analysis when we're inferring types, the first pass may not have
     // enough information to figure out the exact size of the integer. Later
@@ -298,15 +319,15 @@ public:
 
   size_t GetNumElements() const
   {
-    assert(IsArrayTy() || IsStringTy());
-    // For array's we can't just do size_bits_ / element_type.GetSize()
+    assert(IsArrayTy());
+    // For arrays we can't just do size_bits_ / element_type.GetSize()
     // because we might not know the size of the element type (it may be 0)
     // if it's being resolved in a later AST pass e.g. for an imported type:
     // `let $x: struct Foo[10];`
-    return IsStringTy() ? size_bits_ : num_elements_;
+    return num_elements_;
   };
 
-  const std::string GetName() const
+  const std::string &GetName() const
   {
     assert(IsRecordTy() || IsEnumTy());
     return name_;
@@ -329,12 +350,6 @@ public:
     return element_type_.get();
   }
 
-  const SizedType *GetDereferencedTy() const
-  {
-    assert(IsRefTy());
-    return element_type_.get();
-  }
-
   bool IsBoolTy() const
   {
     return type_ == Type::integer && size_bits_ == 1;
@@ -343,131 +358,123 @@ public:
   {
     return type_ == Type::pointer;
   };
-  bool IsRefTy() const
-  {
-    return type_ == Type::reference;
-  };
   bool IsIntTy() const
   {
     return type_ == Type::integer;
   };
   bool IsEnumTy() const
   {
-    return IsIntTy() && name_.size();
+    return IsIntTy() && !name_.empty();
   }
-  bool IsNoneTy(void) const
+  bool IsNoneTy() const
   {
     return type_ == Type::none;
   };
-  bool IsVoidTy(void) const
+  bool IsVoidTy() const
   {
     return type_ == Type::voidtype;
   };
-  bool IsIntegerTy(void) const
+  bool IsIntegerTy() const
   {
     return type_ == Type::integer;
   };
-  bool IsHistTy(void) const
+  bool IsHistTy() const
   {
     return type_ == Type::hist_t;
   };
-  bool IsLhistTy(void) const
+  bool IsLhistTy() const
   {
     return type_ == Type::lhist_t;
   };
-  bool IsCountTy(void) const
+  bool IsCountTy() const
   {
     return type_ == Type::count_t;
   };
-  bool IsSumTy(void) const
+  bool IsSumTy() const
   {
     return type_ == Type::sum_t;
   };
-  bool IsMinTy(void) const
+  bool IsMinTy() const
   {
     return type_ == Type::min_t;
   };
-  bool IsMaxTy(void) const
+  bool IsMaxTy() const
   {
     return type_ == Type::max_t;
   };
-  bool IsAvgTy(void) const
+  bool IsAvgTy() const
   {
     return type_ == Type::avg_t;
   };
-  bool IsStatsTy(void) const
+  bool IsStatsTy() const
   {
     return type_ == Type::stats_t;
   };
-  bool IsKstackTy(void) const
+  bool IsKstackTy() const
   {
     return type_ == Type::kstack_t;
   };
-  bool IsUstackTy(void) const
+  bool IsUstackTy() const
   {
     return type_ == Type::ustack_t;
   };
-  bool IsStringTy(void) const
+  bool IsStringTy() const
   {
     return type_ == Type::string;
   };
-  bool IsKsymTy(void) const
+  bool IsKsymTy() const
   {
     return type_ == Type::ksym_t;
   };
-  bool IsUsymTy(void) const
+  bool IsUsymTy() const
   {
     return type_ == Type::usym_t;
   };
-  bool IsProbeTy(void) const
-  {
-    return type_ == Type::probe;
-  };
-  bool IsUsernameTy(void) const
+  bool IsUsernameTy() const
   {
     return type_ == Type::username;
   };
-  bool IsInetTy(void) const
+  bool IsInetTy() const
   {
     return type_ == Type::inet;
   };
-  bool IsStackModeTy(void) const
+  bool IsStackModeTy() const
   {
     return type_ == Type::stack_mode;
   };
-  bool IsArrayTy(void) const
+  bool IsArrayTy() const
   {
     return type_ == Type::array;
   };
-  bool IsRecordTy(void) const
+  bool IsRecordTy() const
   {
     return type_ == Type::record;
   };
-  bool IsBufferTy(void) const
+  bool IsBufferTy() const
   {
     return type_ == Type::buffer;
   };
-  bool IsTupleTy(void) const
+  bool IsTupleTy() const
   {
     return type_ == Type::tuple;
   };
-  bool IsTimestampTy(void) const
+  bool IsTimestampTy() const
   {
     return type_ == Type::timestamp;
   };
-  bool IsMacAddressTy(void) const
+  bool IsMacAddressTy() const
   {
     return type_ == Type::mac_address;
   };
-  bool IsCgroupPathTy(void) const
+  bool IsCgroupPathTy() const
   {
     return type_ == Type::cgroup_path_t;
   };
-  bool IsStrerrorTy(void) const
+  bool IsStrerrorTy() const
   {
     return type_ == Type::strerror_t;
   };
-  bool IsTimestampModeTy(void) const
+  bool IsTimestampModeTy() const
   {
     return type_ == Type::timestamp_mode;
   }
@@ -478,27 +485,25 @@ public:
   }
   bool IsMapIterableTy() const
   {
-    return !IsMultiOutputMapTy();
+    if (IsMultiKeyMapTy()) {
+      return false;
+    }
+    if (NeedsPercpuMap() && !IsCastableMapTy()) {
+      return false;
+    }
+    return true;
   }
 
-  // These are special map value types that can't be reduced to a single value
-  // and output multiple lines when printed
-  bool IsMultiOutputMapTy() const
+  // These are special map value types that use multiple keys to store a single
+  // logical value (from the user perspective).
+  bool IsMultiKeyMapTy() const
   {
-    return type_ == Type::hist_t || type_ == Type::lhist_t ||
-           type_ == Type::stats_t;
+    return type_ == Type::hist_t || type_ == Type::lhist_t;
   }
 
   bool NeedsPercpuMap() const;
 
-  friend std::ostream &operator<<(std::ostream &, const SizedType &);
-  friend std::ostream &operator<<(std::ostream &, Type);
-
-  void IntoPointer()
-  {
-    assert(IsRefTy());
-    type_ = Type::pointer;
-  }
+  friend std::string typestr(const SizedType &type, bool debug);
 
   // Factories
 
@@ -507,14 +512,15 @@ public:
                                const SizedType &element_type);
 
   friend SizedType CreatePointer(const SizedType &pointee_type, AddrSpace as);
-  friend SizedType CreateReference(const SizedType &pointee_type, AddrSpace as);
+  friend SizedType CreateRecord(const std::string &name);
+  friend SizedType CreateRecord(std::shared_ptr<Struct> &&record);
   friend SizedType CreateRecord(const std::string &name,
                                 std::weak_ptr<Struct> record);
   friend SizedType CreateInteger(size_t bits, bool is_signed);
-  friend SizedType CreateTuple(std::weak_ptr<Struct> tuple);
+  friend SizedType CreateTuple(std::shared_ptr<Struct> &&tuple);
 };
-// Type helpers
 
+// Type helpers
 SizedType CreateNone();
 SizedType CreateVoid();
 SizedType CreateBool();
@@ -531,15 +537,16 @@ SizedType CreateUInt32();
 SizedType CreateUInt64();
 SizedType CreateEnum(size_t bits, const std::string &name);
 
+// Create a string of `size` bytes, inclusive of NUL terminator.
 SizedType CreateString(size_t size);
 SizedType CreateArray(size_t num_elements, const SizedType &element_type);
 SizedType CreatePointer(const SizedType &pointee_type,
                         AddrSpace as = AddrSpace::none);
-SizedType CreateReference(const SizedType &referred_type,
-                          AddrSpace as = AddrSpace::none);
 
+SizedType CreateRecord(const std::string &name);
+SizedType CreateRecord(std::shared_ptr<Struct> &&record);
 SizedType CreateRecord(const std::string &name, std::weak_ptr<Struct> record);
-SizedType CreateTuple(std::weak_ptr<Struct> tuple);
+SizedType CreateTuple(std::shared_ptr<Struct> &&tuple);
 
 SizedType CreateStackMode();
 SizedType CreateStack(bool kernel, StackType st = StackType());
@@ -547,10 +554,9 @@ SizedType CreateStack(bool kernel, StackType st = StackType());
 SizedType CreateMin(bool is_signed);
 SizedType CreateMax(bool is_signed);
 SizedType CreateSum(bool is_signed);
-SizedType CreateCount(bool is_signed);
+SizedType CreateCount();
 SizedType CreateAvg(bool is_signed);
 SizedType CreateStats(bool is_signed);
-SizedType CreateProbe();
 SizedType CreateUsername();
 SizedType CreateInet(size_t size);
 SizedType CreateLhist();
@@ -564,199 +570,13 @@ SizedType CreateCgroupPath();
 SizedType CreateStrerror();
 SizedType CreateTimestampMode();
 
-std::ostream &operator<<(std::ostream &os, const SizedType &type);
-
-enum class ProbeType {
-  invalid,
-  special,
-  kprobe,
-  kretprobe,
-  uprobe,
-  uretprobe,
-  usdt,
-  tracepoint,
-  profile,
-  interval,
-  software,
-  hardware,
-  watchpoint,
-  asyncwatchpoint,
-  fentry,
-  fexit,
-  iter,
-  rawtracepoint,
-};
-
-std::ostream &operator<<(std::ostream &os, ProbeType type);
-
-struct ProbeItem {
-  std::string name;
-  std::unordered_set<std::string> aliases;
-  ProbeType type;
-  // these are used in bpftrace -l
-  // to show which probes are available to attach to
-  bool show_in_kernel_list = false;
-  bool show_in_userspace_list = false;
-};
-
-const std::vector<ProbeItem> PROBE_LIST = {
-  { .name = "kprobe",
-    .aliases = { "k" },
-    .type = ProbeType::kprobe,
-    .show_in_kernel_list = true },
-  { .name = "kretprobe", .aliases = { "kr" }, .type = ProbeType::kretprobe },
-  { .name = "uprobe",
-    .aliases = { "u" },
-    .type = ProbeType::uprobe,
-    .show_in_userspace_list = true },
-  { .name = "uretprobe", .aliases = { "ur" }, .type = ProbeType::uretprobe },
-  { .name = "usdt",
-    .aliases = { "U" },
-    .type = ProbeType::usdt,
-    .show_in_userspace_list = true },
-  { .name = "BEGIN", .aliases = { "BEGIN" }, .type = ProbeType::special },
-  { .name = "END", .aliases = { "END" }, .type = ProbeType::special },
-  { .name = "self", .aliases = { "self" }, .type = ProbeType::special },
-  { .name = "tracepoint",
-    .aliases = { "t" },
-    .type = ProbeType::tracepoint,
-    .show_in_kernel_list = true },
-  { .name = "profile", .aliases = { "p" }, .type = ProbeType::profile },
-  { .name = "interval", .aliases = { "i" }, .type = ProbeType::interval },
-  { .name = "software",
-    .aliases = { "s" },
-    .type = ProbeType::software,
-    .show_in_kernel_list = true },
-  { .name = "hardware",
-    .aliases = { "h" },
-    .type = ProbeType::hardware,
-    .show_in_kernel_list = true },
-  { .name = "watchpoint", .aliases = { "w" }, .type = ProbeType::watchpoint },
-  { .name = "asyncwatchpoint",
-    .aliases = { "aw" },
-    .type = ProbeType::asyncwatchpoint },
-  { .name = "fentry",
-    .aliases = { "f", "kfunc" },
-    .type = ProbeType::fentry,
-    .show_in_kernel_list = true },
-  { .name = "fexit",
-    .aliases = { "fr", "kretfunc" },
-    .type = ProbeType::fexit },
-  { .name = "iter",
-    .aliases = { "it" },
-    .type = ProbeType::iter,
-    .show_in_kernel_list = true },
-  { .name = "rawtracepoint",
-    .aliases = { "rt" },
-    .type = ProbeType::rawtracepoint,
-    .show_in_kernel_list = true },
-};
-
-ProbeType probetype(const std::string &type);
 std::string addrspacestr(AddrSpace as);
 std::string typestr(Type t);
-std::string expand_probe_name(const std::string &orig_name);
-std::string probetypeName(ProbeType t);
-
-struct Probe {
-  ProbeType type;
-  std::string path;         // file path if used
-  std::string attach_point; // probe name (last component)
-  std::string orig_name;    // original full probe name,
-                            // before wildcard expansion
-  std::string name;         // full probe name
-  bool need_expansion;
-  std::string pin;  // pin file for iterator probes
-  std::string ns;   // for USDT probes, if provider namespace not from path
-  uint64_t loc = 0; // for USDT probes
-  int usdt_location_idx = 0; // to disambiguate duplicate USDT markers
-  uint64_t log_size = 1000000;
-  int index = 0;
-  int freq = 0;
-  uint64_t len = 0;   // for watchpoint probes, size of region
-  std::string mode;   // for watchpoint probes, watch mode (rwx)
-  bool async = false; // for watchpoint probes, if it's an async watchpoint
-  uint64_t address = 0;
-  uint64_t func_offset = 0;
-  std::vector<std::string> funcs;
-
-private:
-  friend class cereal::access;
-  template <typename Archive>
-  void serialize(Archive &archive)
-  {
-    archive(type,
-            path,
-            attach_point,
-            orig_name,
-            name,
-            pin,
-            ns,
-            loc,
-            usdt_location_idx,
-            log_size,
-            index,
-            freq,
-            len,
-            mode,
-            async,
-            address,
-            func_offset,
-            funcs);
-  }
-};
-
-const int RESERVED_IDS_PER_ASYNCACTION = 10000;
-
-enum class AsyncAction {
-  // clang-format off
-  printf  = 0,     // printf reserves 0-9999 for printf_ids
-  syscall = 10000, // system reserves 10000-19999 for printf_ids
-  cat     = 20000, // cat reserves 20000-29999 for printf_ids
-  exit    = 30000,
-  print,
-  clear,
-  zero,
-  time,
-  join,
-  helper_error,
-  print_non_map,
-  strftime,
-  watchpoint_attach,
-  watchpoint_detach,
-  skboutput,
-  // clang-format on
-};
-
-uint64_t asyncactionint(AsyncAction a);
-
-enum class PositionalParameterType { positional, count };
-
-namespace globalvars {
-
-enum class GlobalVar {
-  // Number of online CPUs at runtime, used for metric aggregation for functions
-  // like sum and avg
-  NUM_CPUS,
-  // Max CPU ID returned by bpf_get_smp_processor_id, used for simulating
-  // per-CPU maps in read-write global variables
-  MAX_CPU_ID,
-  // Scratch buffers used to avoid BPF stack allocation limits
-  FMT_STRINGS_BUFFER,
-  TUPLE_BUFFER,
-  GET_STR_BUFFER,
-  READ_MAP_VALUE_BUFFER,
-  WRITE_MAP_VALUE_BUFFER,
-  VARIABLE_BUFFER,
-  MAP_KEY_BUFFER,
-};
-
-} // namespace globalvars
+std::string typestr(const SizedType &type, bool debug = false);
+std::ostream &operator<<(std::ostream &os, const SizedType &type);
 
 } // namespace bpftrace
 
-// SizedType hash function
-// Allows to use SizedType in unordered_set/map.
 namespace std {
 template <>
 struct hash<bpftrace::StackType> {
@@ -774,10 +594,4 @@ struct hash<bpftrace::StackType> {
     return {}; // unreached
   }
 };
-
-template <>
-struct hash<bpftrace::SizedType> {
-  size_t operator()(const bpftrace::SizedType &type) const;
-};
-
 } // namespace std

@@ -1,14 +1,19 @@
 #include "bpfbytecode.h"
 
+#include <algorithm>
+#include <cstring>
+#include <stdexcept>
+
 #include "bpftrace.h"
 #include "globalvars.h"
 #include "log.h"
-#include "utils.h"
+#include "util/bpf_names.h"
+#include "util/exceptions.h"
+#include "util/wildcard.h"
 
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
 #include <elf.h>
-#include <stdexcept>
 
 namespace bpftrace {
 
@@ -27,7 +32,7 @@ static std::optional<std::string> get_global_var_section_name(
 {
   for (const auto &section_name : section_names) {
     // there are some random chars in the beginning of the map name
-    if (map_name.npos != map_name.find(section_name))
+    if (std::string_view::npos != map_name.find(section_name))
       return section_name;
   }
   return std::nullopt;
@@ -38,7 +43,7 @@ BpfBytecode::BpfBytecode(std::span<const std::byte> elf)
   int log_level = 0;
   // In debug mode, show full verifier log.
   // In verbose mode, only show verifier log for failures.
-  if (bt_debug.find(DebugStage::Verifier) != bt_debug.end())
+  if (bt_debug.contains(DebugStage::Verifier))
     log_level = 15;
   else if (bt_verbose)
     log_level = 1;
@@ -50,7 +55,8 @@ BpfBytecode::BpfBytecode(std::span<const std::byte> elf)
   bpf_object_ = std::unique_ptr<struct bpf_object, bpf_object_deleter>(
       bpf_object__open_mem(elf.data(), elf.size(), &opts));
   if (!bpf_object_)
-    LOG(BUG) << "The produced ELF is not a valid BPF object";
+    LOG(BUG) << "The produced ELF is not a valid BPF object: "
+             << std::strerror(errno);
 
   const auto section_names = globalvars::get_section_names();
 
@@ -81,12 +87,12 @@ const BpfProgram &BpfBytecode::getProgramForProbe(const Probe &probe) const
                                      probe.usdt_location_idx)
                                : std::nullopt;
 
-  auto prog = programs_.find(
-      get_function_name_for_probe(probe.name, probe.index, usdt_location_idx));
+  auto prog = programs_.find(util::get_function_name_for_probe(
+      probe.name, probe.index, usdt_location_idx));
   if (prog == programs_.end()) {
-    prog = programs_.find(get_function_name_for_probe(probe.orig_name,
-                                                      probe.index,
-                                                      usdt_location_idx));
+    prog = programs_.find(util::get_function_name_for_probe(probe.orig_name,
+                                                            probe.index,
+                                                            usdt_location_idx));
   }
 
   if (prog == programs_.end()) {
@@ -116,39 +122,37 @@ void BpfBytecode::update_global_vars(BPFtrace &bpftrace)
 }
 
 namespace {
-/*
- * Searches the verifier's log for err_pattern. If a match is found, extracts
- * the name and ID of the problematic helper and throws a HelperVerifierError.
- *
- * Example verfier log extract:
- *     [...]
- *     36: (b7) r3 = 64                      ; R3_w=64
- *     37: (85) call bpf_d_path#147
- *     helper call is not allowed in probe
- *     [...]
- *
- *  In the above log, "bpf_d_path" is the helper's name and "147" is the ID.
- */
+// Searches the verifier's log for err_pattern. If a match is found, extracts
+// the name and ID of the problematic helper and throws a HelperVerifierError.
+//
+// Example verfier log extract:
+//     [...]
+//     36: (b7) r3 = 64                      ; R3_w=64
+//     37: (85) call bpf_d_path#147
+//     helper call is not allowed in probe
+//     [...]
+//
+//  In the above log, "bpf_d_path" is the helper's name and "147" is the ID.
 void maybe_throw_helper_verifier_error(std::string_view log,
                                        std::string_view err_pattern,
                                        const std::string &exception_msg_suffix)
 {
   auto err_pos = log.find(err_pattern);
-  if (err_pos == log.npos)
+  if (err_pos == std::string_view::npos)
     return;
 
   std::string_view call_pattern = " call ";
   auto call_pos = log.rfind(call_pattern, err_pos);
-  if (call_pos == log.npos)
+  if (call_pos == std::string_view::npos)
     return;
 
   auto helper_begin = call_pos + call_pattern.size();
   auto hash_pos = log.find("#", helper_begin);
-  if (hash_pos == log.npos)
+  if (hash_pos == std::string_view::npos)
     return;
 
   auto eol = log.find("\n", hash_pos + 1);
-  if (eol == log.npos)
+  if (eol == std::string_view::npos)
     return;
 
   auto helper_name = std::string{ log.substr(helper_begin,
@@ -169,7 +173,7 @@ void maybe_throw_helper_verifier_error(std::string_view log,
 bool is_log_trimmed(std::string_view log)
 {
   static const std::vector<std::string> tokens = { "processed", "insns" };
-  return !wildcard_match(log, tokens, true, true);
+  return !util::wildcard_match(log, tokens, true, true);
 }
 } // namespace
 
@@ -180,8 +184,7 @@ void BpfBytecode::load_progs(const RequiredResources &resources,
 {
   std::unordered_map<std::string_view, std::vector<char>> log_bufs;
   for (auto &[name, prog] : programs_) {
-    log_bufs[name] = std::vector<char>(config.get(ConfigKeyInt::log_size),
-                                       '\0');
+    log_bufs[name] = std::vector<char>(config.log_size, '\0');
     auto &log_buf = log_bufs[name];
     bpf_program__set_log_buf(prog.bpf_prog(), log_buf.data(), log_buf.size());
   }
@@ -190,6 +193,7 @@ void BpfBytecode::load_progs(const RequiredResources &resources,
   for (auto probe : resources.special_probes)
     special_probes.push_back(probe.second);
   prepare_progs(special_probes, btf, feature, config);
+  prepare_progs(resources.signal_probes, btf, feature, config);
   prepare_progs(resources.probes, btf, feature, config);
   prepare_progs(resources.watchpoint_probes, btf, feature, config);
 
@@ -197,7 +201,7 @@ void BpfBytecode::load_progs(const RequiredResources &resources,
 
   // If requested, print the entire verifier logs, even if loading succeeded.
   for (const auto &[name, prog] : programs_) {
-    if (bt_debug.find(DebugStage::Verifier) != bt_debug.end()) {
+    if (bt_debug.contains(DebugStage::Verifier)) {
       std::cout << "BPF verifier log for " << name << ":\n";
       std::cout << "--------------------------------------\n";
       std::cout << log_bufs[name].data() << std::endl;
@@ -230,6 +234,17 @@ void BpfBytecode::load_progs(const RequiredResources &resources,
           "pointer arithmetic on ptr_or_null_ prohibited, null-check it first",
           ": result needs to be null-checked before accessing fields");
 
+      auto err_pos = log.find("from non-GPL compatible program");
+      if (err_pos != std::string_view::npos) {
+        LOG(ERROR) << "Your bpftrace program cannot load because you are using "
+                      "a license that is non-GPL compatible. License: "
+                   << config.license;
+        LOG(HINT)
+            << "Read more about BPF programs and licensing: "
+               "https://docs.kernel.org/bpf/"
+               "bpf_licensing.html#using-bpf-programs-in-the-linux-kernel";
+      }
+
       std::stringstream errmsg;
       errmsg << "Error loading BPF program for " << name << ".";
       if (bt_verbose) {
@@ -261,7 +276,7 @@ void BpfBytecode::load_progs(const RequiredResources &resources,
   }
 
   std::cerr << err.str();
-  throw FatalUserException("Loading BPF object(s) failed.");
+  throw util::FatalUserException("Loading BPF object(s) failed.");
 }
 
 void BpfBytecode::prepare_progs(const std::vector<Probe> &probes,
@@ -269,7 +284,7 @@ void BpfBytecode::prepare_progs(const std::vector<Probe> &probes,
                                 BPFfeature &feature,
                                 const Config &config)
 {
-  for (auto &probe : probes) {
+  for (const auto &probe : probes) {
     auto &program = getProgramForProbe(probe);
     program.set_prog_type(probe);
     program.set_expected_attach_type(probe, feature);
@@ -280,21 +295,19 @@ void BpfBytecode::prepare_progs(const std::vector<Probe> &probes,
 
 bool BpfBytecode::all_progs_loaded()
 {
-  for (const auto &prog : programs_) {
-    if (prog.second.fd() < 0)
-      return false;
-  }
-  return true;
+  return std::ranges::all_of(programs_, [](const auto &prog) {
+    return prog.second.fd() >= 0;
+  });
 }
 
 bool BpfBytecode::hasMap(MapType internal_type) const
 {
-  return maps_.find(to_string(internal_type)) != maps_.end();
+  return maps_.contains(to_string(internal_type));
 }
 
 bool BpfBytecode::hasMap(const StackType &stack_type) const
 {
-  return maps_.find(stack_type.name()) != maps_.end();
+  return maps_.contains(stack_type.name());
 }
 
 const BpfMap &BpfBytecode::getMap(const std::string &name) const
@@ -328,7 +341,7 @@ const std::map<std::string, BpfMap> &BpfBytecode::maps() const
 int BpfBytecode::countStackMaps() const
 {
   int n = 0;
-  for (auto &map : maps_) {
+  for (const auto &map : maps_) {
     if (map.second.is_stack_map())
       n++;
   }

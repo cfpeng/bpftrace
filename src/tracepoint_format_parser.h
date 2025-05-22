@@ -3,43 +3,15 @@
 #include <istream>
 #include <set>
 
-#include "ast/visitors.h"
+#include "ast/pass_manager.h"
+#include "ast/visitor.h"
 #include "bpftrace.h"
 
 namespace bpftrace {
 
-namespace ast {
-
-class TracepointArgsVisitor : public Visitor {
-public:
-  void visit(Builtin &builtin) override
-  {
-    Visitor::visit(builtin);
-
-    if (builtin.ident == "args" && probe_->tp_args_structs_level == -1)
-      probe_->tp_args_structs_level = 0;
-  };
-  void visit(FieldAccess &acc) override
-  {
-    Visitor::visit(acc);
-
-    if (probe_->tp_args_structs_level >= 0)
-      probe_->tp_args_structs_level++;
-  };
-  void visit(Probe &probe) override
-  {
-    probe_ = &probe;
-    Visitor::visit(probe);
-  };
-
-private:
-  Probe *probe_;
-};
-} // namespace ast
-
 class TracepointFormatParser {
 public:
-  static bool parse(ast::Program *program, BPFtrace &bpftrace);
+  static bool parse(ast::ASTContext &ctx, BPFtrace &bpftrace);
   static std::string get_struct_name(const std::string &category,
                                      const std::string &event_name);
   static std::string get_struct_name(const std::string &probe_id);
@@ -62,5 +34,7 @@ protected:
                                            const std::string &event_name,
                                            BPFtrace &bpftrace);
 };
+
+ast::Pass CreateParseTracepointFormatPass();
 
 } // namespace bpftrace

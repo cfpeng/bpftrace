@@ -11,20 +11,42 @@
 namespace llvm {
 class Type;
 } // namespace llvm
-namespace bpftrace {
-namespace ast {
+
+namespace bpftrace::ast {
 class IRBuilderBPF;
-} // namespace ast
-} // namespace bpftrace
+} // namespace bpftrace::ast
 
-/*
- * The main goal here is to keep the struct definitions close to each other,
- * making it easier to spot type mismatches.
- *
- * If you update a type, remember to update the .cpp too!
- */
+// The main goal here is to keep the struct definitions close to each other,
+// making it easier to spot type mismatches.
+//
+// If you update a type, remember to update the .cpp too!
 
 namespace bpftrace {
+
+// TODO: move this `AsyncAction` enum to `async_action.h`
+enum class AsyncAction {
+  // clang-format off
+  printf      = 0,     // printf reserves 0-9999 for printf_ids
+  printf_end  = 9999,
+  syscall     = 10000, // system reserves 10000-19999 for printf_ids
+  syscall_end = 19999,
+  cat         = 20000, // cat reserves 20000-29999 for printf_ids
+  cat_end     = 29999,
+  exit        = 30000,
+  print,
+  clear,
+  zero,
+  time,
+  join,
+  helper_error,
+  print_non_map,
+  strftime,
+  watchpoint_attach,
+  watchpoint_detach,
+  skboutput,
+  // clang-format on
+};
+
 namespace AsyncEvent {
 
 struct Print {
@@ -121,6 +143,14 @@ struct Exit {
   uint8_t exit_code;
 
   std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b);
+} __attribute__((packed));
+
+struct Join {
+  uint64_t action_id;
+  uint64_t join_id;
+  char content[0];
+
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b, uint32_t length);
 } __attribute__((packed));
 
 } // namespace AsyncEvent

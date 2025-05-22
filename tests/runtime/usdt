@@ -74,6 +74,10 @@ RUN {{BPFTRACE}} -e 'usdt:*:tracetest:testprobe { printf("here\n" ); exit(); }'
 EXPECT here
 BEFORE ./testprogs/usdt_test
 NEW_PIDNS
+# On 9pfs, is_elf() hangs on a syscall to fstat64. We suspect it's
+# a bug with 9pfs. https://github.com/danobi/vmtest/pull/88 should help
+# when it lands. So for now, don't run this test on 9pfs.
+REQUIRES findmnt -n / | awk '{exit $3!="9pfs"}'
 
 NAME usdt probes - attach to fully specified library probe by pid
 RUN {{BPFTRACE}} -e 'usdt:./testlibs/libusdt_tp.so:tracetestlib:lib_probe_1 { printf("here\n" ); exit(); }' -p $(pidof usdt_lib)
@@ -128,7 +132,7 @@ EXPECT Attaching 3 probes...
 
 NAME usdt probes - attach to probe on multiple files by wildcard
 PROG usdt:./testprogs/usdt*::* { printf("here\n" ); exit(); }
-EXPECT Attaching 48 probes...
+EXPECT Attaching 49 probes...
 
 NAME usdt probes - attach to probe on multiple providers by wildcard and pid
 RUN {{BPFTRACE}} -e 'usdt:::*probe2 { printf("here\n" ); exit(); }' -p {{BEFORE_PID}}
@@ -282,4 +286,9 @@ NAME usdt probes in multiple modules
 RUN {{BPFTRACE}} runtime/scripts/usdt_multi_modules.bt
 EXPECT Attaching 2 probes...
 TIMEOUT 1
+REQUIRES ./testprogs/systemtap_sys_sdt_check
+
+NAME usdt multi arguments
+RUN {{BPFTRACE}} -e 'usdt:./testprogs/usdt_multi_args:usdt_multi_args:probe1 { printf("%llx %llx %llx %llx %llx %llx %llx %llx %llx %llx %lld %llx\n", arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11); exit(); }' -c ./testprogs/usdt_multi_args
+EXPECT deadbeef 1 ffffffffffffffff cafebabe 8badf00d feedface 123456789abcdef 0 7fffffffffffffff 5555555555555555 42 aaaaaaaaaaaaaaaa
 REQUIRES ./testprogs/systemtap_sys_sdt_check

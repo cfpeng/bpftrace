@@ -30,6 +30,11 @@ RUN {{BPFTRACE}} -l | grep kprobes
 EXPECT_REGEX kprobe:.*
 TIMEOUT 1
 
+NAME it lists kprobes with glob matching
+RUN {{BPFTRACE}} -l 'kprobe*'
+EXPECT_REGEX kprobe:.*
+TIMEOUT 1
+
 NAME it lists tracepoints
 RUN {{BPFTRACE}} -l | grep tracepoint
 EXPECT_REGEX tracepoint:.*
@@ -55,6 +60,22 @@ TIMEOUT 1
 NAME it lists rawtracepoints
 RUN {{BPFTRACE}} -l | grep rawtracepoint
 EXPECT_REGEX rawtracepoint:.*
+TIMEOUT 1
+
+NAME it lists rawtracepoint params
+RUN {{BPFTRACE}} -lv "rawtracepoint:*"
+EXPECT_REGEX [ ]+[a-zA-Z_\*\s]+
+REQUIRES_FEATURE btf
+TIMEOUT 1
+
+# The BTF FUNC_PROTOs for rawtracepoint params have an unnecessary initial
+# void * and a retval that can't be used so make sure they are not
+# included in the listing output
+NAME it doesn't list the first rawtracepoint param or retval
+RUN {{BPFTRACE}} -lv "rawtracepoint:consume_skb"
+EXPECT_NONE void * __data
+EXPECT_NONE int retval
+REQUIRES_FEATURE btf
 TIMEOUT 1
 
 NAME it lists fentry params
@@ -140,6 +161,11 @@ RUN {{BPFTRACE}} -l "rawtracepoint:*"
 EXPECT_REGEX rawtracepoint:.*
 TIMEOUT 1
 
+NAME it lists iter with regex filter
+RUN {{BPFTRACE}} -l "iter:*"
+EXPECT_REGEX iter:.*
+TIMEOUT 1
+
 NAME it only lists probes in the program
 RUN {{BPFTRACE}} -l -e 'fentry:vmlinux:vfs_read { exit(); }'
 EXPECT fentry:vmlinux:vfs_read
@@ -163,8 +189,8 @@ TIMEOUT 2
 NAME it lists probes in a given file
 RUN {{BPFTRACE}} -l runtime/scripts/interval_order.bt
 EXPECT interval:ms:
-EXPECT interval:ms:
-EXPECT interval:ms:
+EXPECT interval:s:
+EXPECT interval:us:
 
 NAME warning on non existent file
 RUN {{BPFTRACE}} -l non_existent_file.bt
@@ -245,9 +271,9 @@ EXPECT 10 12 12 10
 TIMEOUT 1
 
 NAME parallel map access
-RUN {{BPFTRACE}} runtime/scripts/parallel_map_access.bt
+RUN {{BPFTRACE}} runtime/scripts/parallel_map_access.bt --no-warnings
 EXPECT SUCCESS
-TIMEOUT 2
+TIMEOUT 10
 
 NAME increment/decrement variable
 PROG BEGIN { $x = 10; printf("%d", $x++); printf(" %d", ++$x); printf(" %d", $x--); printf(" %d\n", --$x); exit(); }
@@ -261,7 +287,7 @@ TIMEOUT 3
 
 NAME info flag
 RUN {{BPFTRACE}} --info
-EXPECT perf_event_array: yes
+EXPECT_REGEX perf_event_array: yes
 TIMEOUT 1
 
 NAME basic while loop
@@ -277,7 +303,9 @@ WILL_FAIL
 
 NAME kaddr fails
 PROG BEGIN { print(kaddr("asdfzzzzzzz")) }
-EXPECT ERROR: Failed to compile: Failed to resolve kernel symbol: asdfzzzzzzz
+EXPECT stdin:1:9-35: ERROR: Failed to resolve kernel symbol: asdfzzzzzzz
+       BEGIN { print(kaddr("asdfzzzzzzz")) }
+               ~~~~~~~~~~~~~~~~~~~~~~~~~~
 TIMEOUT 1
 WILL_FAIL
 
@@ -292,6 +320,7 @@ EXPECT len: 1
 TIMEOUT 1
 
 NAME print_per_cpu_map_vals
+REQUIRES_FEATURE lookup_percpu_elem
 PROG BEGIN { @a = avg(5); @c = count(); @s = sum(5); @mn = min(1); @mx = max(-1); print((@a, @c, @s, @mn, @mx)); exit(); }
 EXPECT (5, 1, 5, 1, -1)
 TIMEOUT 3
@@ -329,3 +358,7 @@ NAME exit code
 PROG BEGIN { exit(69); }
 RETURN_CODE 69
 TIMEOUT 1
+
+NAME block expression
+PROG BEGIN { let $a = { let $b = 1; $b }; print($a); exit(); }
+EXPECT 1

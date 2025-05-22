@@ -1,15 +1,14 @@
 #pragma once
 
-#include "gmock/gmock.h"
-
 #include "bpffeature.h"
 #include "bpftrace.h"
 #include "child.h"
 #include "probe_matcher.h"
 #include "procmon.h"
+#include "util/format.h"
+#include "gmock/gmock-function-mocker.h"
 
-namespace bpftrace {
-namespace test {
+namespace bpftrace::test {
 
 class MockProbeMatcher : public ProbeMatcher {
 public:
@@ -25,16 +24,43 @@ public:
   MOCK_CONST_METHOD1(get_symbols_from_traceable_funcs,
                      std::unique_ptr<std::istream>(bool with_modules));
   MOCK_CONST_METHOD2(get_symbols_from_usdt,
-                     std::unique_ptr<std::istream>(int pid,
+                     std::unique_ptr<std::istream>(std::optional<int> pid,
                                                    const std::string &target));
   MOCK_CONST_METHOD2(get_func_symbols_from_file,
-                     std::unique_ptr<std::istream>(int pid,
+                     std::unique_ptr<std::istream>(std::optional<int> pid,
                                                    const std::string &path));
+  MOCK_CONST_METHOD0(get_raw_tracepoint_symbols,
+                     std::unique_ptr<std::istream>());
+
+  MOCK_CONST_METHOD0(get_fentry_symbols, std::unique_ptr<std::istream>());
+
 #pragma GCC diagnostic pop
+};
+
+class MockBpfMap : public BpfMap {
+public:
+  MockBpfMap(libbpf::bpf_map_type type = libbpf::BPF_MAP_TYPE_HASH,
+             std::string name = "mock_map",
+             uint32_t key_size = sizeof(uint64_t),
+             uint32_t value_size = sizeof(uint64_t),
+             uint32_t max_entries = 10)
+      : BpfMap(type, name, key_size, value_size, max_entries)
+  {
+  }
+  MOCK_CONST_METHOD1(collect_elements, Result<MapElements>(int nvalues));
+  MOCK_CONST_METHOD2(collect_histogram_data,
+                     Result<HistogramMap>(const MapInfo &map_info,
+                                          int nvalues));
 };
 
 class MockBPFtrace : public BPFtrace {
 public:
+  MOCK_METHOD2(
+      attach_probe,
+      std::vector<std::unique_ptr<AttachedProbe>>(Probe &probe,
+                                                  const BpfBytecode &bytecode));
+
+  MOCK_METHOD1(resume_tracee, int(pid_t tracee_pid));
   std::vector<Probe> get_probes()
   {
     return resources.probes;
@@ -56,7 +82,7 @@ public:
       sym->address = 12345;
       sym->size = 4;
     } else {
-      auto fields = split_string(name, '_');
+      auto fields = util::split_string(name, '_');
       sym->address = std::stoull(fields.at(0));
       sym->size = std::stoull(fields.at(1));
     }
@@ -64,15 +90,33 @@ public:
   }
 
   bool is_traceable_func(
-      const std::string &__attribute__((unused))) const override
+      const std::string &__attribute__((unused)) /*func_name*/) const override
   {
     return true;
   }
 
   std::unordered_set<std::string> get_func_modules(
-      const std::string &__attribute__((unused))) const override
+      const std::string &__attribute__((unused)) /*func_name*/) const override
   {
     return { "mock_vmlinux" };
+  }
+
+  const std::optional<struct stat> &get_pidns_self_stat() const override
+  {
+    static const std::optional<struct stat> init_pid_namespace = []() {
+      struct stat s{};
+      s.st_ino = 0xeffffffc; // PROC_PID_INIT_INO
+      return std::optional{ s };
+    }();
+    static const std::optional<struct stat> child_pid_namespace = []() {
+      struct stat s{};
+      s.st_ino = 0xf0000011; // Arbitrary user namespace
+      return std::optional{ s };
+    }();
+
+    if (mock_in_init_pid_ns)
+      return init_pid_namespace;
+    return child_pid_namespace;
   }
 
   void set_mock_probe_matcher(std::unique_ptr<MockProbeMatcher> probe_matcher)
@@ -82,43 +126,57 @@ public:
   }
 
   MockProbeMatcher *mock_probe_matcher;
+  bool mock_in_init_pid_ns = true;
 };
 
 std::unique_ptr<MockBPFtrace> get_mock_bpftrace();
 std::unique_ptr<MockBPFtrace> get_strict_mock_bpftrace();
 
+static auto bpf_nofeature = BPFnofeature();
+static auto btf_obj = BTF(nullptr);
+
 class MockBPFfeature : public BPFfeature {
 public:
-  MockBPFfeature(bool has_features = true)
+  MockBPFfeature(bool has_features = true) : BPFfeature(bpf_nofeature, btf_obj)
   {
     has_send_signal_ = std::make_optional<bool>(has_features);
     has_get_current_cgroup_id_ = std::make_optional<bool>(has_features);
     has_override_return_ = std::make_optional<bool>(has_features);
     has_prog_fentry_ = std::make_optional<bool>(has_features);
-    has_loop_ = std::make_optional<bool>(has_features);
     has_probe_read_kernel_ = std::make_optional<bool>(has_features);
     has_features_ = has_features;
     has_d_path_ = std::make_optional<bool>(has_features);
     has_ktime_get_boot_ns_ = std::make_optional<bool>(has_features);
     has_kprobe_multi_ = std::make_optional<bool>(has_features);
+    has_kprobe_session_ = std::make_optional<bool>(has_features);
     has_uprobe_multi_ = std::make_optional<bool>(has_features);
     has_skb_output_ = std::make_optional<bool>(has_features);
     map_ringbuf_ = std::make_optional<bool>(has_features);
-    map_percpu_hash_ = std::make_optional<bool>(has_features);
     has_ktime_get_tai_ns_ = std::make_optional<bool>(has_features);
     has_get_func_ip_ = std::make_optional<bool>(has_features);
     has_jiffies64_ = std::make_optional<bool>(has_features);
     has_for_each_map_elem_ = std::make_optional<bool>(has_features);
+    has_get_ns_current_pid_tgid_ = std::make_optional<bool>(has_features);
+    has_map_lookup_percpu_elem_ = std::make_optional<bool>(has_features);
   };
 
-  void has_loop(bool has)
+  bool has_fentry() override
   {
-    has_loop_ = std::make_optional<bool>(has);
+    return has_features_;
   }
 
-  void mock_missing_kernel_func(Kfunc kfunc)
+  void add_to_available_kernel_funcs(Kfunc kfunc, bool available)
   {
-    available_kernel_funcs_.emplace(kfunc, false);
+    available_kernel_funcs_.emplace(kfunc, available);
+  }
+
+  bool has_kernel_func(Kfunc kfunc) override
+  {
+    auto find_kfunc = available_kernel_funcs_.find(kfunc);
+    if (find_kfunc != available_kernel_funcs_.end())
+      return find_kfunc->second;
+
+    return false;
   }
 
   bool has_features_;
@@ -130,14 +188,14 @@ public:
   {
     child_pid_ = 1337;
   };
-  ~MockChildProc(){};
+  ~MockChildProc() override = default;
 
-  void terminate(bool force __attribute__((unused)) = false) override{};
+  void terminate(bool force __attribute__((unused)) = false) override {};
   bool is_alive() override
   {
     return true;
   };
-  void resume(void) override{};
+  void resume() override {};
 
   void run(bool pause = false) override
   {
@@ -154,12 +212,9 @@ public:
 
   ~MockProcMon() override = default;
 
-  bool is_alive(void) override
+  bool is_alive() override
   {
-    if (pid_ > 0)
-      return true;
-    else
-      return false;
+    return pid_ > 0;
   }
 };
 
@@ -173,7 +228,7 @@ public:
 #pragma GCC diagnostic ignored "-Winconsistent-missing-override"
 #endif
   MOCK_METHOD4(find,
-               std::optional<usdt_probe_entry>(int pid,
+               std::optional<usdt_probe_entry>(std::optional<int> pid,
                                                const std::string &target,
                                                const std::string &provider,
                                                const std::string &name));
@@ -182,5 +237,4 @@ public:
 
 std::unique_ptr<MockUSDTHelper> get_mock_usdt_helper(int num_locations);
 
-} // namespace test
-} // namespace bpftrace
+} // namespace bpftrace::test

@@ -1,42 +1,50 @@
 #pragma once
 
-#include <fstream>
-#include <string_view>
+#include <optional>
+#include <utility>
 
 #include "ast/ast.h"
+#include "ast/context.h"
+#include "ast/pass_manager.h"
 #include "bpftrace.h"
+#include "parser.tab.hh"
 
-typedef void *yyscan_t;
+using yyscan_t = void *;
+
+#define YY_DECL                                                                \
+  bpftrace::Parser::symbol_type yylex(bpftrace::Driver &driver,                \
+                                      yyscan_t yyscanner)
 
 namespace bpftrace {
 
 class Driver {
 public:
-  explicit Driver(BPFtrace &bpftrace, std::ostream &o = std::cerr);
+  explicit Driver(ast::ASTContext &ctx, bool debug = false)
+      : ctx(ctx), debug(debug) {};
+  ast::Program *parse_program();
+  std::optional<ast::Expression> parse_expr();
 
-  int parse();
-  int parse_str(std::string_view script);
-  void source(std::string_view, std::string_view);
-  void error(std::ostream &, const location &, const std::string &);
   void error(const location &l, const std::string &m);
-  void error(const std::string &m);
-  ast::ASTContext ctx;
 
-  void debug()
-  {
-    debug_ = true;
-  };
+  // These are accessible to the parser and lexer, but are not mutable.
+  ast::ASTContext &ctx;
+  const bool debug;
 
-  std::set<std::string> list_modules() const;
+  // These are mutable state that can be modified by the lexer.
+  location loc;
+  std::string struct_type;
+  std::string buffer;
 
-  BPFtrace &bpftrace_;
+  // This is the token injected into the lexer.
+  std::optional<Parser::symbol_type> token;
 
-  bool listing_ = false;
+  // The final result is available here.
+  std::variant<ast::Program *, ast::Expression> result;
 
 private:
-  std::ostream &out_;
-  bool failed_ = false;
-  bool debug_ = false;
+  void parse(Parser::symbol_type first_token);
 };
+
+ast::Pass CreateParsePass(bool debug = false);
 
 } // namespace bpftrace

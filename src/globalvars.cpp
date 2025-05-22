@@ -1,16 +1,14 @@
-#include "globalvars.h"
-
-#include "bpftrace.h"
-#include "log.h"
-#include "types.h"
-#include "utils.h"
-
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
 #include <elf.h>
-#include <map>
-#include <stdexcept>
 #include <sys/mman.h>
+
+#include "bpftrace.h"
+#include "globalvars.h"
+#include "log.h"
+#include "required_resources.h"
+#include "types.h"
+#include "util/exceptions.h"
 
 namespace bpftrace::globalvars {
 
@@ -30,7 +28,7 @@ static void verify_maps_found(
 {
   for (const auto global_var : bpftrace.resources.needed_global_vars) {
     auto config = get_config(global_var);
-    if (!section_name_to_global_vars_map.count(config.section)) {
+    if (!section_name_to_global_vars_map.contains(config.section)) {
       LOG(BUG) << "No map found for " << config.section
                << " which is needed to set global variable " << config.name;
     }
@@ -82,7 +80,7 @@ static std::map<GlobalVar, int> find_btf_var_offsets(
     vars_and_offsets[global_var] = -1;
   }
 
-  int i;
+  uint16_t i;
   struct btf_var_secinfo *member;
 
   for (i = 0, member = btf_var_secinfos(section_type);
@@ -94,10 +92,15 @@ static std::map<GlobalVar, int> find_btf_var_offsets(
     }
 
     std::string_view name = btf__name_by_offset(self_btf, type_id->name_off);
-    vars_and_offsets[from_string(name)] = member->offset;
+
+    // Only deal with bpftrace's known global variables. Other global variables
+    // could come from imported BPF libraries, for example.
+    auto global_var = from_string(name);
+    if (global_var)
+      vars_and_offsets[*global_var] = member->offset;
   }
 
-  for (const auto [global_var, offset] : vars_and_offsets) {
+  for (const auto &[global_var, offset] : vars_and_offsets) {
     if (offset < 0) {
       LOG(BUG) << "Global variable " << to_string(global_var)
                << " has not been added to the BPF code "
@@ -120,15 +123,15 @@ static void update_global_vars_rodata(
 
   size_t v_size;
   char *global_vars_buf = reinterpret_cast<char *>(
-      const_cast<void *>(bpf_map__initial_value(global_vars_map, &v_size)));
+      bpf_map__initial_value(global_vars_map, &v_size));
 
   if (!global_vars_buf) {
     LOG(BUG) << "Failed to get array buf for global variable map";
   }
 
   // Update the values for the global vars (using the above offsets)
-  for (const auto [global_var, offset] : vars_and_offsets) {
-    int64_t *var = reinterpret_cast<int64_t *>(global_vars_buf + offset);
+  for (const auto &[global_var, offset] : vars_and_offsets) {
+    auto *var = reinterpret_cast<int64_t *>(global_vars_buf + offset);
 
     switch (global_var) {
       case GlobalVar::NUM_CPUS:
@@ -163,7 +166,7 @@ static void update_global_vars_custom_rw_section(
   auto global_var = *needed_global_vars.begin();
 
   size_t actual_size;
-  auto buf = bpf_map__initial_value(global_vars_map, &actual_size);
+  auto *buf = bpf_map__initial_value(global_vars_map, &actual_size);
   if (!buf) {
     LOG(BUG) << "Failed to get size for section " << section_name
              << " before resizing";
@@ -175,9 +178,9 @@ static void update_global_vars_custom_rw_section(
   auto desired_size = (bpftrace.max_cpu_id_ + 1) * actual_size;
   auto err = bpf_map__set_value_size(global_vars_map, desired_size);
   if (err != 0) {
-    throw bpftrace::FatalUserException("Failed to set size to " +
-                                       std::to_string(desired_size) +
-                                       " for section " + section_name);
+    throw util::FatalUserException("Failed to set size to " +
+                                   std::to_string(desired_size) +
+                                   " for section " + section_name);
   }
 
   buf = bpf_map__initial_value(global_vars_map, &actual_size);
@@ -186,7 +189,7 @@ static void update_global_vars_custom_rw_section(
              << " after resizing";
   }
   if (actual_size != desired_size) {
-    throw bpftrace::FatalUserException(
+    throw util::FatalUserException(
         "Failed to set size from " + std::to_string(actual_size) + " to " +
         std::to_string(desired_size) + " for section " + section_name);
   }
@@ -238,14 +241,13 @@ std::string to_string(GlobalVar global_var)
   return get_config(global_var).name;
 }
 
-GlobalVar from_string(std::string_view name)
+std::optional<GlobalVar> from_string(std::string_view name)
 {
   for (const auto &[global_var, config] : GLOBAL_VAR_CONFIGS) {
     if (config.name == name)
       return global_var;
   }
-  LOG(BUG) << "Unknown global variable " << name;
-  return {}; // unreachable
+  return {};
 }
 
 static SizedType make_rw_type(size_t num_elements,
@@ -275,7 +277,7 @@ SizedType get_type(bpftrace::globalvars::GlobalVar global_var,
                           CreateArray(resources.max_tuple_size, CreateInt8()));
     case bpftrace::globalvars::GlobalVar::GET_STR_BUFFER: {
       assert(resources.str_buffers > 0);
-      const auto max_strlen = bpftrace_config.get(ConfigKeyInt::max_strlen);
+      const auto max_strlen = bpftrace_config.max_strlen;
       return make_rw_type(resources.str_buffers,
                           CreateArray(max_strlen, CreateInt8()));
     }

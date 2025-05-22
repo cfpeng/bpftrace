@@ -27,15 +27,21 @@ endif()
 
 add_executable(bpftrace_test
   ast.cpp
+  async_action.cpp
   bpfbytecode.cpp
   bpftrace.cpp
   child.cpp
   clang_parser.cpp
   config.cpp
   collect_nodes.cpp
-  cstring_view.cpp
+  deprecated.cpp
   field_analyser.cpp
+  fold_literals.cpp
+  function_registry.cpp
+  imports.cpp
+  location.cpp
   log.cpp
+  macro_expansion.cpp
   main.cpp
   mocks.cpp
   output.cpp
@@ -44,40 +50,32 @@ add_executable(bpftrace_test
   procmon.cpp
   probe.cpp
   config_analyser.cpp
+  pass_manager.cpp
+  pid_filter_pass.cpp
+  recursion_check.cpp
   resource_analyser.cpp
+  result.cpp
   required_resources.cpp
   return_path_analyser.cpp
+  scopeguard.cpp
   semantic_analyser.cpp
+  temp.cpp
   tracepoint_format_parser.cpp
   types.cpp
+  unstable_feature.cpp
   utils.cpp
 
   ${CODEGEN_SRC}
 )
+add_test(NAME bpftrace_test COMMAND bpftrace_test)
 
 add_subdirectory(data)
-if(${LLDB_FOUND})
-  add_dependencies(bpftrace_test debuginfo_dwarf_data)
-  add_dependencies(bpftrace_test data_source_cxx)
-endif()
-add_dependencies(bpftrace_test debuginfo_btf_data)
+add_dependencies(bpftrace_test data_source_dwarf data_source_btf data_source_funcs parser)
 target_include_directories(bpftrace_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(bpftrace_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_definitions(bpftrace_test PRIVATE TEST_CODEGEN_LOCATION="${CMAKE_SOURCE_DIR}/tests/codegen/llvm/")
 target_link_libraries(bpftrace_test libbpftrace)
-
-if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-  target_compile_definitions(bpftrace_test PRIVATE ARCH_AARCH64)
-elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64" OR
-       CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le")
-  target_compile_definitions(bpftrace_test PRIVATE ARCH_PPC64)
-elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "s390" OR
-       CMAKE_SYSTEM_PROCESSOR STREQUAL "s390x")
-  target_compile_definitions(bpftrace_test PRIVATE ARCH_S390)
-elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-  target_compile_definitions(bpftrace_test PRIVATE ARCH_X86_64)
-endif()
 
 target_compile_definitions(bpftrace_test PRIVATE ${BPFTRACE_FLAGS})
 
@@ -94,11 +92,8 @@ find_package(GMock REQUIRED)
 include_directories(SYSTEM ${GTEST_INCLUDE_DIRS} ${GMOCK_INCLUDE_DIRS})
 target_link_libraries(bpftrace_test ${GTEST_BOTH_LIBRARIES} ${GMOCK_LIBRARIES})
 
-add_test(NAME bpftrace_test COMMAND bpftrace_test)
-if(NOT STATIC_LINKING)
-  find_package(Threads REQUIRED)
-  target_link_libraries(bpftrace_test ${CMAKE_THREAD_LIBS_INIT})
-endif(NOT STATIC_LINKING)
+find_package(Threads REQUIRED)
+target_link_libraries(bpftrace_test ${CMAKE_THREAD_LIBS_INIT})
 
 add_subdirectory(testprogs)
 add_subdirectory(testlibs)
@@ -152,11 +147,6 @@ configure_file(runtime/engine/cmake_vars.py ${CMAKE_CURRENT_BINARY_DIR}/runtime/
 configure_file(tools-parsing-test.sh tools-parsing-test.sh COPYONLY)
 add_custom_target(tools-parsing-test COMMAND ./tools-parsing-test.sh)
 add_test(NAME tools-parsing-test COMMAND ./tools-parsing-test.sh)
-
-if (BUILD_ASAN)
-  configure_file(memleak-tests.sh memleak-tests.sh COPYONLY)
-  add_custom_target(memleak-test COMMAND ./memleak-tests.sh)
-endif()
 
 if(ENABLE_TEST_VALIDATE_CODEGEN)
   if(${LLVM_VERSION_MAJOR} VERSION_EQUAL 18)

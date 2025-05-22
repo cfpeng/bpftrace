@@ -1,7 +1,10 @@
 #include <climits>
 #include <sstream>
 
+#include "ast/attachpoint_parser.h"
+#include "ast/passes/c_macro_expansion.h"
 #include "ast/passes/printer.h"
+#include "clang_parser.h"
 #include "driver.h"
 #include "gtest/gtest.h"
 
@@ -10,12 +13,17 @@ namespace bpftrace::test::parser {
 using Printer = ast::Printer;
 
 void test_parse_failure(BPFtrace &bpftrace,
-                        std::string_view input,
+                        const std::string &input,
                         std::string_view expected_error)
 {
   std::stringstream out;
-  Driver driver(bpftrace, out);
-  EXPECT_EQ(driver.parse_str(input), 1);
+  ast::ASTContext ast("stdin", input);
+  Driver driver(ast);
+  ast.root = driver.parse_program();
+  ast::AttachPointParser ap_parser(ast, bpftrace, false);
+  ap_parser.parse();
+  ASSERT_FALSE(ast.diagnostics().ok());
+  ast.diagnostics().emit(out);
 
   if (expected_error.data()) {
     if (!expected_error.empty() && expected_error[0] == '\n')
@@ -24,27 +32,68 @@ void test_parse_failure(BPFtrace &bpftrace,
   }
 }
 
-void test_parse_failure(std::string_view input, std::string_view expected_error)
+void test_parse_failure(const std::string &input,
+                        std::string_view expected_error)
 {
   BPFtrace bpftrace;
   test_parse_failure(bpftrace, input, expected_error);
 }
 
-void test(BPFtrace &bpftrace, std::string_view input, std::string_view expected)
+void test_macro_parse_failure(BPFtrace &bpftrace,
+                              const std::string &input,
+                              std::string_view expected_error)
 {
-  Driver driver(bpftrace);
-  ASSERT_EQ(driver.parse_str(input), 0);
+  std::stringstream out;
+  ast::ASTContext ast("stdin", input);
+  auto ok = ast::PassManager()
+                .put(ast)
+                .put(bpftrace)
+                .add(CreateParsePass())
+                .add(CreateClangPass())
+                .add(ast::CreateCMacroExpansionPass())
+                .run();
+  ASSERT_TRUE(bool(ok));
+
+  ASSERT_FALSE(ast.diagnostics().ok());
+  ast.diagnostics().emit(out);
+
+  if (expected_error.data()) {
+    if (!expected_error.empty() && expected_error[0] == '\n')
+      expected_error.remove_prefix(1); // Remove initial '\n'
+    EXPECT_EQ(expected_error, out.str());
+  }
+}
+
+void test_macro_parse_failure(const std::string &input,
+                              std::string_view expected_error)
+{
+  BPFtrace bpftrace;
+  test_macro_parse_failure(bpftrace, input, expected_error);
+}
+
+void test(BPFtrace &bpftrace,
+          const std::string &input,
+          std::string_view expected)
+{
+  ast::ASTContext ast("stdin", input);
+  Driver driver(ast);
+
+  ast.root = driver.parse_program();
+  ast::AttachPointParser ap_parser(ast, bpftrace, false);
+  ap_parser.parse();
+  std::ostringstream out;
+  ast.diagnostics().emit(out);
+  ASSERT_TRUE(ast.diagnostics().ok()) << out.str();
 
   if (expected[0] == '\n')
     expected.remove_prefix(1); // Remove initial '\n'
 
-  std::ostringstream out;
   Printer printer(out);
-  printer.print(driver.ctx.root);
+  printer.visit(ast.root);
   EXPECT_EQ(expected, out.str());
 }
 
-void test(std::string_view input, std::string_view expected)
+void test(const std::string &input, std::string_view expected)
 {
   BPFtrace bpftrace;
   test(bpftrace, input, expected);
@@ -198,6 +247,12 @@ stdin:1:12-14: ERROR: param $0 is out of integer range [1, 9223372036854775807]
 kprobe:f { $0 }
            ~~
 )");
+
+  test_parse_failure("kprobe:f { $999999999999999999999999 }", R"(
+stdin:1:12-37: ERROR: param $999999999999999999999999 is out of integer range [1, 9223372036854775807]
+kprobe:f { $999999999999999999999999 }
+           ~~~~~~~~~~~~~~~~~~~~~~~~~
+)");
 }
 
 TEST(Parser, positional_param_count)
@@ -238,6 +293,13 @@ TEST(Parser, positional_param_attachpoint)
 )PROG");
 
   test(bpftrace,
+       R"PROG(uprobe:/$1/bash:readline { 1 })PROG",
+       R"PROG(Program
+ uprobe:/foo/bash:readline
+  int: 1
+)PROG");
+
+  test(bpftrace,
        R"PROG(uprobe:$1:$2 { 1 })PROG",
        R"PROG(Program
  uprobe:foo:bar
@@ -273,41 +335,44 @@ TEST(Parser, positional_param_attachpoint)
 )PROG");
 
   test(bpftrace,
-       R"PROG(uprobe:aa$1:$2 { 1 })PROG",
+       R"PROG(uprobe:aa$1aa:$2 { 1 })PROG",
        R"PROG(Program
- uprobe:aafoo:bar
+ uprobe:aafooaa:bar
   int: 1
 )PROG");
 
-  // Error location is incorrect: #3063
-  test_parse_failure(bpftrace, R"(uprobe:$1a { 1 })", R"(
-stdin:1:1-12: ERROR: Found trailing text 'a' in positional parameter index. Try quoting the trailing text.
-uprobe:$1a { 1 }
-~~~~~~~~~~~
-stdin:1:1-1: ERROR: No attach points for probe
-uprobe:$1a { 1 }
+  test(bpftrace,
+       R"PROG(uprobe:$1:$2func$4 { 1 })PROG",
+       R"PROG(Program
+ uprobe:foo:barfunc
+  int: 1
+)PROG");
 
+  test_parse_failure(bpftrace, R"(uprobe:/bin/bash:$0 { 1 })", R"(
+stdin:1:1-20: ERROR: invalid trailing character for positional param: 0. Try quoting this entire part if this is intentional e.g. "$0".
+uprobe:/bin/bash:$0 { 1 }
+~~~~~~~~~~~~~~~~~~~
+stdin:1:1-26: ERROR: No attach points for probe
+uprobe:/bin/bash:$0 { 1 }
+~~~~~~~~~~~~~~~~~~~~~~~~~
 )");
 
-  test_parse_failure(bpftrace, R"(uprobe:$a { 1 })", R"(
-stdin:1:1-11: ERROR: syntax error, unexpected variable, expecting {
-uprobe:$a { 1 }
-~~~~~~~~~~
-)");
-
-  test_parse_failure(bpftrace, R"(uprobe:$-1 { 1 })", R"(
-stdin:1:1-10: ERROR: invalid character '$'
-uprobe:$-1 { 1 }
-~~~~~~~~~
-stdin:1:1-11: ERROR: syntax error, unexpected -, expecting {
-uprobe:$-1 { 1 }
-~~~~~~~~~~
+  test_parse_failure(bpftrace, R"(uprobe:/bin/bash:$a { 1 })", R"(
+stdin:1:1-20: ERROR: invalid trailing character for positional param: a. Try quoting this entire part if this is intentional e.g. "$a".
+uprobe:/bin/bash:$a { 1 }
+~~~~~~~~~~~~~~~~~~~
+stdin:1:1-26: ERROR: No attach points for probe
+uprobe:/bin/bash:$a { 1 }
+~~~~~~~~~~~~~~~~~~~~~~~~~
 )");
 
   test_parse_failure(bpftrace, R"(uprobe:$999999999999999999999999 { 1 })", R"(
-stdin:1:1-34: ERROR: param $999999999999999999999999 is out of integer range [1, 9223372036854775807]
+stdin:1:1-33: ERROR: positional param index 999999999999999999999999 is out of integer range. Max int: 9223372036854775807
 uprobe:$999999999999999999999999 { 1 }
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+stdin:1:1-39: ERROR: No attach points for probe
+uprobe:$999999999999999999999999 { 1 }
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 )");
 }
 
@@ -404,7 +469,8 @@ TEST(Parser, variable_assign)
        " kprobe:sys_open\n"
        "  =\n"
        "   variable: $x\n"
-       "   int: -1\n");
+       "   -\n"
+       "    int: 1\n");
 
   char in_cstr[128];
   char out_cstr[128];
@@ -416,8 +482,9 @@ TEST(Parser, variable_assign)
            " kprobe:sys_open\n"
            "  =\n"
            "   variable: $x\n"
-           "   int: %ld\n",
-           LONG_MIN);
+           "   -\n"
+           "    int: %lu\n",
+           static_cast<unsigned long>(LONG_MAX) + 1);
   test(std::string(in_cstr), std::string(out_cstr));
 }
 
@@ -1122,41 +1189,19 @@ TEST(Parser, call)
        "   map: @x\n");
 }
 
-TEST(Parser, call_unknown_function)
+TEST(Parser, call_function)
 {
-  test_parse_failure("kprobe:sys_open { myfunc() }", R"(
-stdin:1:19-25: ERROR: Unknown function: myfunc
-kprobe:sys_open { myfunc() }
-                  ~~~~~~
-)");
+  // builtin func
+  test("kprobe:sys_open { ustack() }",
+       "Program\n"
+       " kprobe:sys_open\n"
+       "  call: ustack\n");
 
-  test_parse_failure("k:f { probe(); }", R"(
-stdin:1:7-12: ERROR: Unknown function: probe
-k:f { probe(); }
-      ~~~~~
-)");
-}
-
-TEST(Parser, call_builtin)
-{
-  // Builtins should not be usable as function
-  test_parse_failure("k:f { probe(\"blah\"); }", R"(
-stdin:1:7-12: ERROR: Unknown function: probe
-k:f { probe("blah"); }
-      ~~~~~
-)");
-
-  test_parse_failure("k:f { probe(); }", R"(
-stdin:1:7-12: ERROR: Unknown function: probe
-k:f { probe(); }
-      ~~~~~
-)");
-
-  test_parse_failure("k:f { probe(123); }", R"(
-stdin:1:7-12: ERROR: Unknown function: probe
-k:f { probe(123); }
-      ~~~~~
-)");
+  // unknown func
+  test("kprobe:sys_open { myfunc() }",
+       "Program\n"
+       " kprobe:sys_open\n"
+       "  call: myfunc\n");
 }
 
 TEST(Parser, call_kaddr)
@@ -1351,6 +1396,28 @@ tracepoint:f { 1 }
 stdin:1:1-11: ERROR: tracepoint probe type requires 2 arguments, found 0
 tracepoint { 1 }
 ~~~~~~~~~~
+)");
+}
+
+TEST(Parser, rawtracepoint_probe)
+{
+  test("rawtracepoint:sched:sched_switch { 1 }",
+       "Program\n"
+       " rawtracepoint:sched:sched_switch\n"
+       "  int: 1\n");
+  test("rawtracepoint:* { 1 }",
+       "Program\n"
+       " rawtracepoint:*:*\n"
+       "  int: 1\n");
+  test("rawtracepoint:f { 1 }",
+       "Program\n"
+       " rawtracepoint:*:f\n"
+       "  int: 1\n");
+
+  test_parse_failure("rawtracepoint { 1 }", R"(
+stdin:1:1-14: ERROR: rawtracepoint probe type requires 2 or 1 arguments, found 0
+rawtracepoint { 1 }
+~~~~~~~~~~~~~
 )");
 }
 
@@ -1811,7 +1878,7 @@ TEST(Parser, cast_sized_type)
   test("kprobe:sys_read { (string)arg0; }",
        "Program\n"
        " kprobe:sys_read\n"
-       "  (string[0])\n"
+       "  (string)\n"
        "   builtin: arg0\n");
 }
 
@@ -1820,16 +1887,16 @@ TEST(Parser, cast_sized_type_pointer)
   test("kprobe:sys_read { (string *)arg0; }",
        "Program\n"
        " kprobe:sys_read\n"
-       "  (string[0] *)\n"
+       "  (string *)\n"
        "   builtin: arg0\n");
 }
 
 TEST(Parser, cast_sized_type_pointer_with_size)
 {
-  test("kprobe:sys_read { (string[1] *)arg0; }",
+  test("kprobe:sys_read { (inet[1] *)arg0; }",
        "Program\n"
        " kprobe:sys_read\n"
-       "  (string[1] *)\n"
+       "  (inet[1] *)\n"
        "   builtin: arg0\n");
 }
 
@@ -1936,6 +2003,17 @@ TEST(Parser, cast_precedence)
        "   int: 123\n");
 }
 
+TEST(Parser, cast_enum)
+{
+  test("enum Foo { ONE = 1 } kprobe:sys_read { (enum Foo)1; }",
+       "enum Foo { ONE = 1 };\n"
+       "\n"
+       "Program\n"
+       " kprobe:sys_read\n"
+       "  (enum Foo)\n"
+       "   int: 1\n");
+}
+
 TEST(Parser, sizeof_expression)
 {
   test("kprobe:sys_read { sizeof(arg0); }",
@@ -1963,6 +2041,23 @@ TEST(Parser, offsetof_type)
        "  offsetof: \n"
        "   struct Foo\n"
        "   x\n");
+  test("struct Foo { struct Bar { int x; } bar; } "
+       "BEGIN { offsetof(struct Foo, bar.x); }",
+       "struct Foo { struct Bar { int x; } bar; };\n"
+       "\n"
+       "Program\n"
+       " BEGIN\n"
+       "  offsetof: \n"
+       "   struct Foo\n"
+       "   bar\n"
+       "   x\n");
+  test_parse_failure("struct Foo { struct Bar { int x; } *bar; } "
+                     "BEGIN { offsetof(struct Foo, bar->x); }",
+                     R"(
+stdin:1:74-79: ERROR: syntax error, unexpected ->, expecting ) or .
+struct Foo { struct Bar { int x; } *bar; } BEGIN { offsetof(struct Foo, bar->x); }
+                                                                         ~~~~~
+)");
 }
 
 TEST(Parser, offsetof_expression)
@@ -2085,6 +2180,24 @@ TEST(Parser, field_access_builtin_type)
        "   timestamp\n");
 }
 
+TEST(Parser, field_access_sized_type)
+{
+  test("kprobe:sys_read { @x.buffer; }",
+       "Program\n"
+       " kprobe:sys_read\n"
+       "  .\n"
+       "   map: @x\n"
+       "   buffer\n");
+
+  test("kprobe:sys_read { @x->string; }",
+       "Program\n"
+       " kprobe:sys_read\n"
+       "  .\n"
+       "   dereference\n"
+       "    map: @x\n"
+       "   string\n");
+}
+
 TEST(Parser, array_access)
 {
   test("kprobe:sys_read { x[index]; }",
@@ -2136,10 +2249,12 @@ TEST(Parser, cstruct_nested)
 
 TEST(Parser, unexpected_symbol)
 {
-  BPFtrace bpftrace;
   std::stringstream out;
-  Driver driver(bpftrace, out);
-  EXPECT_EQ(driver.parse_str("i:s:1 { < }"), 1);
+  ast::ASTContext ast("stdin", "i:s:1 { < }");
+  Driver driver(ast);
+  ast.root = driver.parse_program();
+  ASSERT_FALSE(ast.diagnostics().ok());
+  ast.diagnostics().emit(out);
   std::string expected =
       R"(stdin:1:9-10: ERROR: syntax error, unexpected <
 i:s:1 { < }
@@ -2150,10 +2265,12 @@ i:s:1 { < }
 
 TEST(Parser, string_with_tab)
 {
-  BPFtrace bpftrace;
   std::stringstream out;
-  Driver driver(bpftrace, out);
-  EXPECT_EQ(driver.parse_str("i:s:1\t\t\t$a"), 1);
+  ast::ASTContext ast("stdin", "i:s:1\t\t\t$a");
+  Driver driver(ast);
+  ast.root = driver.parse_program();
+  ASSERT_FALSE(ast.diagnostics().ok());
+  ast.diagnostics().emit(out);
   std::string expected =
       R"(stdin:1:9-11: ERROR: syntax error, unexpected variable, expecting {
 i:s:1            $a
@@ -2164,10 +2281,12 @@ i:s:1            $a
 
 TEST(Parser, unterminated_string)
 {
-  BPFtrace bpftrace;
   std::stringstream out;
-  Driver driver(bpftrace, out);
-  EXPECT_EQ(driver.parse_str("kprobe:f { \"asdf }"), 1);
+  ast::ASTContext ast("stdin", "kprobe:f { \"asdf }");
+  Driver driver(ast);
+  ast.root = driver.parse_program();
+  ASSERT_FALSE(ast.diagnostics().ok());
+  ast.diagnostics().emit(out);
   std::string expected =
       R"(stdin:1:12-19: ERROR: unterminated string
 kprobe:f { "asdf }
@@ -2196,7 +2315,7 @@ TEST(Parser, kprobe_offset)
        " kprobe:fn.abc+16\n");
 
   test_parse_failure("k:asdf+123abc", R"(
-stdin:1:1-14: ERROR: unexpected end of file, expected {
+stdin:1:1-14: ERROR: syntax error, unexpected end of file, expecting {
 k:asdf+123abc
 ~~~~~~~~~~~~~
 )");
@@ -2280,11 +2399,12 @@ i:s:1 { @="a"++}
 
 TEST(Parser, long_param_overflow)
 {
-  BPFtrace bpftrace;
   std::stringstream out;
-  Driver driver(bpftrace, out);
-  EXPECT_NO_THROW(
-      driver.parse_str("i:s:100 { @=$111111111111111111111111111 }"));
+  ast::ASTContext ast("stdin", "i:s:100 { @=$111111111111111111111111111 }");
+  Driver driver(ast);
+  EXPECT_NO_THROW(driver.parse_program());
+  ASSERT_FALSE(ast.diagnostics().ok());
+  ast.diagnostics().emit(out);
   std::string expected = "stdin:1:11-41: ERROR: param "
                          "$111111111111111111111111111 is out of "
                          "integer range [1, " +
@@ -2298,9 +2418,9 @@ TEST(Parser, long_param_overflow)
 TEST(Parser, empty_arguments)
 {
   test_parse_failure("::k::vfs_open:: { 1 }", R"(
-stdin:1:1-1: ERROR: No attach points for probe
+stdin:1:1-26: ERROR: No attach points for probe
 ::k::vfs_open:: { 1 }
-
+~~~~~~~~~~~~~~~~~~~~~
 )");
 
   // Error location is incorrect: #3063
@@ -2311,9 +2431,9 @@ k:vfs_open:: { 1 }
 )");
 
   test_parse_failure(":w:0x10000000:8:rw { 1 }", R"(
-stdin:1:1-1: ERROR: No attach points for probe
+stdin:1:1-25: ERROR: No attach points for probe
 :w:0x10000000:8:rw { 1 }
-
+~~~~~~~~~~~~~~~~~~~~~~~~
 )");
 }
 
@@ -2428,10 +2548,12 @@ TEST(Parser, while_loop)
 
 TEST(Parser, tuple_assignment_error_message)
 {
-  BPFtrace bpftrace;
   std::stringstream out;
-  Driver driver(bpftrace, out);
-  EXPECT_EQ(driver.parse_str("i:s:1 { @x = (1, 2); $x.1 = 1; }"), 1);
+  ast::ASTContext ast("stdin", "i:s:1 { @x = (1, 2); $x.1 = 1; }");
+  Driver driver(ast);
+  ast.root = driver.parse_program();
+  ASSERT_FALSE(ast.diagnostics().ok());
+  ast.diagnostics().emit(out);
   std::string expected =
       R"(stdin:1:22-30: ERROR: Tuples are immutable once created. Consider creating a new tuple and assigning it instead.
 i:s:1 { @x = (1, 2); $x.1 = 1; }
@@ -2533,7 +2655,7 @@ TEST(Parser, config)
 Program
  config
   =
-   config var: blah
+   var: blah
    int: 5
  BEGIN
 )");
@@ -2542,7 +2664,7 @@ Program
 Program
  config
   =
-   config var: blah
+   var: blah
    int: 5
  BEGIN
 )");
@@ -2551,10 +2673,10 @@ Program
 Program
  config
   =
-   config var: blah
+   var: blah
    int: 5
   =
-   config var: zoop
+   var: zoop
    string: a
  BEGIN
 )");
@@ -2576,9 +2698,9 @@ i:s:1 { exit(); } config = { BPFTRACE_STACK_MODE=perf }
 )");
 
   test_parse_failure("config = { exit(); } i:s:1 { exit(); }", R"(
-stdin:1:12-16: ERROR: syntax error, unexpected call, expecting } or identifier
+stdin:1:12-17: ERROR: syntax error, unexpected (, expecting =
 config = { exit(); } i:s:1 { exit(); }
-           ~~~~
+           ~~~~~
 )");
 
   test_parse_failure("config = { @start = nsecs; } i:s:1 { exit(); }", R"(
@@ -2652,8 +2774,8 @@ TEST(Parser, subprog_probe_mixed)
 {
   test("i:s:1 {} fn f1(): void {} i:s:1 {} fn f2(): void {}",
        "Program\n"
-       " f1: void()\n"
-       " f2: void()\n"
+       " subprog: f1 :: [void]\n"
+       " subprog: f2 :: [void]\n"
        " interval:s:1\n"
        " interval:s:1\n");
 }
@@ -2662,7 +2784,7 @@ TEST(Parser, subprog_void_no_args)
 {
   test("fn f(): void {}",
        "Program\n"
-       " f: void()\n");
+       " subprog: f :: [void]\n");
 }
 
 TEST(Parser, subprog_invalid_return_type)
@@ -2679,42 +2801,55 @@ TEST(Parser, subprog_one_arg)
 {
   test("fn f($a : uint8): void {}",
        "Program\n"
-       " f: void($a : uint8)\n");
+       " subprog: f :: [void]\n"
+       "  args\n"
+       "   $a :: [uint8]\n");
 }
 
 TEST(Parser, subprog_two_args)
 {
   test("fn f($a : uint8, $b : uint8): void {}",
        "Program\n"
-       " f: void($a : uint8, $b : uint8)\n");
+       " subprog: f :: [void]\n"
+       "  args\n"
+       "   $a :: [uint8]\n"
+       "   $b :: [uint8]\n");
 }
 
 TEST(Parser, subprog_string_arg)
 {
-  test("fn f($a : string[16]): void {}",
+  test("fn f($a : string): void {}",
        "Program\n"
-       " f: void($a : string[16])\n");
+       " subprog: f :: [void]\n"
+       "  args\n"
+       "   $a :: [string[0]]\n");
 }
 
 TEST(Parser, subprog_struct_arg)
 {
   test("fn f($a: struct x): void {}",
        "Program\n"
-       " f: void($a : struct x)\n");
+       " subprog: f :: [void]\n"
+       "  args\n"
+       "   $a :: [struct x]\n");
 }
 
 TEST(Parser, subprog_union_arg)
 {
   test("fn f($a : union x): void {}",
        "Program\n"
-       " f: void($a : union x)\n");
+       " subprog: f :: [void]\n"
+       "  args\n"
+       "   $a :: [union x]\n");
 }
 
 TEST(Parser, subprog_enum_arg)
 {
   test("fn f($a : enum x): void {}",
        "Program\n"
-       " f: void($a : enum x)\n");
+       " subprog: f :: [void]\n"
+       "  args\n"
+       "   $a :: [enum x]\n");
 }
 
 TEST(Parser, subprog_invalid_arg)
@@ -2731,7 +2866,7 @@ TEST(Parser, subprog_return)
 {
   test("fn f(): void { return 1 + 1; }",
        "Program\n"
-       " f: void()\n"
+       " subprog: f :: [void]\n"
        "  return\n"
        "   +\n"
        "    int: 1\n"
@@ -2740,30 +2875,30 @@ TEST(Parser, subprog_return)
 
 TEST(Parser, subprog_string)
 {
-  test("fn f(): string[16] {}",
+  test("fn f(): string {}",
        "Program\n"
-       " f: string[16]()\n");
+       " subprog: f :: [string[0]]\n");
 }
 
 TEST(Parser, subprog_struct)
 {
   test("fn f(): struct x {}",
        "Program\n"
-       " f: struct x()\n");
+       " subprog: f :: [struct x]\n");
 }
 
 TEST(Parser, subprog_union)
 {
   test("fn f(): union x {}",
        "Program\n"
-       " f: union x()\n");
+       " subprog: f :: [union x]\n");
 }
 
 TEST(Parser, subprog_enum)
 {
   test("fn f(): enum x {}",
        "Program\n"
-       " f: enum x()\n");
+       " subprog: f :: [enum x]\n");
 }
 
 TEST(Parser, for_loop)
@@ -2774,7 +2909,6 @@ Program
   for
    decl
     variable: $kv
-   expr
     map: @map
    stmts
     call: print
@@ -2784,7 +2918,7 @@ Program
   // Error location is incorrect: #3063
   // No body
   test_parse_failure("BEGIN { for ($kv : @map) print($kv); }", R"(
-stdin:1:27-32: ERROR: syntax error, unexpected call, expecting {
+stdin:1:27-32: ERROR: syntax error, unexpected identifier, expecting {
 BEGIN { for ($kv : @map) print($kv); }
                           ~~~~~
 )");
@@ -2809,8 +2943,8 @@ Program
   test("BEGIN { let $x: int8; }", R"(
 Program
  BEGIN
-  decl
-   variable: $x :: [int8]
+  decl :: [int8]
+   variable: $x
 )");
 
   test("BEGIN { let $x = 1; }", R"(
@@ -2824,8 +2958,8 @@ Program
   test("BEGIN { let $x: int8 = 1; }", R"(
 Program
  BEGIN
-  decl
-   variable: $x :: [int8]
+  decl :: [int8]
+   variable: $x
    int: 1
 )");
 
@@ -2842,6 +2976,182 @@ stdin:1:9-12: ERROR: syntax error, unexpected :, expecting ; or }
 BEGIN { $x: int8 = 1; }
         ~~~
 )");
+}
+
+TEST(Parser, block_expressions)
+{
+  // Non-legal trailing statement
+  test_parse_failure("BEGIN { $x = { $a = 1; $b = 2 } exit(); }", R"(
+stdin:1:31-32: ERROR: syntax error, unexpected }, expecting ;
+BEGIN { $x = { $a = 1; $b = 2 } exit(); }
+                              ~
+)");
+
+  // No expression, statement with trailing ;
+  test_parse_failure("BEGIN { $x = { $a = 1; $b = 2; } exit(); }", R"(
+stdin:1:32-33: ERROR: syntax error, unexpected }
+BEGIN { $x = { $a = 1; $b = 2; } exit(); }
+                               ~
+)");
+
+  // Missing ; after block expression
+  test_parse_failure("BEGIN { $x = { $a = 1; $a } exit(); }", R"(
+stdin:1:29-33: ERROR: syntax error, unexpected identifier, expecting ; or }
+BEGIN { $x = { $a = 1; $a } exit(); }
+                            ~~~~
+)");
+
+  // Illegal; no map assignment
+  test_parse_failure("BEGIN { $x = { $a = 1; count() } exit(); }", R"(
+stdin:1:34-38: ERROR: syntax error, unexpected identifier, expecting ; or }
+BEGIN { $x = { $a = 1; count() } exit(); }
+                                 ~~~~
+)");
+
+  // Good, no map assignment
+  test("BEGIN { $x = { $a = 1; $a }; exit(); }", R"(
+Program
+ BEGIN
+  =
+   variable: $x
+   =
+    variable: $a
+    int: 1
+   variable: $a
+  call: exit
+)");
+
+  // Good, with map assignment
+  test("BEGIN { $x = { $a = 1; count() }; exit(); }", R"(
+Program
+ BEGIN
+  =
+   variable: $x
+   =
+    variable: $a
+    int: 1
+   call: count
+  call: exit
+)");
+}
+
+TEST(Parser, map_declarations)
+{
+  test("let @a = hash(5); BEGIN { $x; }", R"(
+Program
+ map decl: @a
+  bpf type: hash
+  max entries: 5
+ BEGIN
+  variable: $x
+)");
+
+  test("let @a = hash(2); let @b = percpuhash(7); BEGIN { $x; }", R"(
+Program
+ map decl: @a
+  bpf type: hash
+  max entries: 2
+ map decl: @b
+  bpf type: percpuhash
+  max entries: 7
+ BEGIN
+  variable: $x
+)");
+
+  test_parse_failure("@a = hash(); BEGIN { $x; }", R"(
+stdin:1:1-3: ERROR: syntax error, unexpected map, expecting {
+@a = hash(); BEGIN { $x; }
+~~
+)");
+
+  test_parse_failure("let @a = hash(); BEGIN { $x; }", R"(
+stdin:1:10-16: ERROR: syntax error, unexpected ), expecting integer
+let @a = hash(); BEGIN { $x; }
+         ~~~~~~
+)");
+}
+
+TEST(Parser, macro_expansion_error)
+{
+  // A recursive macro expansion
+  test_macro_parse_failure("#define M M+1\n"
+                           "BEGIN { M; }",
+                           R"(
+M:1:1-2: ERROR: Macro recursion: M
+M+1
+~
+stdin:2:9-10: ERROR: expanded from
+BEGIN { M; }
+        ~
+)");
+
+  // Invalid macro expression
+  test_macro_parse_failure("#define M {\n"
+                           "BEGIN { M; }",
+                           R"(
+stdin:2:9-10: ERROR: unable to expand macro as an expression: {
+BEGIN { M; }
+        ~
+)");
+
+  // Large source code doesn't cause any problem
+  std::string padding(16384 * 2, 'p'); // Twice the default value of YY_BUF_SIZE
+  test_macro_parse_failure("#define M M+1\n"
+                           "BEGIN { M; }\n"
+                           "END { printf(\"" +
+                               padding + "\"); }",
+                           R"(
+M:1:1-2: ERROR: Macro recursion: M
+M+1
+~
+stdin:2:9-10: ERROR: expanded from
+BEGIN { M; }
+        ~
+)");
+}
+
+TEST(Parser, imports)
+{
+  test(R"(import "foo"; BEGIN { })", R"(
+Program
+ import foo
+ BEGIN
+)");
+
+  test(R"(import "foo"; import "bar"; BEGIN { })", R"(
+Program
+ import foo
+ import bar
+ BEGIN
+)");
+
+  test_parse_failure(R"(BEGIN { }; import "foo";)", R"(
+stdin:1:9-11: ERROR: syntax error, unexpected ;, expecting {
+BEGIN { }; import "foo";
+        ~~
+)");
+
+  test_parse_failure("import 0; BEGIN { }", R"(
+stdin:1:8-9: ERROR: syntax error, unexpected integer, expecting string
+import 0; BEGIN { }
+       ~
+)");
+
+  test_parse_failure("import foo; BEGIN { }", R"(
+stdin:1:8-11: ERROR: syntax error, unexpected identifier, expecting string
+import foo; BEGIN { }
+       ~~~
+)");
+}
+
+TEST(Parser, naked_expression)
+{
+  std::stringstream out;
+  ast::ASTContext ast("stdin", "1 + 2 + 3");
+  Driver driver(ast);
+  driver.parse_expr();
+  ASSERT_TRUE(ast.diagnostics().ok());
+  ASSERT_TRUE(std::holds_alternative<ast::Expression>(driver.result));
 }
 
 } // namespace bpftrace::test::parser

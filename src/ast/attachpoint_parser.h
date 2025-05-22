@@ -1,22 +1,18 @@
 #pragma once
 
 #include <optional>
-#include <ostream>
 #include <sstream>
 #include <vector>
 
 #include "ast/ast.h"
+#include "ast/pass_manager.h"
 #include "bpftrace.h"
 
-namespace bpftrace {
-namespace ast {
+namespace bpftrace::ast {
 
 class AttachPointParser {
 public:
-  AttachPointParser(ASTContext &ctx,
-                    BPFtrace &bpftrace,
-                    std::ostream &sink,
-                    bool listing);
+  AttachPointParser(ASTContext &ctx, BPFtrace &bpftrace, bool listing);
   ~AttachPointParser() = default;
   int parse();
 
@@ -24,18 +20,16 @@ private:
   enum State { OK = 0, INVALID, NEW_APS, SKIP };
 
   State parse_attachpoint(AttachPoint &ap);
-  /*
-   * This method splits an attach point definition into arguments,
-   * where arguments are separated by `:`. The exception is `:`s inside
-   * of quoted strings, which we must treat as a literal.
-   *
-   * This method also resolves positional parameters. Positional params
-   * may be escaped with double quotes.
-   *
-   * Note that this function assumes the raw string is generally well
-   * formed. More specifically, that there is no unescaped whitespace
-   * and no unmatched quotes.
-   */
+  // This method splits an attach point definition into arguments,
+  // where arguments are separated by `:`. The exception is `:`s inside
+  // of quoted strings, which we must treat as a literal.
+  //
+  // This method also resolves positional parameters. Positional params
+  // may be escaped with double quotes.
+  //
+  // Note that this function assumes the raw string is generally well
+  // formed. More specifically, that there is no unescaped whitespace
+  // and no unmatched quotes.
   State lex_attachpoint(const AttachPoint &ap);
 
   State special_parser();
@@ -61,7 +55,6 @@ private:
 
   ASTContext &ctx_;
   BPFtrace &bpftrace_;
-  std::ostream &sink_;
   AttachPoint *ap_{ nullptr }; // Non-owning pointer
   std::stringstream errs_;
   std::vector<std::string> parts_;
@@ -69,5 +62,7 @@ private:
   bool listing_;
 };
 
-} // namespace ast
-} // namespace bpftrace
+// The attachpoints are expanded in their own separate pass.
+Pass CreateParseAttachpointsPass(bool listing = false);
+
+} // namespace bpftrace::ast

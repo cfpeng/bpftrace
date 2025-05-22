@@ -1,13 +1,11 @@
-#include "required_resources.h"
-
 #include <iostream>
 #include <sstream>
 
-#include <gtest/gtest.h>
-
 #include "format_string.h"
+#include "required_resources.h"
 #include "struct.h"
 #include "types.h"
+#include "gtest/gtest.h"
 
 namespace bpftrace::test {
 
@@ -29,7 +27,7 @@ TEST(required_resources, round_trip_simple)
   {
     RequiredResources r;
     r.load_state(input);
-    ASSERT_EQ(r.probe_ids.size(), 1ul);
+    ASSERT_EQ(r.probe_ids.size(), 1UL);
     EXPECT_EQ(r.probe_ids[0], "itsastring");
   }
 }
@@ -54,22 +52,22 @@ TEST(required_resources, round_trip_field_sized_type)
     RequiredResources r;
     r.load_state(input);
 
-    ASSERT_EQ(r.system_args.size(), 1ul);
+    ASSERT_EQ(r.system_args.size(), 1UL);
     EXPECT_EQ(std::get<0>(r.system_args[0]).str(), "field0");
 
     auto &fields = std::get<1>(r.system_args[0]);
-    ASSERT_EQ(fields.size(), 1ul);
+    ASSERT_EQ(fields.size(), 1UL);
     auto &field = fields[0];
     EXPECT_EQ(field.name, "myfield");
     EXPECT_TRUE(field.type.IsIntTy());
-    EXPECT_EQ(field.type.GetSize(), 4ul);
+    EXPECT_EQ(field.type.GetSize(), 4UL);
     EXPECT_EQ(field.offset, 123);
     // clang-tidy does not recognize ASSERT_*() terminates testcase
     // NOLINTBEGIN(bugprone-unchecked-optional-access)
     ASSERT_TRUE(field.bitfield.has_value());
-    EXPECT_EQ(field.bitfield->read_bytes, 1ul);
-    EXPECT_EQ(field.bitfield->access_rshift, 2ul);
-    EXPECT_EQ(field.bitfield->mask, 0xFFul);
+    EXPECT_EQ(field.bitfield->read_bytes, 1UL);
+    EXPECT_EQ(field.bitfield->access_rshift, 2UL);
+    EXPECT_EQ(field.bitfield->mask, 0xFFUL);
     // NOLINTEND(bugprone-unchecked-optional-access)
   }
 }
@@ -81,13 +79,12 @@ TEST(required_resources, round_trip_map_info)
     MapInfo info{
       .key_type = CreateNone(),
       .value_type = CreateInet(3),
-      .lhist_args =
+      .detail =
           LinearHistogramArgs{
               .min = 99,
               .max = 123,
               .step = 33,
           },
-      .hist_bits_arg = 1,
     };
     info.key_type = CreateInt32();
     RequiredResources r;
@@ -100,25 +97,19 @@ TEST(required_resources, round_trip_map_info)
     RequiredResources r;
     r.load_state(input);
 
-    ASSERT_EQ(r.maps_info.count("mymap"), 1ul);
+    ASSERT_EQ(r.maps_info.count("mymap"), 1UL);
     const auto &map_info = r.maps_info["mymap"];
 
     EXPECT_TRUE(map_info.value_type.IsInetTy());
-    EXPECT_EQ(map_info.value_type.GetSize(), 3ul);
+    EXPECT_EQ(map_info.value_type.GetSize(), 3UL);
 
     EXPECT_TRUE(map_info.key_type.IsIntegerTy());
     EXPECT_EQ(map_info.key_type.GetSize(), 4);
 
-    // clang-tidy does not recognize ASSERT_*() terminates testcase
-    // NOLINTBEGIN(bugprone-unchecked-optional-access)
-    ASSERT_TRUE(map_info.lhist_args.has_value());
-    EXPECT_EQ(map_info.lhist_args->min, 99);
-    EXPECT_EQ(map_info.lhist_args->max, 123);
-    EXPECT_EQ(map_info.lhist_args->step, 33);
-    // NOLINTEND(bugprone-unchecked-optional-access)
-
-    EXPECT_TRUE(map_info.hist_bits_arg.has_value());
-    EXPECT_EQ(map_info.hist_bits_arg, 1);
+    const auto &lhist_args = std::get<LinearHistogramArgs>(map_info.detail);
+    EXPECT_EQ(lhist_args.min, 99);
+    EXPECT_EQ(lhist_args.max, 123);
+    EXPECT_EQ(lhist_args.step, 33);
   }
 }
 
@@ -142,7 +133,7 @@ TEST(required_resources, round_trip_probes)
     RequiredResources r;
     r.load_state(input);
 
-    ASSERT_EQ(r.special_probes.size(), 1ul);
+    ASSERT_EQ(r.special_probes.size(), 1UL);
     auto &probe = r.special_probes["test"];
     EXPECT_EQ(probe.type, ProbeType::hardware);
     EXPECT_EQ(probe.path, "mypath");
@@ -165,9 +156,9 @@ TEST(required_resources, round_trip_multiple_members)
     RequiredResources r;
     r.load_state(input);
 
-    ASSERT_EQ(r.join_args.size(), 1ul);
+    ASSERT_EQ(r.join_args.size(), 1UL);
     EXPECT_EQ(r.join_args[0], "joinarg0");
-    ASSERT_EQ(r.time_args.size(), 1ul);
+    ASSERT_EQ(r.time_args.size(), 1UL);
     EXPECT_EQ(r.time_args[0], "timearg0");
   }
 }

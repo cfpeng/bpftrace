@@ -7,17 +7,20 @@ target triple = "bpf-pc-linux"
 %"struct map_t.0" = type { ptr, ptr, ptr, ptr }
 %exit_t = type <{ i64, i8 }>
 
-@LICENSE = global [4 x i8] c"GPL\00", section "license"
-@ringbuf = dso_local global %"struct map_t" zeroinitializer, section ".maps", !dbg !0
-@event_loss_counter = dso_local global %"struct map_t.0" zeroinitializer, section ".maps", !dbg !16
+@LICENSE = global [4 x i8] c"GPL\00", section "license", !dbg !0
+@ringbuf = dso_local global %"struct map_t" zeroinitializer, section ".maps", !dbg !7
+@event_loss_counter = dso_local global %"struct map_t.0" zeroinitializer, section ".maps", !dbg !22
 
 ; Function Attrs: nounwind
 declare i64 @llvm.bpf.pseudo(i64 %0, i64 %1) #0
 
-define i64 @kprobe_f_1(ptr %0) section "s_kprobe_f_1" !dbg !39 {
+; Function Attrs: nounwind
+define i64 @kprobe_f_1(ptr %0) #0 section "s_kprobe_f_1" !dbg !46 {
 entry:
   %key = alloca i32, align 4
   %exit = alloca %exit_t, align 8
+  %n = alloca i32, align 4
+  %i = alloca i32, align 4
   %arraycmp.result = alloca i1, align 1
   %v2 = alloca i32, align 4
   %v1 = alloca i32, align 4
@@ -27,37 +30,42 @@ entry:
   %"$a" = alloca i64, align 8
   call void @llvm.lifetime.start.p0(i64 -1, ptr %"$a")
   store i64 0, ptr %"$a", align 8
-  %1 = getelementptr i64, ptr %0, i64 14
-  %arg0 = load volatile i64, ptr %1, align 8
-  %2 = add i64 %arg0, 0
-  store i64 %2, ptr %"$a", align 8
-  %3 = getelementptr i64, ptr %0, i64 14
-  %arg01 = load volatile i64, ptr %3, align 8
-  %4 = add i64 %arg01, 0
-  store i64 %4, ptr %"$b", align 8
-  %5 = load i64, ptr %"$a", align 8
-  %6 = load i64, ptr %"$b", align 8
+  %1 = call ptr @llvm.preserve.static.offset(ptr %0)
+  %2 = getelementptr i64, ptr %1, i64 14
+  %arg0 = load volatile i64, ptr %2, align 8
+  %3 = inttoptr i64 %arg0 to ptr
+  %4 = call ptr @llvm.preserve.static.offset(ptr %3)
+  %5 = getelementptr i8, ptr %4, i64 0
+  %6 = ptrtoint ptr %5 to i64
+  store i64 %6, ptr %"$a", align 8
+  %7 = call ptr @llvm.preserve.static.offset(ptr %0)
+  %8 = getelementptr i64, ptr %7, i64 14
+  %arg01 = load volatile i64, ptr %8, align 8
+  %9 = inttoptr i64 %arg01 to ptr
+  %10 = call ptr @llvm.preserve.static.offset(ptr %9)
+  %11 = getelementptr i8, ptr %10, i64 0
+  %12 = ptrtoint ptr %11 to i64
+  store i64 %12, ptr %"$b", align 8
+  %13 = load i64, ptr %"$a", align 8
+  %14 = load i64, ptr %"$b", align 8
   call void @llvm.lifetime.start.p0(i64 -1, ptr %v1)
   call void @llvm.lifetime.start.p0(i64 -1, ptr %v2)
   call void @llvm.lifetime.start.p0(i64 -1, ptr %arraycmp.result)
   store i1 true, ptr %arraycmp.result, align 1
-  %7 = inttoptr i64 %5 to ptr
-  %8 = inttoptr i64 %6 to ptr
-  %9 = getelementptr [4 x i32], ptr %7, i32 0, i32 0
-  %probe_read_kernel = call i64 inttoptr (i64 113 to ptr)(ptr %v1, i32 4, ptr %9)
-  %10 = load i32, ptr %v1, align 4
-  %11 = getelementptr [4 x i32], ptr %8, i32 0, i32 0
-  %probe_read_kernel2 = call i64 inttoptr (i64 113 to ptr)(ptr %v2, i32 4, ptr %11)
-  %12 = load i32, ptr %v2, align 4
-  %arraycmp.cmp = icmp ne i32 %10, %12
-  br i1 %arraycmp.cmp, label %arraycmp.false, label %arraycmp.loop
+  %15 = inttoptr i64 %13 to ptr
+  %16 = inttoptr i64 %14 to ptr
+  call void @llvm.lifetime.start.p0(i64 -1, ptr %i)
+  call void @llvm.lifetime.start.p0(i64 -1, ptr %n)
+  store i32 0, ptr %i, align 4
+  store i32 4, ptr %n, align 4
+  br label %while_cond
 
 if_body:                                          ; preds = %arraycmp.done
   call void @llvm.lifetime.start.p0(i64 -1, ptr %exit)
-  %13 = getelementptr %exit_t, ptr %exit, i64 0, i32 0
-  store i64 30000, ptr %13, align 8
-  %14 = getelementptr %exit_t, ptr %exit, i64 0, i32 1
-  store i8 0, ptr %14, align 1
+  %17 = getelementptr %exit_t, ptr %exit, i64 0, i32 0
+  store i64 30000, ptr %17, align 8
+  %18 = getelementptr %exit_t, ptr %exit, i64 0, i32 1
+  store i8 0, ptr %18, align 1
   %ringbuf_output = call i64 inttoptr (i64 130 to ptr)(ptr @ringbuf, ptr %exit, i64 9, i64 0)
   %ringbuf_loss = icmp slt i64 %ringbuf_output, 0
   br i1 %ringbuf_loss, label %event_loss_counter, label %counter_merge
@@ -65,51 +73,42 @@ if_body:                                          ; preds = %arraycmp.done
 if_end:                                           ; preds = %deadcode, %arraycmp.done
   ret i64 0
 
-arraycmp.false:                                   ; preds = %arraycmp.loop7, %arraycmp.loop3, %arraycmp.loop, %entry
+while_cond:                                       ; preds = %arraycmp.loop, %entry
+  %19 = load i32, ptr %n, align 4
+  %20 = load i32, ptr %i, align 4
+  %size_check = icmp slt i32 %20, %19
+  br i1 %size_check, label %while_body, label %arraycmp.done, !llvm.loop !52
+
+while_body:                                       ; preds = %while_cond
+  %21 = load i32, ptr %i, align 4
+  %22 = getelementptr [4 x i32], ptr %15, i32 0, i32 %21
+  %probe_read_kernel = call i64 inttoptr (i64 113 to ptr)(ptr %v1, i32 4, ptr %22)
+  %23 = load i32, ptr %v1, align 4
+  %24 = load i32, ptr %i, align 4
+  %25 = getelementptr [4 x i32], ptr %16, i32 0, i32 %24
+  %probe_read_kernel2 = call i64 inttoptr (i64 113 to ptr)(ptr %v2, i32 4, ptr %25)
+  %26 = load i32, ptr %v2, align 4
+  %arraycmp.cmp = icmp ne i32 %23, %26
+  br i1 %arraycmp.cmp, label %arraycmp.false, label %arraycmp.loop
+
+arraycmp.false:                                   ; preds = %while_body
   store i1 false, ptr %arraycmp.result, align 1
   br label %arraycmp.done
 
-arraycmp.done:                                    ; preds = %arraycmp.false, %arraycmp.loop11
-  %15 = load i1, ptr %arraycmp.result, align 1
+arraycmp.done:                                    ; preds = %arraycmp.false, %while_cond
+  %27 = load i1, ptr %arraycmp.result, align 1
   call void @llvm.lifetime.end.p0(i64 -1, ptr %arraycmp.result)
   call void @llvm.lifetime.end.p0(i64 -1, ptr %v1)
   call void @llvm.lifetime.end.p0(i64 -1, ptr %v2)
-  %16 = zext i1 %15 to i64
-  %true_cond = icmp ne i64 %16, 0
+  %28 = zext i1 %27 to i64
+  %true_cond = icmp ne i64 %28, 0
   br i1 %true_cond, label %if_body, label %if_end
 
-arraycmp.loop:                                    ; preds = %entry
-  %17 = getelementptr [4 x i32], ptr %7, i32 0, i32 1
-  %probe_read_kernel4 = call i64 inttoptr (i64 113 to ptr)(ptr %v1, i32 4, ptr %17)
-  %18 = load i32, ptr %v1, align 4
-  %19 = getelementptr [4 x i32], ptr %8, i32 0, i32 1
-  %probe_read_kernel5 = call i64 inttoptr (i64 113 to ptr)(ptr %v2, i32 4, ptr %19)
-  %20 = load i32, ptr %v2, align 4
-  %arraycmp.cmp6 = icmp ne i32 %18, %20
-  br i1 %arraycmp.cmp6, label %arraycmp.false, label %arraycmp.loop3
-
-arraycmp.loop3:                                   ; preds = %arraycmp.loop
-  %21 = getelementptr [4 x i32], ptr %7, i32 0, i32 2
-  %probe_read_kernel8 = call i64 inttoptr (i64 113 to ptr)(ptr %v1, i32 4, ptr %21)
-  %22 = load i32, ptr %v1, align 4
-  %23 = getelementptr [4 x i32], ptr %8, i32 0, i32 2
-  %probe_read_kernel9 = call i64 inttoptr (i64 113 to ptr)(ptr %v2, i32 4, ptr %23)
-  %24 = load i32, ptr %v2, align 4
-  %arraycmp.cmp10 = icmp ne i32 %22, %24
-  br i1 %arraycmp.cmp10, label %arraycmp.false, label %arraycmp.loop7
-
-arraycmp.loop7:                                   ; preds = %arraycmp.loop3
-  %25 = getelementptr [4 x i32], ptr %7, i32 0, i32 3
-  %probe_read_kernel12 = call i64 inttoptr (i64 113 to ptr)(ptr %v1, i32 4, ptr %25)
-  %26 = load i32, ptr %v1, align 4
-  %27 = getelementptr [4 x i32], ptr %8, i32 0, i32 3
-  %probe_read_kernel13 = call i64 inttoptr (i64 113 to ptr)(ptr %v2, i32 4, ptr %27)
-  %28 = load i32, ptr %v2, align 4
-  %arraycmp.cmp14 = icmp ne i32 %26, %28
-  br i1 %arraycmp.cmp14, label %arraycmp.false, label %arraycmp.loop11
-
-arraycmp.loop11:                                  ; preds = %arraycmp.loop7
-  br label %arraycmp.done
+arraycmp.loop:                                    ; preds = %while_body
+  %29 = load i32, ptr %i, align 4
+  %30 = add i32 %29, 1
+  store i32 %30, ptr %i, align 4
+  br label %while_cond
 
 event_loss_counter:                               ; preds = %if_body
   call void @llvm.lifetime.start.p0(i64 -1, ptr %key)
@@ -123,7 +122,7 @@ counter_merge:                                    ; preds = %lookup_merge, %if_b
   ret i64 0
 
 lookup_success:                                   ; preds = %event_loss_counter
-  %29 = atomicrmw add ptr %lookup_elem, i64 1 seq_cst, align 8
+  %31 = atomicrmw add ptr %lookup_elem, i64 1 seq_cst, align 8
   br label %lookup_merge
 
 lookup_failure:                                   ; preds = %event_loss_counter
@@ -137,61 +136,73 @@ deadcode:                                         ; No predecessors!
   br label %if_end
 }
 
-; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)
-declare void @llvm.lifetime.start.p0(i64 immarg %0, ptr nocapture %1) #1
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare ptr @llvm.preserve.static.offset(ptr readnone %0) #1
 
 ; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)
-declare void @llvm.lifetime.end.p0(i64 immarg %0, ptr nocapture %1) #1
+declare void @llvm.lifetime.start.p0(i64 immarg %0, ptr nocapture %1) #2
+
+; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)
+declare void @llvm.lifetime.end.p0(i64 immarg %0, ptr nocapture %1) #2
 
 attributes #0 = { nounwind }
-attributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }
 
-!llvm.dbg.cu = !{!36}
-!llvm.module.flags = !{!38}
+!llvm.dbg.cu = !{!42}
+!llvm.module.flags = !{!44, !45}
 
 !0 = !DIGlobalVariableExpression(var: !1, expr: !DIExpression())
-!1 = distinct !DIGlobalVariable(name: "ringbuf", linkageName: "global", scope: !2, file: !2, type: !3, isLocal: false, isDefinition: true)
+!1 = distinct !DIGlobalVariable(name: "LICENSE", linkageName: "global", scope: !2, file: !2, type: !3, isLocal: false, isDefinition: true)
 !2 = !DIFile(filename: "bpftrace.bpf.o", directory: ".")
-!3 = !DICompositeType(tag: DW_TAG_structure_type, scope: !2, file: !2, size: 128, elements: !4)
-!4 = !{!5, !11}
-!5 = !DIDerivedType(tag: DW_TAG_member, name: "type", scope: !2, file: !2, baseType: !6, size: 64)
-!6 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !7, size: 64)
-!7 = !DICompositeType(tag: DW_TAG_array_type, baseType: !8, size: 864, elements: !9)
-!8 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
-!9 = !{!10}
-!10 = !DISubrange(count: 27, lowerBound: 0)
-!11 = !DIDerivedType(tag: DW_TAG_member, name: "max_entries", scope: !2, file: !2, baseType: !12, size: 64, offset: 64)
+!3 = !DICompositeType(tag: DW_TAG_array_type, baseType: !4, size: 32, elements: !5)
+!4 = !DIBasicType(name: "int8", size: 8, encoding: DW_ATE_signed)
+!5 = !{!6}
+!6 = !DISubrange(count: 4, lowerBound: 0)
+!7 = !DIGlobalVariableExpression(var: !8, expr: !DIExpression())
+!8 = distinct !DIGlobalVariable(name: "ringbuf", linkageName: "global", scope: !2, file: !2, type: !9, isLocal: false, isDefinition: true)
+!9 = !DICompositeType(tag: DW_TAG_structure_type, scope: !2, file: !2, size: 128, elements: !10)
+!10 = !{!11, !17}
+!11 = !DIDerivedType(tag: DW_TAG_member, name: "type", scope: !2, file: !2, baseType: !12, size: 64)
 !12 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !13, size: 64)
-!13 = !DICompositeType(tag: DW_TAG_array_type, baseType: !8, size: 8388608, elements: !14)
-!14 = !{!15}
-!15 = !DISubrange(count: 262144, lowerBound: 0)
-!16 = !DIGlobalVariableExpression(var: !17, expr: !DIExpression())
-!17 = distinct !DIGlobalVariable(name: "event_loss_counter", linkageName: "global", scope: !2, file: !2, type: !18, isLocal: false, isDefinition: true)
-!18 = !DICompositeType(tag: DW_TAG_structure_type, scope: !2, file: !2, size: 256, elements: !19)
-!19 = !{!20, !25, !30, !33}
-!20 = !DIDerivedType(tag: DW_TAG_member, name: "type", scope: !2, file: !2, baseType: !21, size: 64)
-!21 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !22, size: 64)
-!22 = !DICompositeType(tag: DW_TAG_array_type, baseType: !8, size: 64, elements: !23)
-!23 = !{!24}
-!24 = !DISubrange(count: 2, lowerBound: 0)
-!25 = !DIDerivedType(tag: DW_TAG_member, name: "max_entries", scope: !2, file: !2, baseType: !26, size: 64, offset: 64)
-!26 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !27, size: 64)
-!27 = !DICompositeType(tag: DW_TAG_array_type, baseType: !8, size: 32, elements: !28)
-!28 = !{!29}
-!29 = !DISubrange(count: 1, lowerBound: 0)
-!30 = !DIDerivedType(tag: DW_TAG_member, name: "key", scope: !2, file: !2, baseType: !31, size: 64, offset: 128)
-!31 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !32, size: 64)
-!32 = !DIBasicType(name: "int32", size: 32, encoding: DW_ATE_signed)
-!33 = !DIDerivedType(tag: DW_TAG_member, name: "value", scope: !2, file: !2, baseType: !34, size: 64, offset: 192)
-!34 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !35, size: 64)
-!35 = !DIBasicType(name: "int64", size: 64, encoding: DW_ATE_signed)
-!36 = distinct !DICompileUnit(language: DW_LANG_C, file: !2, producer: "bpftrace", isOptimized: false, runtimeVersion: 0, emissionKind: LineTablesOnly, globals: !37)
-!37 = !{!0, !16}
-!38 = !{i32 2, !"Debug Info Version", i32 3}
-!39 = distinct !DISubprogram(name: "kprobe_f_1", linkageName: "kprobe_f_1", scope: !2, file: !2, type: !40, flags: DIFlagPrototyped, spFlags: DISPFlagDefinition, unit: !36, retainedNodes: !44)
-!40 = !DISubroutineType(types: !41)
-!41 = !{!35, !42}
-!42 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !43, size: 64)
-!43 = !DIBasicType(name: "int8", size: 8, encoding: DW_ATE_signed)
-!44 = !{!45}
-!45 = !DILocalVariable(name: "ctx", arg: 1, scope: !39, file: !2, type: !42)
+!13 = !DICompositeType(tag: DW_TAG_array_type, baseType: !14, size: 864, elements: !15)
+!14 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!15 = !{!16}
+!16 = !DISubrange(count: 27, lowerBound: 0)
+!17 = !DIDerivedType(tag: DW_TAG_member, name: "max_entries", scope: !2, file: !2, baseType: !18, size: 64, offset: 64)
+!18 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !19, size: 64)
+!19 = !DICompositeType(tag: DW_TAG_array_type, baseType: !14, size: 8388608, elements: !20)
+!20 = !{!21}
+!21 = !DISubrange(count: 262144, lowerBound: 0)
+!22 = !DIGlobalVariableExpression(var: !23, expr: !DIExpression())
+!23 = distinct !DIGlobalVariable(name: "event_loss_counter", linkageName: "global", scope: !2, file: !2, type: !24, isLocal: false, isDefinition: true)
+!24 = !DICompositeType(tag: DW_TAG_structure_type, scope: !2, file: !2, size: 256, elements: !25)
+!25 = !{!26, !31, !36, !39}
+!26 = !DIDerivedType(tag: DW_TAG_member, name: "type", scope: !2, file: !2, baseType: !27, size: 64)
+!27 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !28, size: 64)
+!28 = !DICompositeType(tag: DW_TAG_array_type, baseType: !14, size: 64, elements: !29)
+!29 = !{!30}
+!30 = !DISubrange(count: 2, lowerBound: 0)
+!31 = !DIDerivedType(tag: DW_TAG_member, name: "max_entries", scope: !2, file: !2, baseType: !32, size: 64, offset: 64)
+!32 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !33, size: 64)
+!33 = !DICompositeType(tag: DW_TAG_array_type, baseType: !14, size: 32, elements: !34)
+!34 = !{!35}
+!35 = !DISubrange(count: 1, lowerBound: 0)
+!36 = !DIDerivedType(tag: DW_TAG_member, name: "key", scope: !2, file: !2, baseType: !37, size: 64, offset: 128)
+!37 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !38, size: 64)
+!38 = !DIBasicType(name: "int32", size: 32, encoding: DW_ATE_signed)
+!39 = !DIDerivedType(tag: DW_TAG_member, name: "value", scope: !2, file: !2, baseType: !40, size: 64, offset: 192)
+!40 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !41, size: 64)
+!41 = !DIBasicType(name: "int64", size: 64, encoding: DW_ATE_signed)
+!42 = distinct !DICompileUnit(language: DW_LANG_C, file: !2, producer: "bpftrace", isOptimized: false, runtimeVersion: 0, emissionKind: LineTablesOnly, globals: !43)
+!43 = !{!0, !7, !22}
+!44 = !{i32 2, !"Debug Info Version", i32 3}
+!45 = !{i32 7, !"uwtable", i32 0}
+!46 = distinct !DISubprogram(name: "kprobe_f_1", linkageName: "kprobe_f_1", scope: !2, file: !2, type: !47, flags: DIFlagPrototyped, spFlags: DISPFlagDefinition, unit: !42, retainedNodes: !50)
+!47 = !DISubroutineType(types: !48)
+!48 = !{!41, !49}
+!49 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !4, size: 64)
+!50 = !{!51}
+!51 = !DILocalVariable(name: "ctx", arg: 1, scope: !46, file: !2, type: !49)
+!52 = distinct !{!52, !53}
+!53 = !{!"llvm.loop.unroll.disable"}

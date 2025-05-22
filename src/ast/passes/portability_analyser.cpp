@@ -1,29 +1,27 @@
-#include "portability_analyser.h"
-
 #include <cstdlib>
 
-#include "log.h"
+#include "ast/passes/portability_analyser.h"
+#include "ast/visitor.h"
 #include "types.h"
 
 namespace bpftrace::ast {
 
-PortabilityAnalyser::PortabilityAnalyser(Node *root, std::ostream &out)
-    : root_(root), out_(out)
-{
-}
+namespace {
 
-int PortabilityAnalyser::analyse()
-{
-  Visit(*root_);
-
-  std::string errors = err_.str();
-  if (!errors.empty()) {
-    out_ << errors;
-    return 1;
-  }
-
-  return 0;
-}
+// Checks if a script uses any non-portable bpftrace features that AOT
+// cannot handle.
+//
+// Over time, we expect to relax these restrictions as AOT supports more
+// features.
+class PortabilityAnalyser : public Visitor<PortabilityAnalyser> {
+public:
+  using Visitor<PortabilityAnalyser>::visit;
+  void visit(PositionalParameter &param);
+  void visit(Builtin &builtin);
+  void visit(Call &call);
+  void visit(Cast &cast);
+  void visit(AttachPoint &ap);
+};
 
 void PortabilityAnalyser::visit(PositionalParameter &param)
 {
@@ -36,8 +34,7 @@ void PortabilityAnalyser::visit(PositionalParameter &param)
   //   * that would mislead the user into thinking there's positional param
   //   support
   //   * the user can just hard code the values into their script
-  LOG(ERROR, param.loc, err_)
-      << "AOT does not yet support positional parameters";
+  param.addError() << "AOT does not yet support positional parameters";
 }
 
 void PortabilityAnalyser::visit(Builtin &builtin)
@@ -46,15 +43,14 @@ void PortabilityAnalyser::visit(Builtin &builtin)
   // This makes it inherently unportable. We must block it until we support
   // field access relocations.
   if (builtin.ident == "curtask") {
-    LOG(ERROR, builtin.loc, err_)
-        << "AOT does not yet support accessing `curtask`";
+    builtin.addError() << "AOT does not yet support accessing `curtask`";
   }
 }
 
 void PortabilityAnalyser::visit(Call &call)
 {
-  for (Expression *expr : call.vargs)
-    Visit(*expr);
+  for (auto &expr : call.vargs)
+    visit(expr);
 
   // kaddr() and uaddr() both resolve symbols -> address during codegen and
   // embeds the values into the bytecode. For AOT to support kaddr()/uaddr(),
@@ -66,21 +62,20 @@ void PortabilityAnalyser::visit(Call &call)
   // to support cgroupid(), the cgroupid must be resolved at runtime and fixed
   // up during load time.
   if (call.func == "kaddr" || call.func == "uaddr" || call.func == "cgroupid") {
-    LOG(ERROR, call.loc, err_)
-        << "AOT does not yet support " << call.func << "()";
+    call.addError() << "AOT does not yet support " << call.func << "()";
   }
 }
 
 void PortabilityAnalyser::visit(Cast &cast)
 {
-  Visit(*cast.expr);
+  visit(cast.expr);
 
   // The goal here is to block arbitrary field accesses but still allow `args`
   // access. `args` for tracepoint is fairly stable and should be considered
   // portable. `args` for k[ret]funcs are type checked by the kernel and may
   // also be considered stable. For AOT to fully support field accesses, we
   // need to relocate field access at runtime.
-  LOG(ERROR, cast.loc, err_) << "AOT does not yet support struct casts";
+  cast.addError() << "AOT does not yet support struct casts";
 }
 
 void PortabilityAnalyser::visit(AttachPoint &ap)
@@ -93,7 +88,7 @@ void PortabilityAnalyser::visit(AttachPoint &ap)
   // support, this analyzing must be done during runtime and fixed up during
   // load time.
   if (type == ProbeType::usdt) {
-    LOG(ERROR, ap.loc, err_) << "AOT does not yet support USDT probes";
+    ap.addError() << "AOT does not yet support USDT probes";
   }
   // While userspace watchpoint probes are technically portable from codegen
   // point of view, they require a PID or path via cmdline to resolve address.
@@ -103,26 +98,25 @@ void PortabilityAnalyser::visit(AttachPoint &ap)
   // So disable for now and re-evalulate at another point.
   else if (type == ProbeType::watchpoint ||
            type == ProbeType::asyncwatchpoint) {
-    LOG(ERROR, ap.loc, err_) << "AOT does not yet support watchpoint probes";
+    ap.addError() << "AOT does not yet support watchpoint probes";
   }
 }
 
+} // namespace
+
 Pass CreatePortabilityPass()
 {
-  auto fn = [](Node &n, PassContext &__attribute__((unused))) {
-    PortabilityAnalyser analyser{ &n };
-    if (analyser.analyse()) {
+  auto fn = [](ASTContext &ast) {
+    PortabilityAnalyser analyser;
+    analyser.visit(ast.root);
+    if (!ast.diagnostics().ok()) {
       // Used by runtime test framework to know when to skip an AOT test
       if (std::getenv("__BPFTRACE_NOTIFY_AOT_PORTABILITY_DISABLED"))
         std::cout << "__BPFTRACE_NOTIFY_AOT_PORTABILITY_DISABLED" << std::endl;
-
-      return PassResult::Error("");
     }
-
-    return PassResult::Success();
   };
 
-  return Pass("PortabilityAnalyser", fn);
+  return Pass::create("PortabilityAnalyser", fn);
 }
 
 } // namespace bpftrace::ast

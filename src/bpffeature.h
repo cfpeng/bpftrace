@@ -2,7 +2,6 @@
 
 #include "btf.h"
 #include "kfuncs.h"
-#include <memory>
 #include <optional>
 #include <string>
 
@@ -59,23 +58,22 @@ class BPFfeature;
 
 class BPFnofeature {
 public:
-  BPFnofeature() : kprobe_multi_(false), uprobe_multi_(false)
-  {
-  }
-  int parse(const char* optarg);
+  BPFnofeature() = default;
+  int parse(const char* str);
 
 protected:
-  bool kprobe_multi_;
-  bool uprobe_multi_;
+  bool kprobe_multi_{ false };
+  bool kprobe_session_{ false };
+  bool uprobe_multi_{ false };
   friend class BPFfeature;
 };
 
 class BPFfeature {
 public:
-  BPFfeature(BPFnofeature& no_feature) : no_feature_(no_feature)
+  BPFfeature(BPFnofeature& no_feature, BTF& btf)
+      : no_feature_(no_feature), btf_(btf)
   {
   }
-  BPFfeature() = default;
   virtual ~BPFfeature() = default;
 
   // Due to the unique_ptr usage the generated copy constructor & assignment
@@ -89,29 +87,26 @@ public:
   BPFfeature& operator=(BPFfeature&&) = delete;
 
   int instruction_limit();
-  bool has_loop();
   bool has_btf();
   bool has_btf_func_global();
   bool has_map_batch();
   bool has_d_path();
   bool has_uprobe_refcnt();
   bool has_kprobe_multi();
+  bool has_kprobe_session();
   bool has_uprobe_multi();
-  bool has_fentry();
   bool has_skb_output();
   bool has_prog_fentry();
-  bool has_module_btf();
   bool has_iter(std::string name);
-  bool has_kernel_dwarf();
+  // These are virtual so they can be overridden in tests by the mock
+  virtual bool has_fentry();
+  virtual bool has_kernel_func(Kfunc kfunc);
 
-  bool has_kernel_func(Kfunc kfunc);
-
-  std::string report(void);
+  std::string report();
 
   DEFINE_MAP_TEST(array, libbpf::BPF_MAP_TYPE_ARRAY);
   DEFINE_MAP_TEST(hash, libbpf::BPF_MAP_TYPE_HASH);
   DEFINE_MAP_TEST(percpu_array, libbpf::BPF_MAP_TYPE_PERCPU_ARRAY);
-  DEFINE_MAP_TEST(percpu_hash, libbpf::BPF_MAP_TYPE_PERCPU_HASH);
   DEFINE_MAP_TEST(stack_trace, libbpf::BPF_MAP_TYPE_STACK_TRACE);
   DEFINE_MAP_TEST(perf_event_array, libbpf::BPF_MAP_TYPE_PERF_EVENT_ARRAY);
   DEFINE_MAP_TEST(ringbuf, libbpf::BPF_MAP_TYPE_RINGBUF);
@@ -129,21 +124,22 @@ public:
   DEFINE_HELPER_TEST(get_func_ip, libbpf::BPF_PROG_TYPE_KPROBE);
   DEFINE_HELPER_TEST(jiffies64, libbpf::BPF_PROG_TYPE_KPROBE);
   DEFINE_HELPER_TEST(for_each_map_elem, libbpf::BPF_PROG_TYPE_KPROBE);
+  DEFINE_HELPER_TEST(get_ns_current_pid_tgid, libbpf::BPF_PROG_TYPE_KPROBE);
+  DEFINE_HELPER_TEST(map_lookup_percpu_elem, libbpf::BPF_PROG_TYPE_KPROBE);
   DEFINE_PROG_TEST(kprobe, libbpf::BPF_PROG_TYPE_KPROBE);
   DEFINE_PROG_TEST(tracepoint, libbpf::BPF_PROG_TYPE_TRACEPOINT);
   DEFINE_PROG_TEST(perf_event, libbpf::BPF_PROG_TYPE_PERF_EVENT);
 
 protected:
-  std::optional<bool> has_loop_;
   std::optional<bool> has_d_path_;
   std::optional<int> insns_limit_;
   std::optional<bool> has_map_batch_;
   std::optional<bool> has_uprobe_refcnt_;
   std::optional<bool> has_kprobe_multi_;
+  std::optional<bool> has_kprobe_session_;
   std::optional<bool> has_uprobe_multi_;
   std::optional<bool> has_skb_output_;
   std::optional<bool> has_prog_fentry_;
-  std::optional<bool> has_module_btf_;
   std::optional<bool> has_btf_func_global_;
   std::optional<bool> has_kernel_dwarf_;
 
@@ -167,9 +163,8 @@ private:
       int* outfd = nullptr);
   bool try_load_btf(const void* btf_data, size_t btf_size);
 
-  BTF btf_ = BTF({ "vmlinux" });
-
   BPFnofeature no_feature_;
+  BTF& btf_;
 };
 
 #undef DEFINE_PROG_TEST

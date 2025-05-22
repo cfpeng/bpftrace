@@ -1,23 +1,121 @@
+#include <algorithm>
+#include <clang-c/Index.h>
 #include <cstring>
 #include <iostream>
-#include <limits>
+#include <llvm/Config/llvm-config.h>
 #include <regex>
 #include <sstream>
+#include <sys/utsname.h>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "llvm/Config/llvm-config.h"
-
 #include "ast/ast.h"
-#include "ast/passes/field_analyser.h"
+#include "ast/context.h"
+#include "bpftrace.h"
 #include "btf.h"
 #include "clang_parser.h"
 #include "log.h"
 #include "resources/headers.h"
 #include "types.h"
-#include "utils.h"
+#include "util/format.h"
+#include "util/io.h"
+#include "util/system.h"
 
 namespace bpftrace {
+
+char ClangParseError::ID;
+
+void ClangParseError::log(llvm::raw_ostream &OS) const
+{
+  OS << "Clang parse error";
+}
+
+class ClangParser {
+public:
+  bool parse(ast::Program *program,
+             BPFtrace &bpftrace,
+             std::vector<std::string> extra_flags = {});
+
+  // Moved out by the pass.
+  CDefinitions definitions;
+
+private:
+  bool visit_children(CXCursor &cursor, BPFtrace &bpftrace);
+  // The user might have written some struct definitions that rely on types
+  // supplied by BTF data.
+  //
+  // This method will pull out any forward-declared / incomplete struct
+  // definitions and return the types (in string form) of the unresolved types.
+  //
+  // Note that this method does not report "errors". This is because the user
+  // could have typo'd and actually referenced a non-existent type. Put
+  // differently, this method is best effort.
+  std::unordered_set<std::string> get_incomplete_types();
+  // Iteratively check for incomplete types, pull their definitions from BTF,
+  // and update the input files with the definitions.
+  void resolve_incomplete_types_from_btf(BPFtrace &bpftrace);
+
+  // Collect names of types defined by typedefs that are in non-included
+  // headers as they may pose problems for clang parser.
+  std::unordered_set<std::string> get_unknown_typedefs();
+  // Iteratively check for unknown typedefs, pull their definitions from BTF,
+  // and update the input files with the definitions.
+  void resolve_unknown_typedefs_from_btf(BPFtrace &bpftrace);
+
+  static std::optional<std::string> get_unknown_type(
+      const std::string &diagnostic_msg);
+
+  CXUnsavedFile get_btf_generated_header(BPFtrace &bpftrace);
+  CXUnsavedFile get_empty_btf_generated_header();
+
+  std::string get_arch_include_path();
+  std::vector<std::string> system_include_paths();
+
+  std::string input;
+  std::vector<const char *> args;
+  std::vector<CXUnsavedFile> input_files;
+  std::string btf_cdef;
+
+  class ClangParserHandler {
+  public:
+    ClangParserHandler();
+
+    ~ClangParserHandler();
+
+    bool parse_file(const std::string &filename,
+                    const std::vector<const char *> &args,
+                    std::vector<CXUnsavedFile> &unsaved_files,
+                    bool bail_on_errors = true);
+
+    CXTranslationUnit get_translation_unit();
+
+    CXErrorCode parse_translation_unit(const char *source_filename,
+                                       const char *const *command_line_args,
+                                       int num_command_line_args,
+                                       struct CXUnsavedFile *unsaved_files,
+                                       unsigned num_unsaved_files,
+                                       unsigned options);
+
+    // Check diagnostics and collect all error messages.
+    // Return true if an error occurred. If bail_on_error is false, only fail
+    // on fatal errors.
+    bool check_diagnostics(bool bail_on_error);
+
+    CXCursor get_translation_unit_cursor();
+
+    const std::vector<std::string> &get_error_messages();
+
+    bool has_redefinition_error();
+    bool has_unknown_type_error();
+
+  private:
+    CXIndex index;
+    CXTranslationUnit translation_unit = nullptr;
+    std::vector<std::string> error_msgs;
+  };
+};
+
 namespace {
 const std::vector<CXUnsavedFile> &getDefaultHeaders()
 {
@@ -57,11 +155,6 @@ const std::vector<CXUnsavedFile> &getDefaultHeaders()
         .Contents = stdint_h.data(),
         .Length = stdint_h.length(),
     },
-    {
-        .Filename = "/bpftrace/include/" CLANG_WORKAROUNDS_H,
-        .Contents = clang_workarounds_h.data(),
-        .Length = clang_workarounds_h.length(),
-    },
   };
 
   return unsaved_files;
@@ -88,12 +181,10 @@ static std::string get_clang_string(CXString string)
   return str;
 }
 
-/*
- * get_named_parent
- *
- * Find the parent struct of the field pointed to by the cursor.
- * Anonymous structs are skipped.
- */
+// get_named_parent
+//
+// Find the parent struct of the field pointed to by the cursor.
+// Anonymous structs are skipped.
 static CXCursor get_named_parent(CXCursor c)
 {
   CXCursor parent = clang_getCursorSemanticParent(c);
@@ -143,7 +234,7 @@ static bool translateMacro(CXCursor cursor,
     clang_disposeString(tokenText);
   }
   clang_disposeTokens(transUnit, tokens, numTokens);
-  return value.length() != 0;
+  return !value.empty();
 }
 
 static std::string remove_qualifiers(std::string &&typestr)
@@ -262,9 +353,7 @@ bool ClangParser::ClangParserHandler::check_diagnostics(bool bail_on_error)
     if ((bail_on_error && severity == CXDiagnostic_Error) ||
         severity == CXDiagnostic_Fatal) {
       // Do not fail on "too many errors"
-      if (!bail_on_error && msg == "too many errors emitted, stopping now")
-        return true;
-      return false;
+      return !bail_on_error && msg == "too many errors emitted, stopping now";
     }
   }
   return true;
@@ -281,7 +370,7 @@ bool ClangParser::ClangParserHandler::parse_file(
     std::vector<CXUnsavedFile> &unsaved_files,
     bool bail_on_errors)
 {
-  StderrSilencer silencer;
+  util::StderrSilencer silencer;
   if (!bail_on_errors)
     silencer.silence();
 
@@ -310,155 +399,151 @@ const std::vector<std::string> &ClangParser::ClangParserHandler::
 
 bool ClangParser::ClangParserHandler::has_redefinition_error()
 {
-  for (auto &msg : error_msgs) {
-    if (msg.find("redefinition") != std::string::npos)
-      return true;
-  }
-  return false;
+  return std::ranges::any_of(error_msgs, [](const auto &msg) {
+    return msg.find("redefinition") != std::string::npos;
+  });
 }
 
 bool ClangParser::ClangParserHandler::has_unknown_type_error()
 {
-  for (auto &msg : error_msgs) {
-    if (ClangParser::get_unknown_type(msg).has_value())
-      return true;
-  }
-  return false;
+  return std::ranges::any_of(error_msgs, [](const auto &msg) {
+    return ClangParser::get_unknown_type(msg).has_value();
+  });
 }
 
 namespace {
+using visitFn = std::function<CXChildVisitResult(CXCursor, CXCursor)>;
+int visitChildren(CXCursor cursor, visitFn fn)
+{
+  return clang_visitChildren(
+      cursor,
+      [](CXCursor c, CXCursor parent, CXClientData data) {
+        auto *cb = static_cast<visitFn *>(data);
+        return (*cb)(c, parent);
+      },
+      static_cast<void *>(&fn));
+}
+
 // Get annotation associated with field declaration `c`
 std::optional<std::string> get_field_decl_annotation(CXCursor c)
 {
   assert(clang_getCursorKind(c) == CXCursor_FieldDecl);
 
   std::optional<std::string> annotation;
-  clang_visitChildren(
-      c,
-      [](CXCursor c,
-         CXCursor __attribute__((unused)) parent,
-         CXClientData data) {
-        // The header generation code can annotate some struct
-        // fields with additional information for us to parse
-        // here. The annotation looks like:
-        //
-        //    struct Foo {
-        //      __attribute__((annotate("tp_data_loc"))) int
-        //      name;
-        //    };
-        //
-        // Currently only the TracepointFormatParser does this.
-        if (clang_getCursorKind(c) == CXCursor_AnnotateAttr) {
-          auto &a = *static_cast<std::optional<std::string> *>(data);
-          a = get_clang_string(clang_getCursorSpelling(c));
-        }
+  visitChildren(c, [&](CXCursor c, CXCursor __attribute__((unused)) parent) {
+    // The header generation code can annotate some struct
+    // fields with additional information for us to parse
+    // here. The annotation looks like:
+    //
+    //    struct Foo {
+    //      __attribute__((annotate("tp_data_loc"))) int
+    //      name;
+    //    };
+    //
+    // Currently only the TracepointFormatParser does this.
+    if (clang_getCursorKind(c) == CXCursor_AnnotateAttr) {
+      annotation = get_clang_string(clang_getCursorSpelling(c));
+    }
 
-        return CXChildVisit_Recurse;
-      },
-      &annotation);
-
+    return CXChildVisit_Recurse;
+  });
   return annotation;
 }
 } // namespace
 
 bool ClangParser::visit_children(CXCursor &cursor, BPFtrace &bpftrace)
 {
-  int err = clang_visitChildren(
-      cursor,
-      [](CXCursor c, CXCursor parent, CXClientData client_data) {
-        if (clang_getCursorKind(c) == CXCursor_MacroDefinition) {
-          std::string macro_name;
-          std::string macro_value;
-          if (translateMacro(c, macro_name, macro_value)) {
-            auto &macros = static_cast<BPFtrace *>(client_data)->macros_;
-            macros[macro_name] = macro_value;
-          }
-          return CXChildVisit_Recurse;
+  int err = visitChildren(cursor, [&](CXCursor c, CXCursor parent) {
+    if (clang_getCursorKind(c) == CXCursor_MacroDefinition) {
+      std::string macro_name;
+      std::string macro_value;
+      if (translateMacro(c, macro_name, macro_value)) {
+        definitions.macros[macro_name] = macro_value;
+      }
+      return CXChildVisit_Recurse;
+    }
+
+    // Each anon enum must have a unique ID otherwise two variants
+    // with different names but same value will clobber each other
+    // in enum_defs.
+    static uint32_t anon_enum_count = 0;
+    if (clang_getCursorKind(c) == CXCursor_EnumDecl)
+      anon_enum_count++;
+
+    if (clang_getCursorKind(parent) == CXCursor_EnumDecl) {
+      // Store variant name to variant value
+      auto enum_name = get_clang_string(clang_getCursorSpelling(parent));
+      // Anonymous enums have empty string names in libclang <= 15
+      if (enum_name.empty()) {
+        std::ostringstream name;
+        name << "enum <anon_" << anon_enum_count << ">";
+        enum_name = name.str();
+      }
+      auto variant_name = get_clang_string(clang_getCursorSpelling(c));
+      auto variant_value = clang_getEnumConstantDeclValue(c);
+      definitions.enums[variant_name] = std::make_pair(variant_value,
+                                                       enum_name);
+
+      // Store enum name to variant value to variant name
+      definitions.enum_defs[enum_name][variant_value] = variant_name;
+
+      return CXChildVisit_Recurse;
+    }
+
+    if (clang_getCursorKind(parent) != CXCursor_StructDecl &&
+        clang_getCursorKind(parent) != CXCursor_UnionDecl)
+      return CXChildVisit_Recurse;
+
+    if (clang_getCursorKind(c) == CXCursor_FieldDecl) {
+      // N.B. In the future this may be moved into the C definitions, but
+      // currently this is rather tied in to a lot of other plumbing.
+      auto &structs = bpftrace.structs;
+
+      auto named_parent = get_named_parent(c);
+      auto ptype = clang_getCanonicalType(clang_getCursorType(named_parent));
+      auto ptypestr = get_unqualified_type_name(ptype);
+      auto ptypesize = clang_Type_getSizeOf(ptype);
+
+      auto ident = get_clang_string(clang_getCursorSpelling(c));
+      auto offset = clang_Type_getOffsetOf(ptype, ident.c_str()) / 8;
+      auto type = clang_getCanonicalType(clang_getCursorType(c));
+      auto sized_type = get_sized_type(type, structs);
+      auto bitfield = getBitfield(c);
+      bool is_data_loc = false;
+
+      // Process field annotations
+      auto annotation = get_field_decl_annotation(c);
+      if (annotation) {
+        if (*annotation == "tp_data_loc") {
+          // If the field is a tracepoint __data_loc, we need to rewrite the
+          // type as a u64. The reason is that the tracepoint infrastructure
+          // exports an encoded 32bit integer that tells us where to find
+          // the actual data and how wide it is. However, LLVM freaks out if
+          // you try to cast a pointer to a u32 (rightfully so) so we need
+          // this field to actually be 64 bits wide.
+          sized_type = CreateInt64();
+          is_data_loc = true;
         }
+      }
 
-        // Each anon enum must have a unique ID otherwise two variants
-        // with different names but same value will clobber each other
-        // in enum_defs_.
-        static uint32_t anon_enum_count = 0;
-        if (clang_getCursorKind(c) == CXCursor_EnumDecl)
-          anon_enum_count++;
+      // Initialize a new record type if needed
+      if (!structs.Has(ptypestr))
+        structs.Add(ptypestr, ptypesize, false);
 
-        if (clang_getCursorKind(parent) == CXCursor_EnumDecl) {
-          // Store variant name to variant value
-          auto &enums = static_cast<BPFtrace *>(client_data)->enums_;
-          auto enum_name = get_clang_string(clang_getCursorSpelling(parent));
-          // Anonymous enums have empty string names in libclang <= 15
-          if (enum_name.empty()) {
-            std::ostringstream name;
-            name << "enum <anon_" << anon_enum_count << ">";
-            enum_name = std::move(name.str());
-          }
-          auto variant_name = get_clang_string(clang_getCursorSpelling(c));
-          auto variant_value = clang_getEnumConstantDeclValue(c);
-          enums[variant_name] = std::make_pair(variant_value, enum_name);
+      auto str = structs.Lookup(ptypestr).lock();
+      if (str->allow_override) {
+        str->ClearFields();
+        str->allow_override = false;
+      }
 
-          // Store enum name to variant value to variant name
-          auto &enum_defs = static_cast<BPFtrace *>(client_data)->enum_defs_;
-          enum_defs[enum_name][variant_value] = variant_name;
+      // No need to worry about redefined types b/c we should have already
+      // checked clang diagnostics. The diagnostics will tell us if we have
+      // duplicated types.
+      str->AddField(ident, sized_type, offset, bitfield, is_data_loc);
+    }
 
-          return CXChildVisit_Recurse;
-        }
-
-        if (clang_getCursorKind(parent) != CXCursor_StructDecl &&
-            clang_getCursorKind(parent) != CXCursor_UnionDecl)
-          return CXChildVisit_Recurse;
-
-        if (clang_getCursorKind(c) == CXCursor_FieldDecl) {
-          auto &structs = static_cast<BPFtrace *>(client_data)->structs;
-
-          auto named_parent = get_named_parent(c);
-          auto ptype = clang_getCanonicalType(
-              clang_getCursorType(named_parent));
-          auto ptypestr = get_unqualified_type_name(ptype);
-          auto ptypesize = clang_Type_getSizeOf(ptype);
-
-          auto ident = get_clang_string(clang_getCursorSpelling(c));
-          auto offset = clang_Type_getOffsetOf(ptype, ident.c_str()) / 8;
-          auto type = clang_getCanonicalType(clang_getCursorType(c));
-          auto sized_type = get_sized_type(type, structs);
-          auto bitfield = getBitfield(c);
-          bool is_data_loc = false;
-
-          // Process field annotations
-          auto annotation = get_field_decl_annotation(c);
-          if (annotation) {
-            if (*annotation == "tp_data_loc") {
-              // If the field is a tracepoint __data_loc, we need to rewrite the
-              // type as a u64. The reason is that the tracepoint infrastructure
-              // exports an encoded 32bit integer that tells us where to find
-              // the actual data and how wide it is. However, LLVM freaks out if
-              // you try to cast a pointer to a u32 (rightfully so) so we need
-              // this field to actually be 64 bits wide.
-              sized_type = CreateInt64();
-              is_data_loc = true;
-            }
-          }
-
-          // Initialize a new record type if needed
-          if (!structs.Has(ptypestr))
-            structs.Add(ptypestr, ptypesize, false);
-
-          auto str = structs.Lookup(ptypestr).lock();
-          if (str->allow_override) {
-            str->ClearFields();
-            str->allow_override = false;
-          }
-
-          // No need to worry about redefined types b/c we should have already
-          // checked clang diagnostics. The diagnostics will tell us if we have
-          // duplicated types.
-          structs.Lookup(ptypestr).lock()->AddField(
-              ident, sized_type, offset, bitfield, is_data_loc);
-        }
-
-        return CXChildVisit_Recurse;
-      },
-      &bpftrace);
+    return CXChildVisit_Recurse;
+  });
 
   // clang_visitChildren returns a non-zero value if the traversal
   // was terminated by the visitor returning CXChildVisit_Break.
@@ -482,111 +567,91 @@ std::unordered_set<std::string> ClangParser::get_incomplete_types()
   } type_data;
 
   CXCursor cursor = handler.get_translation_unit_cursor();
-  clang_visitChildren(
-      cursor,
-      [](CXCursor c, CXCursor parent, CXClientData client_data) {
-        auto &data = *static_cast<TypeData *>(client_data);
+  visitChildren(cursor, [&](CXCursor c, CXCursor parent) {
+    // We look for field declarations and store the parent
+    // as a fully defined type because we know we're looking at a
+    // type definition.
+    //
+    // Then look at the field declaration itself. If it's a record
+    // type (ie struct or union), check if we think it's a fully
+    // defined type. If not, add it to incomplete types set.
+    if (clang_getCursorKind(parent) == CXCursor_EnumDecl ||
+        (clang_getCursorKind(c) == CXCursor_FieldDecl &&
+         (clang_getCursorKind(parent) == CXCursor_UnionDecl ||
+          clang_getCursorKind(parent) == CXCursor_StructDecl))) {
+      auto parent_type = clang_getCanonicalType(clang_getCursorType(parent));
+      type_data.complete_types.emplace(get_unqualified_type_name(parent_type));
 
-        // We look for field declarations and store the parent
-        // as a fully defined type because we know we're looking at a
-        // type definition.
-        //
-        // Then look at the field declaration itself. If it's a record
-        // type (ie struct or union), check if we think it's a fully
-        // defined type. If not, add it to incomplete types set.
-        if (clang_getCursorKind(parent) == CXCursor_EnumDecl ||
-            (clang_getCursorKind(c) == CXCursor_FieldDecl &&
-             (clang_getCursorKind(parent) == CXCursor_UnionDecl ||
-              clang_getCursorKind(parent) == CXCursor_StructDecl))) {
-          auto parent_type = clang_getCanonicalType(
-              clang_getCursorType(parent));
-          data.complete_types.emplace(get_unqualified_type_name(parent_type));
+      auto cursor_type = clang_getCanonicalType(clang_getCursorType(c));
+      // We need layouts of pointee types because users could dereference
+      if (cursor_type.kind == CXType_Pointer)
+        cursor_type = clang_getPointeeType(cursor_type);
+      if (cursor_type.kind == CXType_Record) {
+        auto type_name = get_unqualified_type_name(cursor_type);
+        if (!type_data.complete_types.contains(type_name))
+          type_data.incomplete_types.emplace(std::move(type_name));
+      }
+    }
 
-          auto cursor_type = clang_getCanonicalType(clang_getCursorType(c));
-          // We need layouts of pointee types because users could dereference
-          if (cursor_type.kind == CXType_Pointer)
-            cursor_type = clang_getPointeeType(cursor_type);
-          if (cursor_type.kind == CXType_Record) {
-            auto type_name = get_unqualified_type_name(cursor_type);
-            if (data.complete_types.find(type_name) ==
-                data.complete_types.end())
-              data.incomplete_types.emplace(std::move(type_name));
-          }
-        }
-
-        return CXChildVisit_Recurse;
-      },
-      &type_data);
+    return CXChildVisit_Recurse;
+  });
 
   return type_data.incomplete_types;
 }
 
-void ClangParser::resolve_incomplete_types_from_btf(
-    BPFtrace &bpftrace,
-    const ast::ProbeList &probes)
+void ClangParser::resolve_incomplete_types_from_btf(BPFtrace &bpftrace)
 {
-  // Resolution of incomplete types must run at least once, maximum should be
-  // the number of levels of nested field accesses for tracepoint args.
-  // The maximum number of iterations can be also controlled by the
-  // BPFTRACE_MAX_TYPE_RES_ITERATIONS env variable (0 is unlimited).
-  uint64_t field_lvl = 1;
-  for (auto &probe : probes)
-    if (probe->tp_args_structs_level > static_cast<int>(field_lvl))
-      field_lvl = probe->tp_args_structs_level;
-
-  unsigned max_iterations = std::max(
-      bpftrace.config_.get(ConfigKeyInt::max_type_res_iterations), field_lvl);
-
-  bool check_incomplete_types = true;
-  for (unsigned i = 0; i < max_iterations && check_incomplete_types; i++) {
+  std::unordered_set<std::string> last_incomplete;
+  while (true) {
     // Collect incomplete types and retrieve their definitions from BTF.
     auto incomplete_types = get_incomplete_types();
-    size_t types_cnt = bpftrace.btf_set_.size();
+
+    // No need to continue if nothing is incomplete.
+    if (incomplete_types.empty()) {
+      break;
+    }
+    // It is an error to attempt to continue if we've converge on a set of
+    // incomplete types which is not changing.
+    if (incomplete_types == last_incomplete) {
+      break;
+    }
+
     bpftrace.btf_set_.insert(incomplete_types.cbegin(),
                              incomplete_types.cend());
-
     input_files.back() = get_btf_generated_header(bpftrace);
-
-    // No need to continue if no more types were added
-    check_incomplete_types = types_cnt != bpftrace.btf_set_.size();
+    last_incomplete = std::move(incomplete_types);
   }
 }
 
-/*
- * Parse the program using Clang.
- *
- * Type resolution rules:
- *
- * If BTF is available, necessary types are retrieved from there, otherwise we
- * rely on headers and types supplied by the user (we also include linux/types.h
- * in some cases, e.g., for tracepoints).
- *
- * The following types are taken from BTF (if available):
- * 1. Types explicitly used in the program (taken from bpftrace.btf_set_).
- * 2. Types used by some of the defined types (as struct members). This step
- *    is done recursively, however, as it may take long time, there is a
- *    maximal depth set. It is computed as the maximum level of nested field
- *    accesses in the program and can be manually overridden using
- *    the BPFTRACE_MAX_TYPE_RES_ITERATIONS env variable.
- * 3. Typedefs used by some of the defined types. These are also resolved
- *    recursively, however, they must be resolved completely as any unknown
- *    typedef will cause the parser to fail (even if the type is not used in
- *    the program).
- *
- * If any of the above steps retrieves a definition that redefines some existing
- * (user-defined) type, no BTF types are used and all types must be provided.
- * In practice, this means that user may use kernel types without providing
- * their definitions but once he redefines any kernel type, he must provide all
- * necessary definitions.
- */
+// Parse the program using Clang.
+//
+// Type resolution rules:
+//
+// If BTF is available, necessary types are retrieved from there, otherwise we
+// rely on headers and types supplied by the user (we also include linux/types.h
+// in some cases, e.g., for tracepoints).
+//
+// The following types are taken from BTF (if available):
+// 1. Types explicitly used in the program (taken from bpftrace.btf_set_).
+// 2. Types used by some of the defined types (as struct members). This step
+//    is done recursively, however, as it may take long time, there is a
+//    maximal depth set. It is computed as the maximum level of nested field
+//    accesses in the program and can be manually overridden using
+//    the BPFTRACE_MAX_TYPE_RES_ITERATIONS env variable.
+// 3. Typedefs used by some of the defined types. These are also resolved
+//    recursively, however, they must be resolved completely as any unknown
+//    typedef will cause the parser to fail (even if the type is not used in
+//    the program).
+//
+// If any of the above steps retrieves a definition that redefines some existing
+// (user-defined) type, no BTF types are used and all types must be provided.
+// In practice, this means that user may use kernel types without providing
+// their definitions but once he redefines any kernel type, he must provide all
+// necessary definitions.
 bool ClangParser::parse(ast::Program *program,
                         BPFtrace &bpftrace,
                         std::vector<std::string> extra_flags)
 {
-#ifdef FUZZ
-  StderrSilencer silencer;
-  silencer.silence();
-#endif
   input = "#include </bpftrace/include/__btf_generated_header.h>\n" +
           program->c_definitions;
 
@@ -627,9 +692,6 @@ bool ClangParser::parse(ast::Program *program,
     // Prevent BTF generated header from redefining stuff found
     // in <linux/types.h>
     args.push_back("-D_LINUX_TYPES_H");
-    // Since we're omitting <linux/types.h> there's no reason to
-    // add the wokarounds for it
-    args.push_back("-D__CLANG_WORKAROUNDS_H");
     // Let script know we have BTF -- this is useful for prewritten tools to
     // conditionally include headers if BTF isn't available.
     args.push_back("-DBPFTRACE_HAVE_BTF");
@@ -639,7 +701,7 @@ bool ClangParser::parse(ast::Program *program,
       btf_conflict = true;
 
     if (!btf_conflict) {
-      resolve_incomplete_types_from_btf(bpftrace, program->probes);
+      resolve_incomplete_types_from_btf(bpftrace);
 
       if (handler.parse_file("definitions.h", args, input_files, false) &&
           handler.has_redefinition_error())
@@ -658,7 +720,6 @@ bool ClangParser::parse(ast::Program *program,
   if (btf_conflict) {
     // There is a conflict (redefinition) between user-supplied types and types
     // taken from BTF. We cannot use BTF in such a case.
-    args.pop_back();
     args.pop_back();
     args.pop_back();
     input_files.back() = get_empty_btf_generated_header();
@@ -685,20 +746,18 @@ bool ClangParser::parse(ast::Program *program,
   return visit_children(cursor, bpftrace);
 }
 
-/*
- * Parse the given Clang diagnostics message and if it has one of the forms:
- *   unknown type name 'type_t'
- *   use of undeclared identifier 'type_t'
- * return type_t.
- */
+// Parse the given Clang diagnostics message and if it has one of the forms:
+//   unknown type name 'type_t'
+//   use of undeclared identifier 'type_t'
+// return type_t.
 std::optional<std::string> ClangParser::ClangParser::get_unknown_type(
     const std::string &diagnostic_msg)
 {
   const std::vector<std::string> unknown_type_msgs = {
     "unknown type name \'", "use of undeclared identifier \'"
   };
-  for (auto &unknown_type_msg : unknown_type_msgs) {
-    if (diagnostic_msg.find(unknown_type_msg) == 0) {
+  for (const auto &unknown_type_msg : unknown_type_msgs) {
+    if (diagnostic_msg.starts_with(unknown_type_msg)) {
       return diagnostic_msg.substr(unknown_type_msg.length(),
                                    diagnostic_msg.length() -
                                        unknown_type_msg.length() - 1);
@@ -779,14 +838,14 @@ static void query_clang_include_dirs(std::vector<std::string> &result)
   try {
     auto clang = "clang-" + std::to_string(LLVM_VERSION_MAJOR);
     auto cmd = clang + " -Wp,-v -x c -fsyntax-only /dev/null 2>&1";
-    auto check = exec_system(cmd.c_str());
+    auto check = util::exec_system(cmd.c_str());
     std::istringstream lines(check);
     std::string line;
     while (std::getline(lines, line) &&
            line != "#include <...> search starts here:") {
     }
     while (std::getline(lines, line) && line != "End of search list.")
-      result.push_back(trim(line));
+      result.push_back(util::trim(line));
   } catch (std::runtime_error &) { // If exec_system fails, just ignore it
   }
 }
@@ -800,13 +859,27 @@ std::vector<std::string> ClangParser::system_include_paths()
     if (line == "auto")
       query_clang_include_dirs(result);
     else
-      result.push_back(trim(line));
+      result.push_back(util::trim(line));
   }
 
   if (result.empty())
     result = { "/usr/local/include", "/usr/include" };
 
   return result;
+}
+
+ast::Pass CreateClangPass(std::vector<std::string> &&extra_flags)
+{
+  return ast::Pass::create("ClangParser",
+                           [extra_flags = std::move(extra_flags)](
+                               ast::ASTContext &ast,
+                               BPFtrace &b) -> Result<CDefinitions> {
+                             ClangParser parser;
+                             if (!parser.parse(ast.root, b, extra_flags)) {
+                               return make_error<ClangParseError>();
+                             }
+                             return std::move(parser.definitions);
+                           });
 }
 
 } // namespace bpftrace

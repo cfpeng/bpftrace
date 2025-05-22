@@ -1,6 +1,11 @@
-# bpftrace
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="images/bpftrace_Full_Logo-White.svg"/>
+    <img alt="bpftrace" src="images/bpftrace_Full_Logo-Black.svg" width="60%"/>
+  </picture>
+</p>
 
-[![Build Status](https://github.com/bpftrace/bpftrace/workflows/CI/badge.svg?branch=master)](https://github.com/bpftrace/bpftrace/actions?query=workflow%3ACI+branch%3Amaster)
+[![Build Status](https://github.com/bpftrace/bpftrace/actions/workflows/ci.yml/badge.svg)](https://github.com/bpftrace/bpftrace/actions/workflows/ci.yml)
 [![IRC#bpftrace](https://img.shields.io/badge/IRC-bpftrace-blue.svg)](https://webchat.oftc.net/?channels=bpftrace)
 [![CodeQL](https://github.com/bpftrace/bpftrace/actions/workflows/codeql.yml/badge.svg)](https://github.com/bpftrace/bpftrace/actions/workflows/codeql.yml)
 
@@ -10,10 +15,11 @@ bpftrace is a high-level tracing language for Linux. bpftrace uses LLVM as a bac
 - [Manual / Reference Guide](man/adoc/bpftrace.adoc)
 - [Tutorial](docs/tutorial_one_liners.md)
 - [Example One-Liners](#example-one-liners)
-- [Videos](#videos)
+- [Videos](https://bpftrace.org/videos)
 - [Tools](tools/README.md)
-- [Contribute](#contribute)
-- [Development](#development)
+- [Release Schedule and Process](docs/release_process.md)
+- [Contribute](CONTRIBUTING.md)
+- [Development](CONTRIBUTING.md#development)
 - [Support](#support)
 - [Migration guide](docs/migration_guide.md)
 - [Probe types](#probe-types)
@@ -26,22 +32,22 @@ The following one-liners demonstrate different capabilities:
 
 ```
 # Files opened by thread name
-bpftrace -e 'tracepoint:syscalls:sys_enter_open { printf("%s %s\n", comm, str(args->filename)); }'
+bpftrace -e 'tracepoint:syscalls:sys_enter_open { printf("%s %s\n", comm, str(args.filename)); }'
 
 # Syscall count by thread name
 bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
 
 # Read bytes by thread name:
-bpftrace -e 'tracepoint:syscalls:sys_exit_read /args->ret/ { @[comm] = sum(args->ret); }'
+bpftrace -e 'tracepoint:syscalls:sys_exit_read /args.ret/ { @[comm] = sum(args.ret); }'
 
 # Read size distribution by thread name:
-bpftrace -e 'tracepoint:syscalls:sys_exit_read { @[comm] = hist(args->ret); }'
+bpftrace -e 'tracepoint:syscalls:sys_exit_read { @[comm] = hist(args.ret); }'
 
 # Show per-second syscall rates:
 bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @ = count(); } interval:s:1 { print(@); clear(@); }'
 
 # Trace disk size by PID and thread name
-bpftrace -e 'tracepoint:block:block_rq_issue { printf("%d %s %d\n", pid, comm, args->bytes); }'
+bpftrace -e 'tracepoint:block:block_rq_issue { printf("%d %s %d\n", pid, comm, args.bytes); }'
 
 # Count page faults by thread name
 bpftrace -e 'software:faults:1 { @[comm] = count(); }'
@@ -53,43 +59,11 @@ bpftrace -e 'hardware:cache-misses:1000000 { @[comm, pid] = count(); }'
 bpftrace -e 'profile:hz:99 /pid == 189/ { @[ustack] = count(); }'
 
 # Files opened in the root cgroup-v2
-bpftrace -e 'tracepoint:syscalls:sys_enter_openat /cgroup == cgroupid("/sys/fs/cgroup/unified/mycg")/ { printf("%s\n", str(args->filename)); }'
+bpftrace -e 'tracepoint:syscalls:sys_enter_openat /cgroup == cgroupid("/sys/fs/cgroup/unified/mycg")/ { printf("%s\n", str(args.filename)); }'
 ```
 
 More powerful scripts can easily be constructed. See [Tools](tools/README.md) for examples.
 
-## Videos
-
-Note: some of the content in these videos may be out of date, the current [reference guide](man/adoc/bpftrace.adoc) is the source of truth.
-
-- [Making bpftrace more powerful - 2023](https://www.youtube.com/watch?v=19RZ7b6AZJ0)
-- [Bpftrace Recipes: 5 Real Problems Solved - 2023](https://www.youtube.com/watch?v=wMtArNjRYXU)
-- [Linux tracing made simpler with bpftrace - 2022](https://www.youtube.com/watch?v=gSxntAO2Iys)
-- [Ahead-of-time compiled bpftrace programs - 2021](https://www.youtube.com/watch?v=C2n2i__YCcI)
-- [Getting Started with BPF observability - 2021](https://www.youtube.com/watch?v=bGAVrtb_tFs)
-- [bpftrace internals - 2020](https://www.youtube.com/watch?v=nDY4iC_ekQY&t=1477s)
-- [Using bpftrace with Performance Co-Pilot & Grafana - 2020](https://www.youtube.com/watch?v=ZiGTbItyJyg)
-- [An introduction to bpftrace tracing language - 2020](https://www.youtube.com/watch?v=93aHXYqZmU0)
-
-## Contribute
-
-Contributions are welcome! Please see the [development section](#development) below for more information. For new bpftrace tools, please add them to the new [user-tools repository](https://github.com/bpftrace/user-tools/blob/master/CONTRIBUTING.md). The tools that exist in this repository are a small collection curated by the bpftrace maintainers.
-
-* Bug reports and feature requests: [Issue Tracker](https://github.com/bpftrace/bpftrace/issues)
-
-* Development IRC: #bpftrace at irc.oftc.net
-
-* [Good first issues](https://github.com/bpftrace/bpftrace/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)
-
-## Development
-
-* [Coding Guidelines](docs/coding_guidelines.md)
-* [Development Guide](docs/developers.md)
-* [Development Roadmap](https://docs.google.com/document/d/17729Rlyo1xzlJObzHpFLDzeCVgvwRh0ktAmMEJLK-EU/edit)
-* [Fuzzing](docs/fuzzing.md)
-* [Nix](docs/nix.md)
-* [Release Process](docs/release_process.md)
-* [Tests](tests/README.md)
 
 ## Support
 
@@ -110,12 +84,13 @@ bpftrace has several plugins/definitions, integrating the syntax into your edito
 - [Emacs](https://gitlab.com/jgkamat/bpftrace-mode)
 - [Vim](https://github.com/mmarchini/bpftrace.vim)
 - [VS Code](https://github.com/bolinfest/bpftrace-vscode)
+- [Bash Completion](https://github.com/scop/bash-completion)
 
 ## License
 
-Copyright 2019 Alastair Robertson
+bpftrace is a registered trademark of Alastair Robertson
 
-Licensed under the Apache License, Version 2.0 (the "License");
+The code is licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
