@@ -34,10 +34,30 @@ BEGIN
 	printf("%5s %5s %s\n", "TX_KB", "RX_KB", "MS");
 }
 
+// void tcp_set_state(struct sock *sk, int state);
+// https://elixir.bootlin.com/linux/v6.12/source/include/net/tcp_states.h#L16
+// enum {
+// 	TCP_ESTABLISHED = 1, 连接已经建立
+// 	TCP_SYN_SENT,       主动打开
+// 	TCP_SYN_RECV,
+// 	TCP_FIN_WAIT1,
+// 	TCP_FIN_WAIT2,
+// 	TCP_TIME_WAIT,
+// 	TCP_CLOSE,
+// 	TCP_CLOSE_WAIT,
+// 	TCP_LAST_ACK,
+// 	TCP_LISTEN,     被动打开监听
+// 	TCP_CLOSING,	/* Now a valid state */
+// 	TCP_NEW_SYN_RECV,
+// 	TCP_BOUND_INACTIVE, /* Pseudo-state for inet_diag */
+
+//	TCP_MAX_STATES	/* Leave at the end! */
+//};
+
 kprobe:tcp_set_state
 {
 	$sk = (struct sock *)arg0;
-	$newstate = arg1;
+	$newstate = arg1; // 状态
 
 	/*
 	 * This tool includes PID and comm context. From TCP this is best
@@ -67,7 +87,7 @@ kprobe:tcp_set_state
 		$delta_ms = (nsecs - @birth[$sk]) / 1e6;
 		$lport = $sk->__sk_common.skc_num;
 		$dport = $sk->__sk_common.skc_dport;
-		$dport = bswap($dport);
+		$dport = bswap($dport); // bswap Reverse byte order
 		$tp = (struct tcp_sock *)$sk;
 		$pid = @skpid[$sk];
 		$comm = @skcomm[$sk];
@@ -77,12 +97,12 @@ kprobe:tcp_set_state
 			$comm = comm;
 		}
 
-		$family = $sk->__sk_common.skc_family;
+		$family = $sk->__sk_common.skc_family; // 协议族
 		$saddr = ntop(0);
 		$daddr = ntop(0);
 		if ($family == AF_INET) {
-			$saddr = ntop(AF_INET, $sk->__sk_common.skc_rcv_saddr);
-			$daddr = ntop(AF_INET, $sk->__sk_common.skc_daddr);
+			$saddr = ntop(AF_INET, $sk->__sk_common.skc_rcv_saddr); // 本地地址
+			$daddr = ntop(AF_INET, $sk->__sk_common.skc_daddr);		// 远端地址
 		} else {
 			// AF_INET6
 			$saddr = ntop(AF_INET6,
